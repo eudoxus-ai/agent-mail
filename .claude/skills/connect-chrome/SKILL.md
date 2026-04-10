@@ -1,0 +1,1 @@
+/Users/cameronpope/source/eudoxus/agent-mail/.claude/skills/gstack/connect-chrome/SKILL.md

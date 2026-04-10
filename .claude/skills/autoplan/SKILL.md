@@ -1,0 +1,1 @@
+/Users/cameronpope/source/eudoxus/agent-mail/.claude/skills/gstack/autoplan/SKILL.md
