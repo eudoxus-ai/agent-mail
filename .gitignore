@@ -1,1 +1,5 @@
 .claude/skills/gstack/
+node_modules/
+dist/
+*.js.map
+.context/

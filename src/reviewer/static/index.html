@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>agent-mail reviewer</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>agent-mail</h1>
+      <p class="subtitle">Reviewer</p>
+    </header>
+
+    <div class="auth-bar" id="auth-bar">
+      <input type="password" id="token-input" placeholder="Bearer token" />
+      <button onclick="setToken()">Set Token</button>
+    </div>
+
+    <div class="tabs">
+      <button class="tab active" onclick="showTab('pending')">Pending</button>
+      <button class="tab" onclick="showTab('audit')">Audit Log</button>
+      <button class="tab" onclick="showTab('stuck')">Stuck</button>
+    </div>
+
+    <div id="pending-tab" class="tab-content active">
+      <div id="pending-list"></div>
+    </div>
+
+    <div id="audit-tab" class="tab-content">
+      <div id="audit-list"></div>
+    </div>
+
+    <div id="stuck-tab" class="tab-content">
+      <div id="stuck-list"></div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

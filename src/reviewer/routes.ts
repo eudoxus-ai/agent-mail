@@ -1,0 +1,91 @@
+import { Router } from 'express';
+import type { Database } from '../ledger/sqlite.js';
+import type { Executor } from '../executor/executor.js';
+import type { Logger } from '../logger.js';
+import { getPendingIntents, getIntent } from '../ledger/intents.js';
+import { getAuditLog } from '../ledger/audit.js';
+import { checkStuckExecuting } from '../ledger/db.js';
+import { loadAccounts } from '../provider/accounts.js';
+
+export interface RouterDeps {
+  db: Database;
+  executor: Executor;
+  logger: Logger;
+}
+
+export function createRouter(deps: RouterDeps): Router {
+  const router = Router();
+
+  router.get('/api/pending', (req, res) => {
+    const accountId = req.query.account_id as string | undefined;
+    const pending = getPendingIntents(deps.db, accountId);
+    res.json(pending);
+  });
+
+  router.get('/api/audit', (req, res) => {
+    const entries = getAuditLog(deps.db, {
+      account_id: req.query.account_id as string | undefined,
+      limit: parseInt(req.query.limit as string) || 50,
+      offset: parseInt(req.query.offset as string) || 0,
+    });
+    res.json(entries);
+  });
+
+  router.get('/api/intent/:id', (req, res) => {
+    const intent = getIntent(deps.db, req.params.id);
+    if (!intent) {
+      res.status(404).json({ error: 'Intent not found' });
+      return;
+    }
+    res.json(intent);
+  });
+
+  router.post('/api/intent/:id/approve', async (req, res) => {
+    try {
+      const intent = await deps.executor.approveAndExecute(req.params.id);
+      res.json(intent);
+    } catch (error) {
+      deps.logger.error('Approve failed', {
+        id: req.params.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      res.status(400).json({
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  router.post('/api/intent/:id/reject', async (req, res) => {
+    try {
+      const reason = req.body?.reason as string | undefined;
+      const intent = await deps.executor.rejectIntent(req.params.id, reason);
+      res.json(intent);
+    } catch (error) {
+      deps.logger.error('Reject failed', {
+        id: req.params.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      res.status(400).json({
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  router.get('/api/accounts', (_req, res) => {
+    try {
+      const accounts = loadAccounts();
+      res.json(
+        accounts.map((a) => ({ id: a.id, email: a.email }))
+      );
+    } catch {
+      res.json([]);
+    }
+  });
+
+  router.get('/api/stuck', (_req, res) => {
+    const stuck = checkStuckExecuting(deps.db);
+    res.json(stuck);
+  });
+
+  return router;
+}
