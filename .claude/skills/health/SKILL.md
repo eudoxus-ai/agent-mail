@@ -1,1 +1,1 @@
-/Users/cameronpope/source/eudoxus/agent-mail/.claude/skills/gstack/health/SKILL.md
+/Users/cameronpope/conductor/workspaces/agent-mail/minnetonka-v1/.claude/skills/gstack/health/SKILL.md
