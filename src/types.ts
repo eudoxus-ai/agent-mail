@@ -10,6 +10,9 @@ export interface AccountConfig {
   email: string;
   imap: { host: string; port: number; tls: boolean };
   smtp: { host: string; port: number; tls: boolean };
+}
+
+export interface ResolvedAccount extends AccountConfig {
   auth: { user: string; pass: string };
 }
 
