@@ -1,8 +1,8 @@
 import nodemailer from 'nodemailer';
 import type { Transporter } from 'nodemailer';
-import type { AccountConfig } from '../types.js';
+import type { ResolvedAccount } from '../types.js';
 
-export function createSmtpTransport(account: AccountConfig): Transporter {
+export function createSmtpTransport(account: ResolvedAccount): Transporter {
   return nodemailer.createTransport({
     host: account.smtp.host,
     port: account.smtp.port,
