@@ -9,7 +9,7 @@ import type { AccountConfig } from '../../src/types.js';
 
 // Mock IMAP/SMTP
 vi.mock('../../src/provider/imap.js', () => ({
-  ImapProvider: vi.fn().mockImplementation(() => ({
+  ImapProvider: vi.fn().mockImplementation(function () { return {
     connect: vi.fn().mockResolvedValue(undefined),
     disconnect: vi.fn().mockResolvedValue(undefined),
     search: vi.fn().mockResolvedValue([
@@ -26,7 +26,7 @@ vi.mock('../../src/provider/imap.js', () => ({
     removeFlags: vi.fn().mockResolvedValue(undefined),
     getMailboxPath: vi.fn().mockResolvedValue('agent-mail-quarantine'),
     ensureMailbox: vi.fn().mockResolvedValue(undefined),
-  })),
+  }; }),
 }));
 
 vi.mock('../../src/provider/smtp.js', () => ({
