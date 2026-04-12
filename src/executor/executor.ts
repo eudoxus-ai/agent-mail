@@ -8,6 +8,7 @@ import {
 } from '../ledger/intents.js';
 import { logAudit } from '../ledger/audit.js';
 import { getAccount } from '../provider/accounts.js';
+import { resolveCredentials } from '../provider/credentials.js';
 import { ImapProvider } from '../provider/imap.js';
 import { createSmtpTransport, sendMail } from '../provider/smtp.js';
 import { generateUndoToken, getUndoExpiry, parseUndoToken } from './undo.js';
@@ -268,7 +269,8 @@ export class Executor {
     intent: Intent
   ): Promise<Array<{ type: 'text'; text: string }>> {
     const account = getAccount(this.accounts, intent.account_id);
-    const imap = new ImapProvider(account);
+    const resolved = resolveCredentials(account);
+    const imap = new ImapProvider(resolved);
 
     try {
       await imap.connect();
@@ -361,7 +363,7 @@ export class Executor {
         }
 
         case 'queue_send': {
-          const transport = createSmtpTransport(account);
+          const transport = createSmtpTransport(resolved);
           const result = await sendMail(transport, {
             from: account.email,
             to: intent.params.to as string,
@@ -422,7 +424,8 @@ export class Executor {
     undoOp: { reverseAction: string; params: Record<string, unknown> }
   ): Promise<void> {
     const account = getAccount(this.accounts, intent.account_id);
-    const imap = new ImapProvider(account);
+    const resolved = resolveCredentials(account);
+    const imap = new ImapProvider(resolved);
 
     try {
       await imap.connect();
