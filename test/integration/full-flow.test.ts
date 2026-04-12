@@ -34,12 +34,18 @@ vi.mock('../../src/provider/smtp.js', () => ({
   sendMail: vi.fn().mockResolvedValue({ messageId: 'sent-456' }),
 }));
 
+vi.mock('../../src/provider/credentials.js', () => ({
+  resolveCredentials: vi.fn().mockImplementation((account: any) => ({
+    ...account,
+    auth: { user: account.email, pass: 'mock-password' },
+  })),
+}));
+
 const testAccount: AccountConfig = {
   id: 'gmail',
   email: 'cameron@gmail.com',
   imap: { host: 'imap.gmail.com', port: 993, tls: true },
   smtp: { host: 'smtp.gmail.com', port: 587, tls: true },
-  auth: { user: 'cameron@gmail.com', pass: 'test-pass' },
 };
 
 let db: Database;
