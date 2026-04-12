@@ -3,6 +3,7 @@ import { writeFileSync } from 'node:fs';
 import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import type { AccountConfig } from '../../src/types.js';
 import { loadAccounts, getAccount, getDefaultAccount, detectImapSmtp } from '../../src/provider/accounts.js';
 
 describe('loadAccounts', () => {
@@ -16,7 +17,6 @@ describe('loadAccounts', () => {
     email: test@gmail.com
     imap: { host: imap.gmail.com, port: 993, tls: true }
     smtp: { host: smtp.gmail.com, port: 587, tls: true }
-    auth: { user: test@gmail.com, pass: secret }
 `
     );
     const accounts = loadAccounts(path);
@@ -34,9 +34,9 @@ describe('loadAccounts', () => {
 });
 
 describe('getAccount', () => {
-  const accounts = [
-    { id: 'gmail', email: 'a@gmail.com', imap: { host: '', port: 993, tls: true }, smtp: { host: '', port: 587, tls: true }, auth: { user: '', pass: '' } },
-    { id: 'icloud', email: 'b@icloud.com', imap: { host: '', port: 993, tls: true }, smtp: { host: '', port: 587, tls: true }, auth: { user: '', pass: '' } },
+  const accounts: AccountConfig[] = [
+    { id: 'gmail', email: 'a@gmail.com', imap: { host: '', port: 993, tls: true }, smtp: { host: '', port: 587, tls: true } },
+    { id: 'icloud', email: 'b@icloud.com', imap: { host: '', port: 993, tls: true }, smtp: { host: '', port: 587, tls: true } },
   ];
 
   it('finds account by id', () => {
@@ -50,8 +50,8 @@ describe('getAccount', () => {
 
 describe('getDefaultAccount', () => {
   it('returns first account', () => {
-    const accounts = [
-      { id: 'first', email: 'a@test.com', imap: { host: '', port: 993, tls: true }, smtp: { host: '', port: 587, tls: true }, auth: { user: '', pass: '' } },
+    const accounts: AccountConfig[] = [
+      { id: 'first', email: 'a@test.com', imap: { host: '', port: 993, tls: true }, smtp: { host: '', port: 587, tls: true } },
     ];
     expect(getDefaultAccount(accounts).id).toBe('first');
   });
