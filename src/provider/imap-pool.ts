@@ -146,7 +146,7 @@ export class ImapConnectionPool {
       const p = entry.provider;
       if (!p) return;
       try {
-        await (p as unknown as { noop: () => Promise<void> }).noop();
+        await p.noop();
       } catch (err) {
         this.logger.warn(`Keepalive NOOP failed for ${accountId}`, {
           error: err instanceof Error ? err.message : String(err),
