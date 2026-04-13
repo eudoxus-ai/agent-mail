@@ -67,7 +67,7 @@ describe('computeSignals — recipient signals', () => {
 });
 
 describe('computeSignals — sender signals', () => {
-  it('flags list mail by List-Id presence', () => {
+  it('flags list mail by List-Unsubscribe presence', () => {
     const msg = makeMessage({ listUnsubscribe: '<https://x/u>' });
     const s = computeSignals(msg, { accountEmail: me, threadMessages: [] });
     expect(s.is_list_mail).toBe(true);
