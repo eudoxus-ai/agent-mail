@@ -4,6 +4,7 @@ import { openDatabase } from '../../src/ledger/db.js';
 import { getIntent } from '../../src/ledger/intents.js';
 import { getAuditLog } from '../../src/ledger/audit.js';
 import { Executor } from '../../src/executor/executor.js';
+import { ImapConnectionPool } from '../../src/provider/imap-pool.js';
 import { createLogger } from '../../src/logger.js';
 import type { AccountConfig } from '../../src/types.js';
 
@@ -47,6 +48,21 @@ vi.mock('../../src/provider/credentials.js', () => ({
   })),
 }));
 
+// Mock pool that simply resolves credentials and calls fn with a fresh mock provider
+vi.mock('../../src/provider/imap-pool.js', () => ({
+  ImapConnectionPool: vi.fn().mockImplementation(function () {
+    return {
+      withConnection: vi.fn(async (_: string, fn: (imap: any) => Promise<any>) => {
+        const { ImapProvider } = await import('../../src/provider/imap.js');
+        const provider = new (ImapProvider as any)();
+        await provider.connect();
+        return fn(provider);
+      }),
+      closeAll: vi.fn().mockResolvedValue(undefined),
+    };
+  }),
+}));
+
 const testAccount: AccountConfig = {
   id: 'test',
   email: 'test@example.com',
@@ -56,12 +72,18 @@ const testAccount: AccountConfig = {
 
 let db: Database;
 let executor: Executor;
+let pool: ImapConnectionPool;
 
 beforeEach(() => {
   db = openDatabase(':memory:');
+  pool = new ImapConnectionPool({
+    accounts: [testAccount],
+    logger: createLogger('cli', { minLevel: 'error' }),
+  });
   executor = new Executor({
     db,
     accounts: [testAccount],
+    pool,
     logger: createLogger('cli', { minLevel: 'error' }),
   });
 });

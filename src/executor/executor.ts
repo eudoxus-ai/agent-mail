@@ -1,6 +1,7 @@
 import type { Database } from '../ledger/sqlite.js';
 import type { AccountConfig, Intent, RiskLevel } from '../types.js';
 import type { Logger } from '../logger.js';
+import type { ImapConnectionPool } from '../provider/imap-pool.js';
 import {
   createIntent,
   getIntent,
@@ -9,24 +10,26 @@ import {
 import { logAudit } from '../ledger/audit.js';
 import { getAccount } from '../provider/accounts.js';
 import { resolveCredentials } from '../provider/credentials.js';
-import { ImapProvider } from '../provider/imap.js';
 import { createSmtpTransport, sendMail } from '../provider/smtp.js';
 import { generateUndoToken, getUndoExpiry, parseUndoToken } from './undo.js';
 
 export interface ExecutorDeps {
   db: Database;
   accounts: AccountConfig[];
+  pool: ImapConnectionPool;
   logger: Logger;
 }
 
 export class Executor {
   private db: Database;
   private accounts: AccountConfig[];
+  private pool: ImapConnectionPool;
   private logger: Logger;
 
   constructor(deps: ExecutorDeps) {
     this.db = deps.db;
     this.accounts = deps.accounts;
+    this.pool = deps.pool;
     this.logger = deps.logger;
   }
 
@@ -270,11 +273,8 @@ export class Executor {
   ): Promise<Array<{ type: 'text'; text: string }>> {
     const account = getAccount(this.accounts, intent.account_id);
     const resolved = resolveCredentials(account);
-    const imap = new ImapProvider(resolved);
 
-    try {
-      await imap.connect();
-
+    return this.pool.withConnection(intent.account_id, async (imap) => {
       switch (intent.tool) {
         case 'search_threads': {
           const results = await imap.search(
@@ -284,15 +284,13 @@ export class Executor {
               to: intent.params.to as string | undefined,
               subject: intent.params.subject as string | undefined,
               body: intent.params.body as string | undefined,
+              since: intent.params.since
+                ? new Date(intent.params.since as string)
+                : undefined,
             },
             (intent.params.limit as number) ?? 20
           );
-          return [
-            {
-              type: 'text',
-              text: JSON.stringify(results, null, 2),
-            },
-          ];
+          return [{ type: 'text', text: JSON.stringify(results, null, 2) }];
         }
 
         case 'read_thread': {
@@ -345,7 +343,10 @@ export class Executor {
             await imap.removeFlags(uids, [label], mailbox);
           }
           return [
-            { type: 'text', text: `Label "${label}" ${action === 'add' ? 'applied' : 'removed'}` },
+            {
+              type: 'text',
+              text: `Label "${label}" ${action === 'add' ? 'applied' : 'removed'}`,
+            },
           ];
         }
 
@@ -363,6 +364,7 @@ export class Executor {
         }
 
         case 'queue_send': {
+          // SMTP doesn't go through the pool — it creates its own transport
           const transport = createSmtpTransport(resolved);
           const result = await sendMail(transport, {
             from: account.email,
@@ -410,26 +412,14 @@ export class Executor {
         default:
           return [{ type: 'text', text: `Unknown tool: ${intent.tool}` }];
       }
-    } finally {
-      try {
-        await imap.disconnect();
-      } catch {
-        // Best effort disconnect
-      }
-    }
+    });
   }
 
   private async performUndo(
     intent: Intent,
     undoOp: { reverseAction: string; params: Record<string, unknown> }
   ): Promise<void> {
-    const account = getAccount(this.accounts, intent.account_id);
-    const resolved = resolveCredentials(account);
-    const imap = new ImapProvider(resolved);
-
-    try {
-      await imap.connect();
-
+    await this.pool.withConnection(intent.account_id, async (imap) => {
       switch (undoOp.reverseAction) {
         case 'move_back_to_inbox': {
           const uids = intent.params.uids as number[];
@@ -445,7 +435,6 @@ export class Executor {
           const action = intent.params.action as 'add' | 'remove';
           const label = intent.params.label as string;
 
-          // Reverse the original action
           if (action === 'add') {
             await imap.removeFlags(uids, [label], mailbox);
           } else {
@@ -457,12 +446,6 @@ export class Executor {
         default:
           throw new Error(`Unknown undo action: ${undoOp.reverseAction}`);
       }
-    } finally {
-      try {
-        await imap.disconnect();
-      } catch {
-        // Best effort
-      }
-    }
+    });
   }
 }

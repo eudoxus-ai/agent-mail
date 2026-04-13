@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { openDatabase, checkStuckExecuting } from '../ledger/db.js';
 import { loadAccounts } from '../provider/accounts.js';
 import { verifyKeychainAccess } from '../provider/keychain.js';
+import { ImapConnectionPool } from '../provider/imap-pool.js';
 import { loadPolicy } from '../policy/engine.js';
 import { Executor } from '../executor/executor.js';
 import { wrapToolHandler } from './middleware.js';
@@ -36,7 +37,12 @@ const ALL_TOOLS: ToolDefinition[] = [
   undoIntentTool,
 ];
 
-export async function createMcpServer(): Promise<McpServer> {
+export interface McpServerBundle {
+  server: McpServer;
+  pool: ImapConnectionPool;
+}
+
+export async function createMcpServer(): Promise<McpServerBundle> {
   const logger = createLogger('mcp');
 
   // Verify Keychain access
@@ -82,8 +88,11 @@ export async function createMcpServer(): Promise<McpServer> {
   // Load policy
   const policy = loadPolicy();
 
+  // Construct IMAP connection pool
+  const pool = new ImapConnectionPool({ accounts, logger });
+
   // Create executor
-  const executor = new Executor({ db, accounts, logger });
+  const executor = new Executor({ db, accounts, pool, logger });
 
   // Create MCP server
   const server = new McpServer(
@@ -161,5 +170,5 @@ export async function createMcpServer(): Promise<McpServer> {
     `agent-mail MCP server initialized with ${accounts.length} account(s) and ${ALL_TOOLS.length} tools`
   );
 
-  return server;
+  return { server, pool };
 }

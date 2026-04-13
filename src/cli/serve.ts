@@ -11,7 +11,19 @@ export async function serve(): Promise<void> {
     process.exit(1);
   }
 
-  const server = await createMcpServer();
+  const { server, pool } = await createMcpServer();
   const transport = new StdioServerTransport();
+
+  const shutdown = async (code = 0) => {
+    try {
+      await pool.closeAll();
+    } catch {
+      // best-effort
+    }
+    process.exit(code);
+  };
+  process.once('SIGINT', () => void shutdown(0));
+  process.once('SIGTERM', () => void shutdown(0));
+
   await server.connect(transport);
 }
