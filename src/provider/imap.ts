@@ -1,5 +1,16 @@
 import { ImapFlow } from 'imapflow';
-import type { ResolvedAccount, EmailMessage, SearchCriteria } from '../types.js';
+import type { ResolvedAccount, EmailMessage, SearchCriteria, Participant } from '../types.js';
+
+function toParticipant(addr: { name?: string | null; address?: string | null } | undefined): Participant {
+  return {
+    address: (addr?.address ?? '').trim().toLowerCase(),
+    name: addr?.name?.trim() || null,
+  };
+}
+
+function toParticipants(addrs: Array<{ name?: string | null; address?: string | null }> | undefined): Participant[] {
+  return (addrs ?? []).map(toParticipant);
+}
 
 export class ImapProvider {
   private client: ImapFlow;
@@ -31,7 +42,7 @@ export class ImapProvider {
     mailbox: string,
     criteria: SearchCriteria,
     limit: number = 20
-  ): Promise<Array<{ uid: number; envelope: { subject: string; from: string; date: string }; snippet: string; flags: string[] }>> {
+  ): Promise<Array<{ uid: number; envelope: { subject: string; from: Participant; date: string }; snippet: string; flags: string[] }>> {
     const lock = await this.client.getMailboxLock(mailbox);
     try {
       const searchQuery: Record<string, unknown> = {};
@@ -44,12 +55,11 @@ export class ImapProvider {
       if (criteria.flagged !== undefined) searchQuery.flagged = criteria.flagged;
       if (criteria.seen !== undefined) searchQuery.seen = criteria.seen;
 
-      // Default: search all if no criteria
       const query = Object.keys(searchQuery).length > 0 ? searchQuery : { all: true };
 
       const results: Array<{
         uid: number;
-        envelope: { subject: string; from: string; date: string };
+        envelope: { subject: string; from: Participant; date: string };
         snippet: string;
         flags: string[];
       }> = [];
@@ -60,19 +70,15 @@ export class ImapProvider {
         envelope: true,
         flags: true,
         bodyStructure: true,
-        source: { start: 0, maxLength: 256 }, // snippet
+        source: { start: 0, maxLength: 256 },
       })) {
         if (count >= limit) break;
-        const fromAddr =
-          msg.envelope?.from?.[0]
-            ? `${msg.envelope.from[0].name ?? ''} <${msg.envelope.from[0].address ?? ''}>`
-            : 'unknown';
 
         results.push({
           uid: msg.uid,
           envelope: {
             subject: msg.envelope?.subject ?? '(no subject)',
-            from: fromAddr,
+            from: toParticipant(msg.envelope?.from?.[0]),
             date: msg.envelope?.date?.toISOString() ?? new Date().toISOString(),
           },
           snippet: msg.source?.toString('utf-8', 0, 200) ?? '',
@@ -107,18 +113,9 @@ export class ImapProvider {
 
       const msg = result;
 
-      const fromAddr =
-        msg.envelope?.from?.[0]
-          ? `${msg.envelope.from[0].name ?? ''} <${msg.envelope.from[0].address ?? ''}>`
-          : 'unknown';
-
-      const toAddrs = (msg.envelope?.to ?? []).map(
-        (a: any) => `${a.name ?? ''} <${a.address ?? ''}>`
-      );
-
-      const ccAddrs = (msg.envelope?.cc ?? []).map(
-        (a: any) => `${a.name ?? ''} <${a.address ?? ''}>`
-      );
+      const fromAddr = toParticipant(msg.envelope?.from?.[0]);
+      const toAddrs = toParticipants(msg.envelope?.to);
+      const ccAddrs = toParticipants(msg.envelope?.cc);
 
       // Parse headers from source for threading
       const source = msg.source?.toString('utf-8') ?? '';

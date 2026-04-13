@@ -126,12 +126,17 @@ export interface ToolDefinition {
 
 // === Email ===
 
+export interface Participant {
+  address: string; // lowercased, trimmed
+  name: string | null;
+}
+
 export interface EmailMessage {
   uid: number;
   messageId: string;
-  from: string;
-  to: string[];
-  cc: string[];
+  from: Participant;
+  to: Participant[];
+  cc: Participant[];
   date: string;
   subject: string;
   bodyText: string;
@@ -147,7 +152,7 @@ export interface EmailThread {
   threadId: string;
   accountId: string;
   subject: string;
-  participants: string[];
+  participants: Participant[];
   messageCount: number;
   messages: EmailMessage[];
 }
