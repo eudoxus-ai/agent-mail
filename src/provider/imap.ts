@@ -1,5 +1,7 @@
 import { ImapFlow } from 'imapflow';
 import type { ResolvedAccount, EmailMessage, SearchCriteria, Participant } from '../types.js';
+import { pickNewestUids } from './search-ordering.js';
+import { extractSnippet } from './mime.js';
 
 function toParticipant(addr: { name?: string | null; address?: string | null } | undefined): Participant {
   return {
@@ -57,6 +59,15 @@ export class ImapProvider {
 
       const query = Object.keys(searchQuery).length > 0 ? searchQuery : { all: true };
 
+      // Phase 1: cheap UID-only search. imapflow returns ascending UIDs (or false on failure).
+      const searchResult = await this.client.search(query as any, { uid: true });
+      const allUids: number[] = Array.isArray(searchResult) ? searchResult : [];
+      if (allUids.length === 0) return [];
+
+      const uidsToFetch = pickNewestUids(allUids, limit);
+      if (uidsToFetch.length === 0) return [];
+
+      // Phase 2: hydrate envelopes + partial source for the selected UIDs.
       const results: Array<{
         uid: number;
         envelope: { subject: string; from: Participant; date: string };
@@ -64,16 +75,16 @@ export class ImapProvider {
         flags: string[];
       }> = [];
 
-      let count = 0;
-      for await (const msg of this.client.fetch(query as any, {
-        uid: true,
-        envelope: true,
-        flags: true,
-        bodyStructure: true,
-        source: { start: 0, maxLength: 256 },
-      })) {
-        if (count >= limit) break;
-
+      for await (const msg of this.client.fetch(
+        uidsToFetch.join(','),
+        {
+          uid: true,
+          envelope: true,
+          flags: true,
+          source: { start: 0, maxLength: 2048 },
+        },
+        { uid: true }
+      )) {
         results.push({
           uid: msg.uid,
           envelope: {
@@ -81,11 +92,17 @@ export class ImapProvider {
             from: toParticipant(msg.envelope?.from?.[0]),
             date: msg.envelope?.date?.toISOString() ?? new Date().toISOString(),
           },
-          snippet: msg.source?.toString('utf-8', 0, 200) ?? '',
+          snippet: extractSnippet(msg.source ?? Buffer.alloc(0)),
           flags: Array.from(msg.flags ?? []),
         });
-        count++;
       }
+
+      // Sort descending by date (newest first). IMAP UIDs are usually chronological
+      // but not guaranteed, so sort on the envelope date we already have.
+      results.sort(
+        (a, b) => new Date(b.envelope.date).getTime() - new Date(a.envelope.date).getTime()
+      );
+
       return results;
     } finally {
       lock.release();
