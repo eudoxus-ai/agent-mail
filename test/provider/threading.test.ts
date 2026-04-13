@@ -80,30 +80,37 @@ describe('buildThreads', () => {
     ];
 
     const threads = buildThreads(messages, 'gmail');
-    const addresses = threads[0].participants.map((p) =>
-      typeof p === 'string' ? p : p.address
-    );
+    const addresses = threads[0].participants.map((p) => p.address);
     expect(addresses).toContain('alice@test.com');
     expect(addresses).toContain('bob@test.com');
     expect(addresses).toContain('carol@test.com');
   });
 
-  it('collects Participant objects with lowercased addresses', () => {
+  it('dedupes participants with the same address across multiple messages', () => {
     const messages: EmailMessage[] = [
       makeMessage({
         uid: 1,
         messageId: 'msg-1@test.com',
-        from: { address: 'Alice@Test.com', name: 'Alice' },
-        to: [{ address: 'BOB@test.com', name: null }],
+        from: { address: 'alice@test.com', name: 'Alice' },
+        to: [{ address: 'bob@test.com', name: 'Bob' }],
+        date: '2026-04-10T10:00:00Z',
+      }),
+      makeMessage({
+        uid: 2,
+        messageId: 'msg-2@test.com',
+        from: { address: 'bob@test.com', name: 'Bob' },
+        to: [{ address: 'alice@test.com', name: 'Alice' }],
+        inReplyTo: 'msg-1@test.com',
+        references: ['msg-1@test.com'],
+        date: '2026-04-10T11:00:00Z',
       }),
     ];
 
     const threads = buildThreads(messages, 'gmail');
-    const addresses = threads[0].participants.map((p) =>
-      typeof p === 'string' ? p : p.address
-    );
-    expect(addresses).toContain('alice@test.com');
-    expect(addresses).toContain('bob@test.com');
+    expect(threads).toHaveLength(1);
+    const addresses = threads[0].participants.map((p) => p.address);
+    // alice and bob each appear twice (from and to), should be deduped to 2 participants
+    expect(addresses).toEqual(['alice@test.com', 'bob@test.com']);
   });
 
   it('handles single message as its own thread', () => {

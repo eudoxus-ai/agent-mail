@@ -69,14 +69,15 @@ export function buildThreads(
       (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()
     );
 
-    // Union of participants across the thread, ordered by first appearance
+    // Union of participants across the thread, ordered by first appearance.
+    // Participant.address is contractually pre-normalized (trimmed + lowercased)
+    // by toParticipant at the IMAP boundary — trust the type here.
     const seen = new Set<string>();
     const participants: Participant[] = [];
     const addParticipant = (p: Participant) => {
-      const normalized = p.address.trim().toLowerCase();
-      if (!seen.has(normalized)) {
-        seen.add(normalized);
-        participants.push({ address: normalized, name: p.name });
+      if (!seen.has(p.address)) {
+        seen.add(p.address);
+        participants.push(p);
       }
     };
     for (const msg of msgs) {
