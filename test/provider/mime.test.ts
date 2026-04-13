@@ -75,8 +75,7 @@ describe('extractSnippet', () => {
     const body = 'a'.repeat(500);
     const source = msg('Content-Type: text/plain; charset=utf-8', body);
     const snippet = extractSnippet(source);
-    expect(snippet.length).toBeLessThanOrEqual(200);
-    expect(snippet.length).toBeGreaterThan(0);
+    expect(snippet).toBe('a'.repeat(200));
   });
 
   it('accepts string input as well as Buffer', () => {

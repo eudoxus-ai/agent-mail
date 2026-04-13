@@ -22,7 +22,7 @@ export function extractSnippet(source: Buffer | string, maxLength = 200): string
       if (!boundary) return '';
       const plainPart = findTextPlainPart(body, boundary);
       if (!plainPart) return '';
-      rawBody = decodePart(plainPart);
+      rawBody = plainPart;
     } else if (/^text\/plain/i.test(contentType)) {
       const encoding = getHeader(headers, 'content-transfer-encoding') ?? '7bit';
       rawBody = decodeEncoding(body, encoding);
@@ -77,10 +77,6 @@ function findTextPlainPart(body: string, boundary: string): string | null {
     }
   }
   return null;
-}
-
-function decodePart(text: string): string {
-  return text;
 }
 
 function decodeEncoding(body: string, encoding: string): string {
