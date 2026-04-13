@@ -117,7 +117,7 @@ export function computeSignals(
   };
 }
 
-function isAutomatedSender(address: string): boolean {
+export function isAutomatedSender(address: string): boolean {
   const localPart = address.toLowerCase().split('@')[0] ?? '';
   return AUTOMATED_LOCAL_PARTS.some((re) => re.test(localPart));
 }

@@ -1,6 +1,6 @@
 import type { Database } from '../ledger/sqlite.js';
-import type { AccountConfig, EmailMessage, Intent, RiskLevel } from '../types.js';
-import { computeSignals } from '../attention/signals.js';
+import type { AccountConfig, Intent, RiskLevel } from '../types.js';
+import { isAutomatedSender } from '../attention/signals.js';
 import type { Logger } from '../logger.js';
 import type { ImapConnectionPool } from '../provider/imap-pool.js';
 import {
@@ -317,30 +317,14 @@ export class Executor {
             (intent.params.limit as number) ?? 20
           );
 
-          // Decorate with message-level signals. Thread-level signals require
-          // additional context fetching and are delivered by get_overview.
-          const decorated = results.map((r) => {
-            const stubMessage: EmailMessage = {
-              uid: r.uid,
-              messageId: `${r.uid}@${account.email}`,
-              from: r.envelope.from,
-              to: [],
-              cc: [],
-              date: r.envelope.date,
-              subject: r.envelope.subject,
-              bodyText: '',
-              references: [],
-              flags: r.flags,
-              mailbox: (intent.params.mailbox as string) ?? 'INBOX',
-            };
-            return {
-              ...r,
-              signals: computeSignals(stubMessage, {
-                accountEmail: account.email,
-                threadMessages: [],
-              }),
-            };
-          });
+          // Decorate with the only signal that's reliably computable from
+          // partial envelope data. Full triage signals (direct_to_me, thread
+          // state, network, etc.) require thread context and are delivered
+          // by get_overview.
+          const decorated = results.map((r) => ({
+            ...r,
+            is_automated: isAutomatedSender(r.envelope.from.address),
+          }));
 
           return [{ type: 'text', text: JSON.stringify(decorated, null, 2) }];
         }

@@ -13,7 +13,18 @@ vi.mock('../../src/provider/imap.js', () => ({
   ImapProvider: vi.fn().mockImplementation(function () { return {
     connect: vi.fn().mockResolvedValue(undefined),
     disconnect: vi.fn().mockResolvedValue(undefined),
-    search: vi.fn().mockResolvedValue([]),
+    search: vi.fn().mockResolvedValue([
+      {
+        uid: 42,
+        envelope: {
+          subject: 'Hello',
+          from: { address: 'noreply@github.com', name: 'GitHub' },
+          date: '2026-04-12T10:00:00Z',
+        },
+        snippet: 'A snippet',
+        flags: [],
+      },
+    ]),
     fetchMessage: vi.fn().mockResolvedValue({
       uid: 1,
       messageId: 'test',
@@ -173,6 +184,24 @@ describe('Executor.executeImmediate', () => {
     const audit = getAuditLog(db, { intent_id: intent.id });
     expect(audit.some((a) => a.action === 'executing')).toBe(true);
     expect(audit.some((a) => a.action === 'executed')).toBe(true);
+  });
+
+  it('decorates search_threads results with is_automated', async () => {
+    const { result } = await executor.executeImmediate({
+      tool: 'search_threads',
+      toolParams: { query: 'hello' },
+      accountId: 'test',
+      agentId: 'claude',
+      risk: 'none',
+    });
+
+    const parsed = JSON.parse(result[0].text);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].uid).toBe(42);
+    expect(parsed[0].is_automated).toBe(true);
+    // Negative assertion — the stripped fields must NOT be present
+    expect(parsed[0].signals).toBeUndefined();
+    expect(parsed[0].direct_to_me).toBeUndefined();
   });
 });
 
