@@ -62,7 +62,11 @@ export function verifyKeychainAccess(): void {
   try {
     storePassword(KEYCHAIN_SERVICE, VERIFY_ACCOUNT, VERIFY_VALUE);
     const readBack = getPassword(KEYCHAIN_SERVICE, VERIFY_ACCOUNT);
-    deletePassword(KEYCHAIN_SERVICE, VERIFY_ACCOUNT);
+    try {
+      deletePassword(KEYCHAIN_SERVICE, VERIFY_ACCOUNT);
+    } catch {
+      // Best effort — don't let a delete failure mask the real result
+    }
     if (readBack !== VERIFY_VALUE) {
       throw new Error(`read-back mismatch: expected "${VERIFY_VALUE}", got "${readBack}"`);
     }

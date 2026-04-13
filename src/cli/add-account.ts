@@ -102,10 +102,6 @@ export async function addAccount(): Promise<void> {
     process.exit(1);
   }
 
-  // Store password in Keychain
-  storePassword(KEYCHAIN_SERVICE, account.id, hostAnswers.password);
-  console.log(`Password stored in macOS Keychain (service: "${KEYCHAIN_SERVICE}", account: "${account.id}")`);
-
   // Load or create accounts.yaml
   let accounts: AccountConfig[] = [];
   if (existsSync(ACCOUNTS_YAML_PATH)) {
@@ -120,6 +116,10 @@ export async function addAccount(): Promise<void> {
     console.error(`Account with ID "${account.id}" already exists.`);
     process.exit(1);
   }
+
+  // Store password in Keychain
+  storePassword(KEYCHAIN_SERVICE, account.id, hostAnswers.password);
+  console.log(`Password stored in macOS Keychain (service: "${KEYCHAIN_SERVICE}", account: "${account.id}")`);
 
   accounts.push(account);
   writeFileSync(
