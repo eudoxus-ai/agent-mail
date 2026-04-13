@@ -40,6 +40,10 @@ export class ImapProvider {
     await this.client.logout();
   }
 
+  async noop(): Promise<void> {
+    await this.client.noop();
+  }
+
   async search(
     mailbox: string,
     criteria: SearchCriteria,
