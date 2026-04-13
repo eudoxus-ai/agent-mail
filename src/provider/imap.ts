@@ -1,11 +1,11 @@
 import { ImapFlow } from 'imapflow';
-import type { AccountConfig, EmailMessage, SearchCriteria } from '../types.js';
+import type { ResolvedAccount, EmailMessage, SearchCriteria } from '../types.js';
 
 export class ImapProvider {
   private client: ImapFlow;
-  private account: AccountConfig;
+  private account: ResolvedAccount;
 
-  constructor(account: AccountConfig) {
+  constructor(account: ResolvedAccount) {
     this.account = account;
     this.client = new ImapFlow({
       host: account.imap.host,

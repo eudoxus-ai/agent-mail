@@ -6,10 +6,11 @@ import inquirer from 'inquirer';
 import { ensureAgentMailDir, ACCOUNTS_YAML_PATH } from '../config.js';
 import { detectImapSmtp } from '../provider/accounts.js';
 import { ImapProvider } from '../provider/imap.js';
+import { storePassword, KEYCHAIN_SERVICE } from '../provider/keychain.js';
 import { writeDefaultPolicy } from '../policy/defaults.js';
 import { openDatabase } from '../ledger/db.js';
 import { generateReviewerToken } from '../reviewer/auth.js';
-import type { AccountConfig } from '../types.js';
+import type { AccountConfig, ResolvedAccount } from '../types.js';
 
 export async function addAccount(): Promise<void> {
   ensureAgentMailDir();
@@ -78,15 +79,15 @@ export async function addAccount(): Promise<void> {
       port: hostAnswers.smtpPort,
       tls: true,
     },
-    auth: {
-      user: answers.email,
-      pass: hostAnswers.password,
-    },
   };
 
   // Test IMAP connection
   console.log('\nTesting IMAP connection...');
-  const imap = new ImapProvider(account);
+  const testResolved: ResolvedAccount = {
+    ...account,
+    auth: { user: answers.email, pass: hostAnswers.password },
+  };
+  const imap = new ImapProvider(testResolved);
   try {
     await imap.connect();
     await imap.disconnect();
@@ -115,6 +116,10 @@ export async function addAccount(): Promise<void> {
     console.error(`Account with ID "${account.id}" already exists.`);
     process.exit(1);
   }
+
+  // Store password in Keychain
+  storePassword(KEYCHAIN_SERVICE, account.id, hostAnswers.password);
+  console.log(`Password stored in macOS Keychain (service: "${KEYCHAIN_SERVICE}", account: "${account.id}")`);
 
   accounts.push(account);
   writeFileSync(

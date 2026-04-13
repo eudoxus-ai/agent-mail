@@ -1,6 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { openDatabase, checkStuckExecuting } from '../ledger/db.js';
 import { loadAccounts } from '../provider/accounts.js';
+import { verifyKeychainAccess } from '../provider/keychain.js';
 import { loadPolicy } from '../policy/engine.js';
 import { Executor } from '../executor/executor.js';
 import { wrapToolHandler } from './middleware.js';
@@ -37,6 +38,16 @@ const ALL_TOOLS: ToolDefinition[] = [
 
 export async function createMcpServer(): Promise<McpServer> {
   const logger = createLogger('mcp');
+
+  // Verify Keychain access
+  try {
+    verifyKeychainAccess();
+  } catch (error) {
+    logger.error(
+      `Keychain verification failed: ${error instanceof Error ? error.message : error}`
+    );
+    process.exit(1);
+  }
 
   // Load accounts
   let accounts;
