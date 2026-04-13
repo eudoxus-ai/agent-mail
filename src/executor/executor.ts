@@ -272,8 +272,33 @@ export class Executor {
     intent: Intent
   ): Promise<Array<{ type: 'text'; text: string }>> {
     const account = getAccount(this.accounts, intent.account_id);
-    const resolved = resolveCredentials(account);
 
+    // SMTP path doesn't use the pool — it creates its own transport.
+    // Handled before the pool borrow so the SMTP send doesn't hold the
+    // per-account IMAP serialization lock.
+    if (intent.tool === 'queue_send') {
+      const resolved = resolveCredentials(account);
+      const transport = createSmtpTransport(resolved);
+      const result = await sendMail(transport, {
+        from: account.email,
+        to: intent.params.to as string,
+        subject: intent.params.subject as string,
+        text: intent.params.body as string,
+        inReplyTo: intent.params.in_reply_to as string | undefined,
+        references: intent.params.references as string[] | undefined,
+      });
+      return [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            sent: true,
+            messageId: result.messageId,
+          }),
+        },
+      ];
+    }
+
+    // All other tools use IMAP via the pool
     return this.pool.withConnection(intent.account_id, async (imap) => {
       switch (intent.tool) {
         case 'search_threads': {
@@ -359,28 +384,6 @@ export class Executor {
             {
               type: 'text',
               text: `Moved ${uids.length} message(s) to quarantine`,
-            },
-          ];
-        }
-
-        case 'queue_send': {
-          // SMTP doesn't go through the pool — it creates its own transport
-          const transport = createSmtpTransport(resolved);
-          const result = await sendMail(transport, {
-            from: account.email,
-            to: intent.params.to as string,
-            subject: intent.params.subject as string,
-            text: intent.params.body as string,
-            inReplyTo: intent.params.in_reply_to as string | undefined,
-            references: intent.params.references as string[] | undefined,
-          });
-          return [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                sent: true,
-                messageId: result.messageId,
-              }),
             },
           ];
         }
