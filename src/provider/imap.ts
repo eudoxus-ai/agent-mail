@@ -113,6 +113,90 @@ export class ImapProvider {
     }
   }
 
+  /** Return the full list of UIDs matching a search criterion, ascending. */
+  async searchUids(
+    mailbox: string,
+    criteria: {
+      from?: string;
+      subject?: string;
+      body?: string;
+      since?: Date;
+      before?: Date;
+      flagged?: boolean;
+      seen?: boolean;
+      unseen?: boolean;
+      answered?: boolean;
+      unanswered?: boolean;
+    }
+  ): Promise<number[]> {
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      const query: Record<string, unknown> = {};
+      if (criteria.from) query.from = criteria.from;
+      if (criteria.subject) query.subject = criteria.subject;
+      if (criteria.body) query.body = criteria.body;
+      if (criteria.since) query.since = criteria.since;
+      if (criteria.before) query.before = criteria.before;
+      if (criteria.flagged !== undefined) query.flagged = criteria.flagged;
+      if (criteria.seen !== undefined) query.seen = criteria.seen;
+      if (criteria.unseen !== undefined) query.unseen = criteria.unseen;
+      if (criteria.answered !== undefined) query.answered = criteria.answered;
+      if (criteria.unanswered !== undefined) query.unanswered = criteria.unanswered;
+      const searchResult = await this.client.search(query as any, { uid: true });
+      return Array.isArray(searchResult) ? searchResult : [];
+    } finally {
+      lock.release();
+    }
+  }
+
+  /** Fetch envelopes + partial source for a specific list of UIDs. Returns EmailMessage objects with a `snippet` field. */
+  async fetchEnvelopes(
+    mailbox: string,
+    uids: number[]
+  ): Promise<Array<EmailMessage & { snippet: string }>> {
+    if (uids.length === 0) return [];
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      const results: Array<EmailMessage & { snippet: string }> = [];
+      for await (const msg of this.client.fetch(
+        uids.join(','),
+        {
+          uid: true,
+          envelope: true,
+          flags: true,
+          source: { start: 0, maxLength: 2048 },
+        },
+        { uid: true }
+      )) {
+        const source = msg.source?.toString('utf-8') ?? '';
+        const inReplyTo = extractHeader(source, 'In-Reply-To');
+        const references =
+          extractHeader(source, 'References')?.split(/\s+/).filter(Boolean) ?? [];
+        const listUnsubscribe = extractHeader(source, 'List-Unsubscribe');
+
+        results.push({
+          uid: msg.uid,
+          messageId: msg.envelope?.messageId ?? `${msg.uid}@unknown`,
+          from: toParticipant(msg.envelope?.from?.[0]),
+          to: toParticipants(msg.envelope?.to),
+          cc: toParticipants(msg.envelope?.cc),
+          date: msg.envelope?.date?.toISOString() ?? new Date().toISOString(),
+          subject: msg.envelope?.subject ?? '(no subject)',
+          bodyText: '',
+          inReplyTo: inReplyTo ?? undefined,
+          references,
+          flags: Array.from(msg.flags ?? []),
+          listUnsubscribe: listUnsubscribe ?? undefined,
+          mailbox,
+          snippet: extractSnippet(msg.source ?? Buffer.alloc(0)),
+        });
+      }
+      return results;
+    } finally {
+      lock.release();
+    }
+  }
+
   async fetchMessage(mailbox: string, uid: number): Promise<EmailMessage> {
     const lock = await this.client.getMailboxLock(mailbox);
     try {

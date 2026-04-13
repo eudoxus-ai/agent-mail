@@ -1,0 +1,153 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import type { AccountConfig } from '../../src/types.js';
+
+// Mock pool passes calls through to a per-test configured handler
+const accountImapBehavior: Record<string, any> = {};
+
+vi.mock('../../src/provider/imap-pool.js', () => ({
+  ImapConnectionPool: vi.fn().mockImplementation(function () {
+    return {
+      withConnection: vi.fn(async (accountId: string, fn: any) => {
+        const behavior = accountImapBehavior[accountId];
+        if (behavior?.throwOn === 'connect') {
+          throw new Error(behavior.error ?? 'boom');
+        }
+        return fn(behavior?.imap ?? {});
+      }),
+      closeAll: vi.fn().mockResolvedValue(undefined),
+    };
+  }),
+}));
+
+import { ImapConnectionPool } from '../../src/provider/imap-pool.js';
+import { createLogger } from '../../src/logger.js';
+import { runGetOverview } from '../../src/tools/get-overview.js';
+
+const personal: AccountConfig = {
+  id: 'personal',
+  email: 'you@example.com',
+  imap: { host: 'imap.example.com', port: 993, tls: true },
+  smtp: { host: 'smtp.example.com', port: 587, tls: true },
+};
+const work: AccountConfig = {
+  id: 'work',
+  email: 'you@work.com',
+  imap: { host: 'imap.work.com', port: 993, tls: true },
+  smtp: { host: 'smtp.work.com', port: 587, tls: true },
+};
+
+beforeEach(() => {
+  for (const k of Object.keys(accountImapBehavior)) delete accountImapBehavior[k];
+});
+
+describe('runGetOverview', () => {
+  it('returns threads for unread messages on a single account', async () => {
+    const pool = new ImapConnectionPool({
+      accounts: [personal],
+      logger: createLogger('cli', { minLevel: 'error' }),
+    });
+    accountImapBehavior.personal = {
+      imap: {
+        searchUids: vi.fn(async (_m: string, criteria: any) => {
+          if (criteria.unseen) return [101, 102];
+          return [];
+        }),
+        fetchEnvelopes: vi.fn(async (_m: string, uids: number[]) =>
+          uids.map((uid) => ({
+            uid,
+            messageId: `<msg-${uid}@example.com>`,
+            from: { address: 'alice@example.com', name: 'Alice' },
+            to: [{ address: 'you@example.com', name: null }],
+            cc: [],
+            date: '2026-04-12T10:00:00Z',
+            subject: `Subject ${uid}`,
+            bodyText: '',
+            references: [],
+            flags: [],
+            mailbox: 'INBOX',
+            snippet: `snippet ${uid}`,
+            listUnsubscribe: undefined,
+          }))
+        ),
+      },
+    };
+
+    const result = await runGetOverview({
+      pool,
+      accounts: [personal],
+      input: { include: ['unread'] },
+    });
+
+    expect(result.accounts).toHaveLength(1);
+    expect(result.accounts[0].account_id).toBe('personal');
+    expect(result.accounts[0].error).toBeNull();
+    expect(result.accounts[0].threads).toHaveLength(2);
+    expect(result.accounts[0].threads[0].categories).toContain('unread');
+    expect(result.accounts[0].threads[0].signals).toBeDefined();
+    expect(result.accounts[0].threads[0].latest_message.snippet).toMatch(/^snippet /);
+    expect(result.summary.total_threads).toBe(2);
+    expect(result.summary.by_category.unread).toBe(2);
+  });
+
+  it('isolates per-account failures', async () => {
+    const pool = new ImapConnectionPool({
+      accounts: [personal, work],
+      logger: createLogger('cli', { minLevel: 'error' }),
+    });
+    accountImapBehavior.personal = {
+      imap: {
+        searchUids: vi.fn(async () => []),
+        fetchEnvelopes: vi.fn(async () => []),
+      },
+    };
+    accountImapBehavior.work = {
+      throwOn: 'connect',
+      error: 'work account is down',
+    };
+
+    const result = await runGetOverview({
+      pool,
+      accounts: [personal, work],
+      input: { include: ['unread'] },
+    });
+
+    expect(result.accounts).toHaveLength(2);
+    const workBundle = result.accounts.find((a) => a.account_id === 'work');
+    expect(workBundle?.error).toContain('work account is down');
+    expect(workBundle?.threads).toEqual([]);
+    const personalBundle = result.accounts.find((a) => a.account_id === 'personal');
+    expect(personalBundle?.error).toBeNull();
+  });
+
+  it('defaults to a 7-day window when since is omitted', async () => {
+    const pool = new ImapConnectionPool({
+      accounts: [personal],
+      logger: createLogger('cli', { minLevel: 'error' }),
+    });
+    const captured: any[] = [];
+    accountImapBehavior.personal = {
+      imap: {
+        searchUids: vi.fn(async (_m: string, criteria: any) => {
+          captured.push(criteria);
+          return [];
+        }),
+        fetchEnvelopes: vi.fn(async () => []),
+      },
+    };
+
+    const before = Date.now();
+    await runGetOverview({
+      pool,
+      accounts: [personal],
+      input: { include: ['unread'] },
+    });
+    const after = Date.now();
+
+    const unreadCriteria = captured.find((c) => c.unseen);
+    expect(unreadCriteria).toBeDefined();
+    const sinceMs = new Date(unreadCriteria.since).getTime();
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+    expect(sinceMs).toBeGreaterThanOrEqual(before - sevenDaysMs - 5000);
+    expect(sinceMs).toBeLessThanOrEqual(after - sevenDaysMs + 5000);
+  });
+});

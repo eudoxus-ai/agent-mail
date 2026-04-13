@@ -21,6 +21,7 @@ import { getAuditLogTool } from '../tools/get-audit-log.js';
 import { queueSendTool } from '../tools/queue-send.js';
 import { quarantineThreadTool } from '../tools/quarantine-thread.js';
 import { undoIntentTool } from '../tools/undo-intent.js';
+import { getOverviewTool, runGetOverview } from '../tools/get-overview.js';
 
 import type { ToolDefinition } from '../types.js';
 
@@ -35,6 +36,7 @@ const ALL_TOOLS: ToolDefinition[] = [
   queueSendTool,
   quarantineThreadTool,
   undoIntentTool,
+  getOverviewTool,
 ];
 
 export interface McpServerBundle {
@@ -105,6 +107,45 @@ export async function createMcpServer(): Promise<McpServerBundle> {
 
   // Register all tools
   for (const toolDef of ALL_TOOLS) {
+    // get_overview runs directly against the pool (multi-account)
+    if (toolDef.name === 'get_overview') {
+      server.tool(
+        toolDef.name,
+        toolDef.description,
+        toolDef.inputSchema.shape,
+        async (params: Record<string, unknown>) => {
+          try {
+            const result = await runGetOverview({
+              pool,
+              accounts,
+              input: params as any,
+            });
+            return {
+              content: [
+                { type: 'text' as const, text: JSON.stringify(result, null, 2) },
+              ],
+            };
+          } catch (error) {
+            logger.error('get_overview failed', {
+              error: error instanceof Error ? error.message : String(error),
+            });
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: JSON.stringify({
+                    error: true,
+                    message: error instanceof Error ? error.message : String(error),
+                  }),
+                },
+              ],
+            };
+          }
+        }
+      );
+      continue;
+    }
+
     // Special handling for tools that read directly from the DB
     if (
       toolDef.name === 'get_pending_actions' ||
