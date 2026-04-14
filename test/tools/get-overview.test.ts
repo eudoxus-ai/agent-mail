@@ -343,3 +343,137 @@ describe('runGetOverview — all categories', () => {
     expect(result.accounts[0].threads).toHaveLength(0);
   });
 });
+
+describe('runGetOverview — thread context', () => {
+  it('aggregates thread participants across messages', async () => {
+    const pool = new ImapConnectionPool({
+      accounts: [personal],
+      logger: createLogger('cli', { minLevel: 'error' }),
+    });
+
+    accountImapBehavior.personal = {
+      imap: {
+        searchUids: vi.fn(async (_m: string, criteria: any) => {
+          if (criteria.unseen) return [12];
+          return [];
+        }),
+        fetchEnvelopes: vi.fn(async (_m: string, uids: number[]) =>
+          uids.map(() => ({
+            uid: 12,
+            messageId: '<m2@x.com>',
+            from: { address: 'bob@x.com', name: null },
+            to: [{ address: 'you@example.com', name: null }],
+            cc: [{ address: 'carol@x.com', name: null }],
+            date: '2026-04-12T11:00:00Z',
+            subject: 'Re: planning',
+            bodyText: '',
+            inReplyTo: '<m1@x.com>',
+            references: ['<m1@x.com>'],
+            flags: [],
+            mailbox: 'INBOX',
+            snippet: 'latest reply',
+            listUnsubscribe: undefined,
+          }))
+        ),
+        fetchThreadContext: vi.fn(async (_m: string, _rootIds: string[]) => [
+          {
+            uid: 11,
+            messageId: '<m1@x.com>',
+            from: { address: 'alice@x.com', name: null },
+            to: [{ address: 'bob@x.com', name: null }],
+            cc: [],
+            date: '2026-04-12T10:00:00Z',
+            subject: 'planning',
+            bodyText: '',
+            references: [],
+            flags: [],
+            mailbox: 'INBOX',
+            snippet: 'earlier message',
+            listUnsubscribe: undefined,
+          },
+          {
+            uid: 12,
+            messageId: '<m2@x.com>',
+            from: { address: 'bob@x.com', name: null },
+            to: [{ address: 'you@example.com', name: null }],
+            cc: [{ address: 'carol@x.com', name: null }],
+            date: '2026-04-12T11:00:00Z',
+            subject: 'Re: planning',
+            bodyText: '',
+            inReplyTo: '<m1@x.com>',
+            references: ['<m1@x.com>'],
+            flags: [],
+            mailbox: 'INBOX',
+            snippet: 'latest reply',
+            listUnsubscribe: undefined,
+          },
+        ]),
+      },
+    };
+
+    const result = await runGetOverview({
+      pool,
+      accounts: [personal],
+      input: { include: ['unread'] },
+    });
+
+    const thread = result.accounts[0].threads[0];
+    expect(thread.thread.message_count).toBe(2);
+    expect(thread.signals.thread_participant_count).toBeGreaterThanOrEqual(3);
+    const addrs = thread.signals.thread_participants.map((p) => p.address);
+    expect(addrs).toContain('alice@x.com');
+    expect(addrs).toContain('bob@x.com');
+    expect(addrs).toContain('carol@x.com');
+    expect(addrs).toContain('you@example.com');
+    expect(thread.signals.thread_state).toBe('awaiting_you');
+  });
+
+  it('marks thread.truncated when thread is longer than the tail window', async () => {
+    const pool = new ImapConnectionPool({
+      accounts: [personal],
+      logger: createLogger('cli', { minLevel: 'error' }),
+    });
+
+    const buildMsg = (uid: number) => ({
+      uid,
+      messageId: `<m${uid}@x.com>`,
+      from: { address: uid % 2 === 0 ? 'alice@x.com' : 'bob@x.com', name: null },
+      to: [{ address: 'you@example.com', name: null }],
+      cc: [],
+      date: new Date(2026, 3, 12, 10, uid).toISOString(),
+      subject: 'long thread',
+      bodyText: '',
+      references: ['<m1@x.com>'],
+      inReplyTo: uid > 1 ? `<m${uid - 1}@x.com>` : undefined,
+      flags: [],
+      mailbox: 'INBOX',
+      snippet: `msg ${uid}`,
+      listUnsubscribe: undefined,
+    });
+
+    accountImapBehavior.personal = {
+      imap: {
+        searchUids: vi.fn(async (_m: string, criteria: any) => {
+          if (criteria.unseen) return [10];
+          return [];
+        }),
+        fetchEnvelopes: vi.fn(async (_m: string, uids: number[]) =>
+          uids.map((u) => buildMsg(u))
+        ),
+        fetchThreadContext: vi.fn(async () =>
+          Array.from({ length: 10 }, (_, i) => buildMsg(i + 1))
+        ),
+      },
+    };
+
+    const result = await runGetOverview({
+      pool,
+      accounts: [personal],
+      input: { include: ['unread'] },
+    });
+
+    const thread = result.accounts[0].threads[0];
+    expect(thread.thread.message_count).toBe(10);
+    expect(thread.thread.truncated).toBe(true);
+  });
+});

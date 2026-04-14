@@ -230,7 +230,68 @@ async function collectAccountBundle(deps: CollectDeps): Promise<OverviewAccountB
 
     const found: OverviewThread[] = [];
     for (const { message, categories, mailbox } of seen.values()) {
-      found.push(toOverviewThread(deps.account, mailbox, message, Array.from(categories)));
+      // Thread root: first References entry, or inReplyTo, or the message itself
+      const rootId =
+        message.references[0] ?? message.inReplyTo ?? message.messageId;
+
+      // Fetch up to 50 thread messages from the same mailbox
+      let threadMessages: Array<EmailMessage & { snippet: string }> = [];
+      try {
+        threadMessages = await imap.fetchThreadContext(mailbox, [rootId]);
+      } catch {
+        threadMessages = [message]; // best-effort
+      }
+
+      if (threadMessages.length === 0) {
+        threadMessages = [message];
+      }
+
+      // Ensure the candidate itself is in the thread list
+      if (!threadMessages.some((m) => m.uid === message.uid)) {
+        threadMessages.push(message);
+        threadMessages.sort(
+          (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()
+        );
+      }
+
+      const fullMessageCount = threadMessages.length;
+      const TAIL_WINDOW = 5;
+      let truncated = false;
+      let contextForSignals = threadMessages;
+      if (fullMessageCount > TAIL_WINDOW) {
+        contextForSignals = threadMessages.slice(-TAIL_WINDOW);
+        truncated = true;
+      }
+
+      const signals = computeSignals(message, {
+        accountEmail: deps.account.email,
+        threadMessages: contextForSignals,
+      });
+
+      found.push({
+        thread_id: hashMessageId(rootId),
+        account_id: deps.account.id,
+        mailbox,
+        categories: Array.from(categories),
+        latest_message: {
+          message_id: message.messageId,
+          uid: message.uid,
+          from: message.from,
+          to: message.to,
+          cc: message.cc,
+          date: message.date,
+          subject: message.subject,
+          snippet: message.snippet,
+          flags: message.flags,
+        },
+        thread: {
+          message_count: fullMessageCount,
+          first_date: threadMessages[0].date,
+          latest_date: threadMessages[threadMessages.length - 1].date,
+          truncated,
+        },
+        signals,
+      });
     }
     // Sort newest-first by latest message date
     found.sort(
@@ -280,42 +341,6 @@ async function gatherCandidateUids(
     out.awaiting_you = clip(uids);
   }
   return out;
-}
-
-function toOverviewThread(
-  account: AccountConfig,
-  mailbox: string,
-  msg: EmailMessage & { snippet: string },
-  categories: Category[]
-): OverviewThread {
-  const signals = computeSignals(msg, {
-    accountEmail: account.email,
-    threadMessages: [msg],
-  });
-  return {
-    thread_id: hashMessageId(msg.messageId),
-    account_id: account.id,
-    mailbox,
-    categories,
-    latest_message: {
-      message_id: msg.messageId,
-      uid: msg.uid,
-      from: msg.from,
-      to: msg.to,
-      cc: msg.cc,
-      date: msg.date,
-      subject: msg.subject,
-      snippet: msg.snippet,
-      flags: msg.flags,
-    },
-    thread: {
-      message_count: 1,
-      first_date: msg.date,
-      latest_date: msg.date,
-      truncated: false,
-    },
-    signals,
-  };
 }
 
 function hashMessageId(id: string): string {

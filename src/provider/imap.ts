@@ -197,6 +197,88 @@ export class ImapProvider {
     }
   }
 
+  /**
+   * Fetch additional messages from a mailbox whose References/In-Reply-To
+   * mention any of the given root Message-Ids. Used to reconstruct thread
+   * context for a candidate message.
+   *
+   * Caps the result at `maxMessages` (default 50) to defend against cycles
+   * or huge threads.
+   */
+  async fetchThreadContext(
+    mailbox: string,
+    rootMessageIds: string[],
+    maxMessages = 50
+  ): Promise<Array<EmailMessage & { snippet: string }>> {
+    if (rootMessageIds.length === 0) return [];
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      const results: Array<EmailMessage & { snippet: string }> = [];
+      const seenUids = new Set<number>();
+
+      for (const root of rootMessageIds) {
+        const orQuery = {
+          or: [
+            { header: { References: root } },
+            { header: { 'In-Reply-To': root } },
+            { header: { 'Message-Id': root } },
+          ],
+        };
+        const searchResult = await this.client.search(orQuery as any, { uid: true });
+        const uids = Array.isArray(searchResult) ? searchResult : [];
+        const newUids = uids.filter((u) => !seenUids.has(u));
+        for (const u of newUids) seenUids.add(u);
+        if (newUids.length === 0) continue;
+
+        // Limit per-root to protect against cycles
+        const clipped = newUids.slice(0, maxMessages - results.length);
+        if (clipped.length === 0) break;
+
+        for await (const msg of this.client.fetch(
+          clipped.join(','),
+          {
+            uid: true,
+            envelope: true,
+            flags: true,
+            source: { start: 0, maxLength: 2048 },
+          },
+          { uid: true }
+        )) {
+          const source = msg.source?.toString('utf-8') ?? '';
+          const inReplyTo = extractHeader(source, 'In-Reply-To');
+          const references =
+            extractHeader(source, 'References')?.split(/\s+/).filter(Boolean) ?? [];
+
+          results.push({
+            uid: msg.uid,
+            messageId: msg.envelope?.messageId ?? `${msg.uid}@unknown`,
+            from: toParticipant(msg.envelope?.from?.[0]),
+            to: toParticipants(msg.envelope?.to),
+            cc: toParticipants(msg.envelope?.cc),
+            date: msg.envelope?.date?.toISOString() ?? new Date().toISOString(),
+            subject: msg.envelope?.subject ?? '(no subject)',
+            bodyText: '',
+            inReplyTo: inReplyTo ?? undefined,
+            references,
+            flags: Array.from(msg.flags ?? []),
+            mailbox,
+            snippet: extractSnippet(msg.source ?? Buffer.alloc(0)),
+          });
+          if (results.length >= maxMessages) break;
+        }
+        if (results.length >= maxMessages) break;
+      }
+
+      // Sort chronologically
+      results.sort(
+        (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()
+      );
+      return results;
+    } finally {
+      lock.release();
+    }
+  }
+
   async fetchMessage(mailbox: string, uid: number): Promise<EmailMessage> {
     const lock = await this.client.getMailboxLock(mailbox);
     try {
