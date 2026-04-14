@@ -69,6 +69,7 @@ describe('runGetOverview', () => {
             listUnsubscribe: undefined,
           }))
         ),
+        fetchThreadContext: vi.fn(async () => []),
       },
     };
 
@@ -98,6 +99,7 @@ describe('runGetOverview', () => {
       imap: {
         searchUids: vi.fn(async () => []),
         fetchEnvelopes: vi.fn(async () => []),
+        fetchThreadContext: vi.fn(async () => []),
       },
     };
     accountImapBehavior.work = {
@@ -132,6 +134,7 @@ describe('runGetOverview', () => {
           return [];
         }),
         fetchEnvelopes: vi.fn(async () => []),
+        fetchThreadContext: vi.fn(async () => []),
       },
     };
 
@@ -188,6 +191,7 @@ describe('runGetOverview — all categories', () => {
             listUnsubscribe: undefined,
           }))
         ),
+        fetchThreadContext: vi.fn(async () => []),
       },
     };
 
@@ -236,6 +240,7 @@ describe('runGetOverview — all categories', () => {
             listUnsubscribe: undefined,
           }))
         ),
+        fetchThreadContext: vi.fn(async () => []),
       },
     };
 
@@ -287,6 +292,7 @@ describe('runGetOverview — all categories', () => {
             };
           })
         ),
+        fetchThreadContext: vi.fn(async () => []),
       },
     };
 
@@ -330,6 +336,7 @@ describe('runGetOverview — all categories', () => {
             listUnsubscribe: undefined,
           }))
         ),
+        fetchThreadContext: vi.fn(async () => []),
       },
     };
 
