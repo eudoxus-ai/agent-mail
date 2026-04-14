@@ -42,8 +42,11 @@ describe('assertSafeRemoteUrl', () => {
   });
 
   it('allows addresses just outside fe80::/10 (fec0::)', async () => {
-    // fec0::/10 is deprecated site-local but not link-local — must not be
-    // caught by the fe80::/10 check (it will be checked by DNS validation).
+    // Verifies that the fe80::/10 link-local check does not incorrectly reject
+    // fec0:: addresses. The DNS mock returns a public-looking fec0:: address so
+    // the test focuses solely on the range-check boundary, not on DNS behaviour
+    // (which is covered by the 'rejects when DNS resolves to a private address'
+    // test below).
     vi.mocked(lookup).mockResolvedValueOnce([
       { address: 'fec0::1', family: 6 },
     ] as never);

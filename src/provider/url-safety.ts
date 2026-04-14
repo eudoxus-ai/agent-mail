@@ -104,13 +104,13 @@ function isPrivateAddress(address: string): boolean {
     const normalized = address.toLowerCase();
     // fe80::/10 covers fe80:: through febf:: (top 10 bits = 1111 1110 10).
     // Checking only "fe80:" would miss fe81:: through febf::.
-    const firstTwoBytes = parseInt(normalized.substring(0, 4), 16);
+    const firstHextet = parseInt(normalized.substring(0, 4), 16);
     return (
       normalized === '::1' ||
       normalized === '::' ||
       normalized.startsWith('fc') ||
       normalized.startsWith('fd') ||
-      (firstTwoBytes & 0xffc0) === 0xfe80
+      (firstHextet & 0xffc0) === 0xfe80
     );
   }
 

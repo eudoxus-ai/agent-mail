@@ -262,45 +262,45 @@ export class Executor {
   async undoIntent(
     intentId: string
   ): Promise<{ success: boolean; message: string }> {
-    // Prevent two concurrent undo calls from both running the reversible IMAP
-    // side effect. The in-process check fires before the DB CAS so that the
-    // second caller never reaches performUndo(), even if the first call is
-    // still awaiting the IMAP response.
+    // Prevent duplicate concurrent undo calls from executing the reversible IMAP
+    // side effect. The in-process guard fires synchronously after the has() check
+    // with no await in between, so no two calls can both pass it in the same
+    // event-loop turn. add() runs immediately after the check so that the
+    // finally block always cleans up the slot, even on early returns.
     if (this.pendingUndos.has(intentId)) {
       return { success: false, message: 'Undo already in progress for this intent' };
     }
-
-    const intent = getIntent(this.db, intentId);
-    if (!intent) return { success: false, message: 'Intent not found' };
-    if (intent.status !== 'executed') {
-      return {
-        success: false,
-        message: `Cannot undo: intent is ${intent.status}`,
-      };
-    }
-    if (!intent.undo_token) {
-      return { success: false, message: 'No undo token available' };
-    }
-
-    const undoOp = parseUndoToken(intent.undo_token);
-
-    if (undoOp.reverseAction === 'not_reversible') {
-      return {
-        success: false,
-        message: `Action ${intent.tool} is not reversible`,
-      };
-    }
-
-    if (
-      intent.undo_expires_at &&
-      new Date(intent.undo_expires_at) < new Date()
-    ) {
-      return { success: false, message: 'Undo window has expired' };
-    }
-
-    // Claim the undo slot before performing the async side effect.
     this.pendingUndos.add(intentId);
+
     try {
+      const intent = getIntent(this.db, intentId);
+      if (!intent) return { success: false, message: 'Intent not found' };
+      if (intent.status !== 'executed') {
+        return {
+          success: false,
+          message: `Cannot undo: intent is ${intent.status}`,
+        };
+      }
+      if (!intent.undo_token) {
+        return { success: false, message: 'No undo token available' };
+      }
+
+      const undoOp = parseUndoToken(intent.undo_token);
+
+      if (undoOp.reverseAction === 'not_reversible') {
+        return {
+          success: false,
+          message: `Action ${intent.tool} is not reversible`,
+        };
+      }
+
+      if (
+        intent.undo_expires_at &&
+        new Date(intent.undo_expires_at) < new Date()
+      ) {
+        return { success: false, message: 'Undo window has expired' };
+      }
+
       await this.performUndo(intent, undoOp);
 
       const undone = updateIntentStatusIfCurrent(
