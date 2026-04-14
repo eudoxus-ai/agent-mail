@@ -8,6 +8,7 @@ export const DEFAULT_POLICY_YAML = `# agent-mail policy configuration
 tools:
   search_threads:      { risk: none, gate: ungated }
   read_thread:         { risk: none, gate: ungated }
+  get_overview:        { risk: none, gate: ungated }
   draft_reply:         { risk: low, gate: ungated }
   label_thread:        { risk: low, gate: ungated }
   get_pending_actions: { risk: none, gate: ungated }

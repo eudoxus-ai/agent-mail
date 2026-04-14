@@ -6,8 +6,8 @@ function makeMessage(overrides: Partial<EmailMessage>): EmailMessage {
   return {
     uid: 1,
     messageId: 'msg-1@test.com',
-    from: 'alice@test.com',
-    to: ['bob@test.com'],
+    from: { address: 'alice@test.com', name: 'Alice' },
+    to: [{ address: 'bob@test.com', name: 'Bob' }],
     cc: [],
     date: '2026-04-10T10:00:00Z',
     subject: 'Test',
@@ -60,21 +60,57 @@ describe('buildThreads', () => {
 
   it('collects participants from all messages', () => {
     const messages: EmailMessage[] = [
-      makeMessage({ uid: 1, messageId: 'msg-1@test.com', from: 'alice@test.com', to: ['bob@test.com'] }),
+      makeMessage({
+        uid: 1,
+        messageId: 'msg-1@test.com',
+        from: { address: 'alice@test.com', name: null },
+        to: [{ address: 'bob@test.com', name: null }],
+      }),
       makeMessage({
         uid: 2,
         messageId: 'msg-2@test.com',
-        from: 'bob@test.com',
-        to: ['alice@test.com', 'carol@test.com'],
+        from: { address: 'bob@test.com', name: null },
+        to: [
+          { address: 'alice@test.com', name: null },
+          { address: 'carol@test.com', name: null },
+        ],
         inReplyTo: 'msg-1@test.com',
         references: ['msg-1@test.com'],
       }),
     ];
 
     const threads = buildThreads(messages, 'gmail');
-    expect(threads[0].participants).toContain('alice@test.com');
-    expect(threads[0].participants).toContain('bob@test.com');
-    expect(threads[0].participants).toContain('carol@test.com');
+    const addresses = threads[0].participants.map((p) => p.address);
+    expect(addresses).toContain('alice@test.com');
+    expect(addresses).toContain('bob@test.com');
+    expect(addresses).toContain('carol@test.com');
+  });
+
+  it('dedupes participants with the same address across multiple messages', () => {
+    const messages: EmailMessage[] = [
+      makeMessage({
+        uid: 1,
+        messageId: 'msg-1@test.com',
+        from: { address: 'alice@test.com', name: 'Alice' },
+        to: [{ address: 'bob@test.com', name: 'Bob' }],
+        date: '2026-04-10T10:00:00Z',
+      }),
+      makeMessage({
+        uid: 2,
+        messageId: 'msg-2@test.com',
+        from: { address: 'bob@test.com', name: 'Bob' },
+        to: [{ address: 'alice@test.com', name: 'Alice' }],
+        inReplyTo: 'msg-1@test.com',
+        references: ['msg-1@test.com'],
+        date: '2026-04-10T11:00:00Z',
+      }),
+    ];
+
+    const threads = buildThreads(messages, 'gmail');
+    expect(threads).toHaveLength(1);
+    const addresses = threads[0].participants.map((p) => p.address);
+    // alice and bob each appear twice (from and to), should be deduped to 2 participants
+    expect(addresses).toEqual(['alice@test.com', 'bob@test.com']);
   });
 
   it('handles single message as its own thread', () => {

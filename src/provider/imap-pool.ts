@@ -1,0 +1,189 @@
+import { ImapProvider } from './imap.js';
+import { resolveCredentials } from './credentials.js';
+import { getAccount } from './accounts.js';
+import type { AccountConfig } from '../types.js';
+import type { Logger } from '../logger.js';
+
+interface PoolDeps {
+  accounts: AccountConfig[];
+  logger: Logger;
+  /** Interval in ms for keepalive NOOPs. Default 60_000. Pass 0 to disable. */
+  keepaliveIntervalMs?: number;
+}
+
+interface PoolEntry {
+  provider: ImapProvider | null;
+  queue: Promise<void>;
+  keepaliveTimer: NodeJS.Timeout | null;
+}
+
+/**
+ * Per-account IMAP connection pool.
+ *
+ * - Lazy connect on first borrow.
+ * - Per-account serialization (imapflow is not safe for concurrent ops on one conn).
+ * - Keepalive NOOP every ~60s to prevent idle disconnects.
+ * - Reconnect-once on dropped-connection errors; otherwise propagate.
+ * - closeAll() for clean shutdown.
+ */
+export class ImapConnectionPool {
+  private readonly accounts: AccountConfig[];
+  private readonly logger: Logger;
+  private readonly keepaliveIntervalMs: number;
+  private readonly entries = new Map<string, PoolEntry>();
+  private closed = false;
+
+  constructor(deps: PoolDeps) {
+    this.accounts = deps.accounts;
+    this.logger = deps.logger;
+    this.keepaliveIntervalMs = deps.keepaliveIntervalMs ?? 60_000;
+  }
+
+  async withConnection<T>(
+    accountId: string,
+    fn: (imap: ImapProvider) => Promise<T>
+  ): Promise<T> {
+    if (this.closed) {
+      throw new Error('ImapConnectionPool is closed');
+    }
+    // Validate account exists before anything else
+    getAccount(this.accounts, accountId);
+
+    const entry = this.getOrCreateEntry(accountId);
+
+    // Chain this borrow onto the per-account queue so concurrent calls serialize.
+    // The task resolves/rejects with the fn result; the queue uses a swallowed
+    // copy so a single failing task never poisons subsequent calls.
+    const task: Promise<T> = entry.queue.then(() =>
+      this.runWithRetry(accountId, entry, fn)
+    );
+    entry.queue = task.then(
+      () => undefined,
+      () => undefined
+    );
+    return task;
+  }
+
+  async closeAll(): Promise<void> {
+    this.closed = true;
+    const shutdowns: Array<Promise<void>> = [];
+    for (const [accountId, entry] of this.entries) {
+      if (entry.keepaliveTimer) {
+        clearInterval(entry.keepaliveTimer);
+        entry.keepaliveTimer = null;
+      }
+      if (entry.provider) {
+        const p = entry.provider;
+        entry.provider = null;
+        shutdowns.push(
+          (async () => {
+            try {
+              await p.disconnect();
+            } catch (err) {
+              this.logger.warn(`Pool shutdown error for ${accountId}`, {
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          })()
+        );
+      }
+    }
+    // Best-effort: wait up to 5s for all disconnects
+    await Promise.race([
+      Promise.all(shutdowns),
+      new Promise((r) => setTimeout(r, 5000)),
+    ]);
+  }
+
+  private getOrCreateEntry(accountId: string): PoolEntry {
+    let entry = this.entries.get(accountId);
+    if (!entry) {
+      entry = { provider: null, queue: Promise.resolve(), keepaliveTimer: null };
+      this.entries.set(accountId, entry);
+    }
+    return entry;
+  }
+
+  private async runWithRetry<T>(
+    accountId: string,
+    entry: PoolEntry,
+    fn: (imap: ImapProvider) => Promise<T>
+  ): Promise<T> {
+    const provider = await this.ensureConnected(accountId, entry);
+    try {
+      return await fn(provider);
+    } catch (err) {
+      if (!isConnectionDropError(err)) throw err;
+      this.logger.warn(`IMAP connection dropped for ${accountId}, reconnecting`, {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      // Tear down dead provider
+      await this.teardown(entry);
+      const freshProvider = await this.ensureConnected(accountId, entry);
+      // Retry exactly once
+      return await fn(freshProvider);
+    }
+  }
+
+  private async ensureConnected(
+    accountId: string,
+    entry: PoolEntry
+  ): Promise<ImapProvider> {
+    if (entry.provider) return entry.provider;
+    const account = getAccount(this.accounts, accountId);
+    const resolved = resolveCredentials(account);
+    const provider = new ImapProvider(resolved);
+    await provider.connect();
+    entry.provider = provider;
+    this.startKeepalive(accountId, entry);
+    return provider;
+  }
+
+  private startKeepalive(accountId: string, entry: PoolEntry): void {
+    if (this.keepaliveIntervalMs <= 0) return;
+    if (entry.keepaliveTimer) return;
+    entry.keepaliveTimer = setInterval(async () => {
+      const p = entry.provider;
+      if (!p) return;
+      try {
+        await p.noop();
+      } catch (err) {
+        this.logger.warn(`Keepalive NOOP failed for ${accountId}`, {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        // Mark provider dead; next borrow will reconnect
+        await this.teardown(entry);
+      }
+    }, this.keepaliveIntervalMs);
+    // Don't block process exit on the keepalive timer
+    entry.keepaliveTimer.unref?.();
+  }
+
+  private async teardown(entry: PoolEntry): Promise<void> {
+    if (entry.keepaliveTimer) {
+      clearInterval(entry.keepaliveTimer);
+      entry.keepaliveTimer = null;
+    }
+    const p = entry.provider;
+    entry.provider = null;
+    if (p) {
+      try {
+        await p.disconnect();
+      } catch {
+        // best-effort
+      }
+    }
+  }
+}
+
+function isConnectionDropError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const code = (err as Error & { code?: string }).code ?? '';
+  const msg = err.message ?? '';
+  return (
+    code === 'NoConnection' ||
+    /socket\s*closed/i.test(msg) ||
+    /connection\s*(reset|lost|closed|ended)/i.test(msg) ||
+    /BYE/i.test(msg)
+  );
+}

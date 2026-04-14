@@ -4,6 +4,7 @@ import { openDatabase } from '../../src/ledger/db.js';
 import { getPendingIntents, getIntent } from '../../src/ledger/intents.js';
 import { getAuditLog } from '../../src/ledger/audit.js';
 import { Executor } from '../../src/executor/executor.js';
+import { ImapConnectionPool } from '../../src/provider/imap-pool.js';
 import { createLogger } from '../../src/logger.js';
 import type { AccountConfig } from '../../src/types.js';
 
@@ -13,8 +14,8 @@ vi.mock('../../src/provider/imap.js', () => ({
     connect: vi.fn().mockResolvedValue(undefined),
     disconnect: vi.fn().mockResolvedValue(undefined),
     search: vi.fn().mockResolvedValue([
-      { uid: 1, envelope: { subject: 'Test email', from: 'alice@test.com', date: '2026-04-10' }, snippet: 'Hello world', flags: [] },
-      { uid: 2, envelope: { subject: 'Newsletter', from: 'news@spam.com', date: '2026-04-10' }, snippet: 'Unsubscribe', flags: [] },
+      { uid: 1, envelope: { subject: 'Test email', from: { address: 'alice@test.com', name: 'Alice' }, date: '2026-04-10' }, snippet: 'Hello world', flags: [] },
+      { uid: 2, envelope: { subject: 'Newsletter', from: { address: 'news@spam.com', name: null }, date: '2026-04-10' }, snippet: 'Unsubscribe', flags: [] },
     ]),
     fetchMessage: vi.fn().mockResolvedValue({
       uid: 1, messageId: 'msg-1@test.com', from: 'alice@test.com', to: ['bob@test.com'],
@@ -41,6 +42,21 @@ vi.mock('../../src/provider/credentials.js', () => ({
   })),
 }));
 
+// Mock pool that simply resolves credentials and calls fn with a fresh mock provider
+vi.mock('../../src/provider/imap-pool.js', () => ({
+  ImapConnectionPool: vi.fn().mockImplementation(function () {
+    return {
+      withConnection: vi.fn(async (_: string, fn: (imap: any) => Promise<any>) => {
+        const { ImapProvider } = await import('../../src/provider/imap.js');
+        const provider = new (ImapProvider as any)();
+        await provider.connect();
+        return fn(provider);
+      }),
+      closeAll: vi.fn().mockResolvedValue(undefined),
+    };
+  }),
+}));
+
 const testAccount: AccountConfig = {
   id: 'gmail',
   email: 'cameron@gmail.com',
@@ -50,12 +66,18 @@ const testAccount: AccountConfig = {
 
 let db: Database;
 let executor: Executor;
+let pool: ImapConnectionPool;
 
 beforeEach(() => {
   db = openDatabase(':memory:');
+  pool = new ImapConnectionPool({
+    accounts: [testAccount],
+    logger: createLogger('cli', { minLevel: 'error' }),
+  });
   executor = new Executor({
     db,
     accounts: [testAccount],
+    pool,
     logger: createLogger('cli', { minLevel: 'error' }),
   });
 });

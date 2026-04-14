@@ -4,6 +4,7 @@ import { openDatabase } from '../../src/ledger/db.js';
 import { getIntent } from '../../src/ledger/intents.js';
 import { getAuditLog } from '../../src/ledger/audit.js';
 import { Executor } from '../../src/executor/executor.js';
+import { ImapConnectionPool } from '../../src/provider/imap-pool.js';
 import { createLogger } from '../../src/logger.js';
 import type { AccountConfig } from '../../src/types.js';
 
@@ -12,8 +13,31 @@ vi.mock('../../src/provider/imap.js', () => ({
   ImapProvider: vi.fn().mockImplementation(function () { return {
     connect: vi.fn().mockResolvedValue(undefined),
     disconnect: vi.fn().mockResolvedValue(undefined),
-    search: vi.fn().mockResolvedValue([]),
-    fetchMessage: vi.fn().mockResolvedValue({ uid: 1, messageId: 'test', from: 'a@b.com', to: [], cc: [], date: '', subject: 'Test', bodyText: 'body', references: [], flags: [], mailbox: 'INBOX' }),
+    search: vi.fn().mockResolvedValue([
+      {
+        uid: 42,
+        envelope: {
+          subject: 'Hello',
+          from: { address: 'noreply@github.com', name: 'GitHub' },
+          date: '2026-04-12T10:00:00Z',
+        },
+        snippet: 'A snippet',
+        flags: [],
+      },
+    ]),
+    fetchMessage: vi.fn().mockResolvedValue({
+      uid: 1,
+      messageId: 'test',
+      from: { address: 'a@b.com', name: null },
+      to: [],
+      cc: [],
+      date: '',
+      subject: 'Test',
+      bodyText: 'body',
+      references: [],
+      flags: [],
+      mailbox: 'INBOX',
+    }),
     createDraft: vi.fn().mockResolvedValue({ uid: 99 }),
     moveMessages: vi.fn().mockResolvedValue(undefined),
     setFlags: vi.fn().mockResolvedValue(undefined),
@@ -35,6 +59,21 @@ vi.mock('../../src/provider/credentials.js', () => ({
   })),
 }));
 
+// Mock pool that simply resolves credentials and calls fn with a fresh mock provider
+vi.mock('../../src/provider/imap-pool.js', () => ({
+  ImapConnectionPool: vi.fn().mockImplementation(function () {
+    return {
+      withConnection: vi.fn(async (_: string, fn: (imap: any) => Promise<any>) => {
+        const { ImapProvider } = await import('../../src/provider/imap.js');
+        const provider = new (ImapProvider as any)();
+        await provider.connect();
+        return fn(provider);
+      }),
+      closeAll: vi.fn().mockResolvedValue(undefined),
+    };
+  }),
+}));
+
 const testAccount: AccountConfig = {
   id: 'test',
   email: 'test@example.com',
@@ -44,12 +83,18 @@ const testAccount: AccountConfig = {
 
 let db: Database;
 let executor: Executor;
+let pool: ImapConnectionPool;
 
 beforeEach(() => {
   db = openDatabase(':memory:');
+  pool = new ImapConnectionPool({
+    accounts: [testAccount],
+    logger: createLogger('cli', { minLevel: 'error' }),
+  });
   executor = new Executor({
     db,
     accounts: [testAccount],
+    pool,
     logger: createLogger('cli', { minLevel: 'error' }),
   });
 });
@@ -139,6 +184,24 @@ describe('Executor.executeImmediate', () => {
     const audit = getAuditLog(db, { intent_id: intent.id });
     expect(audit.some((a) => a.action === 'executing')).toBe(true);
     expect(audit.some((a) => a.action === 'executed')).toBe(true);
+  });
+
+  it('decorates search_threads results with is_automated', async () => {
+    const { result } = await executor.executeImmediate({
+      tool: 'search_threads',
+      toolParams: { query: 'hello' },
+      accountId: 'test',
+      agentId: 'claude',
+      risk: 'none',
+    });
+
+    const parsed = JSON.parse(result[0].text);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].uid).toBe(42);
+    expect(parsed[0].is_automated).toBe(true);
+    // Negative assertion — the stripped fields must NOT be present
+    expect(parsed[0].signals).toBeUndefined();
+    expect(parsed[0].direct_to_me).toBeUndefined();
   });
 });
 

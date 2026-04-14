@@ -1,5 +1,18 @@
 import { ImapFlow } from 'imapflow';
-import type { ResolvedAccount, EmailMessage, SearchCriteria } from '../types.js';
+import type { ResolvedAccount, EmailMessage, SearchCriteria, Participant } from '../types.js';
+import { pickNewestUids } from './search-ordering.js';
+import { extractSnippet } from './mime.js';
+
+function toParticipant(addr: { name?: string | null; address?: string | null } | undefined): Participant {
+  return {
+    address: (addr?.address ?? '').trim().toLowerCase(),
+    name: addr?.name?.trim() || null,
+  };
+}
+
+function toParticipants(addrs: Array<{ name?: string | null; address?: string | null }> | undefined): Participant[] {
+  return (addrs ?? []).map(toParticipant);
+}
 
 export class ImapProvider {
   private client: ImapFlow;
@@ -27,11 +40,15 @@ export class ImapProvider {
     await this.client.logout();
   }
 
+  async noop(): Promise<void> {
+    await this.client.noop();
+  }
+
   async search(
     mailbox: string,
     criteria: SearchCriteria,
     limit: number = 20
-  ): Promise<Array<{ uid: number; envelope: { subject: string; from: string; date: string }; snippet: string; flags: string[] }>> {
+  ): Promise<Array<{ uid: number; envelope: { message_id: string; subject: string; from: Participant; date: string }; snippet: string; flags: string[] }>> {
     const lock = await this.client.getMailboxLock(mailbox);
     try {
       const searchQuery: Record<string, unknown> = {};
@@ -44,42 +61,219 @@ export class ImapProvider {
       if (criteria.flagged !== undefined) searchQuery.flagged = criteria.flagged;
       if (criteria.seen !== undefined) searchQuery.seen = criteria.seen;
 
-      // Default: search all if no criteria
       const query = Object.keys(searchQuery).length > 0 ? searchQuery : { all: true };
 
+      // Phase 1: cheap UID-only search. imapflow returns ascending UIDs (or false on failure).
+      const searchResult = await this.client.search(query as any, { uid: true });
+      const allUids: number[] = Array.isArray(searchResult) ? searchResult : [];
+      if (allUids.length === 0) return [];
+
+      const uidsToFetch = pickNewestUids(allUids, limit);
+      if (uidsToFetch.length === 0) return [];
+
+      // Phase 2: hydrate envelopes + partial source for the selected UIDs.
       const results: Array<{
         uid: number;
-        envelope: { subject: string; from: string; date: string };
+        envelope: { message_id: string; subject: string; from: Participant; date: string };
         snippet: string;
         flags: string[];
       }> = [];
 
-      let count = 0;
-      for await (const msg of this.client.fetch(query as any, {
-        uid: true,
-        envelope: true,
-        flags: true,
-        bodyStructure: true,
-        source: { start: 0, maxLength: 256 }, // snippet
-      })) {
-        if (count >= limit) break;
-        const fromAddr =
-          msg.envelope?.from?.[0]
-            ? `${msg.envelope.from[0].name ?? ''} <${msg.envelope.from[0].address ?? ''}>`
-            : 'unknown';
-
+      for await (const msg of this.client.fetch(
+        uidsToFetch.join(','),
+        {
+          uid: true,
+          envelope: true,
+          flags: true,
+          source: { start: 0, maxLength: 2048 },
+        },
+        { uid: true }
+      )) {
         results.push({
           uid: msg.uid,
           envelope: {
+            message_id: msg.envelope?.messageId ?? `${msg.uid}@unknown`,
             subject: msg.envelope?.subject ?? '(no subject)',
-            from: fromAddr,
+            from: toParticipant(msg.envelope?.from?.[0]),
             date: msg.envelope?.date?.toISOString() ?? new Date().toISOString(),
           },
-          snippet: msg.source?.toString('utf-8', 0, 200) ?? '',
+          snippet: extractSnippet(msg.source ?? Buffer.alloc(0)),
           flags: Array.from(msg.flags ?? []),
         });
-        count++;
       }
+
+      // Sort descending by date (newest first). IMAP UIDs are usually chronological
+      // but not guaranteed, so sort on the envelope date we already have.
+      results.sort(
+        (a, b) => new Date(b.envelope.date).getTime() - new Date(a.envelope.date).getTime()
+      );
+
+      return results;
+    } finally {
+      lock.release();
+    }
+  }
+
+  /** Return the full list of UIDs matching a search criterion, ascending. */
+  async searchUids(
+    mailbox: string,
+    criteria: {
+      from?: string;
+      subject?: string;
+      body?: string;
+      since?: Date;
+      before?: Date;
+      flagged?: boolean;
+      seen?: boolean;
+      unseen?: boolean;
+      answered?: boolean;
+      unanswered?: boolean;
+    }
+  ): Promise<number[]> {
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      const query: Record<string, unknown> = {};
+      if (criteria.from) query.from = criteria.from;
+      if (criteria.subject) query.subject = criteria.subject;
+      if (criteria.body) query.body = criteria.body;
+      if (criteria.since) query.since = criteria.since;
+      if (criteria.before) query.before = criteria.before;
+      if (criteria.flagged !== undefined) query.flagged = criteria.flagged;
+      if (criteria.seen !== undefined) query.seen = criteria.seen;
+      if (criteria.unseen !== undefined) query.unseen = criteria.unseen;
+      if (criteria.answered !== undefined) query.answered = criteria.answered;
+      if (criteria.unanswered !== undefined) query.unanswered = criteria.unanswered;
+      const searchResult = await this.client.search(query as any, { uid: true });
+      return Array.isArray(searchResult) ? searchResult : [];
+    } finally {
+      lock.release();
+    }
+  }
+
+  /** Fetch envelopes + partial source for a specific list of UIDs. Returns EmailMessage objects with a `snippet` field. */
+  async fetchEnvelopes(
+    mailbox: string,
+    uids: number[]
+  ): Promise<Array<EmailMessage & { snippet: string }>> {
+    if (uids.length === 0) return [];
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      const results: Array<EmailMessage & { snippet: string }> = [];
+      for await (const msg of this.client.fetch(
+        uids.join(','),
+        {
+          uid: true,
+          envelope: true,
+          flags: true,
+          source: { start: 0, maxLength: 2048 },
+        },
+        { uid: true }
+      )) {
+        const source = msg.source?.toString('utf-8') ?? '';
+        const inReplyTo = extractHeader(source, 'In-Reply-To');
+        const references =
+          extractHeader(source, 'References')?.split(/\s+/).filter(Boolean) ?? [];
+        const listUnsubscribe = extractHeader(source, 'List-Unsubscribe');
+
+        results.push({
+          uid: msg.uid,
+          messageId: msg.envelope?.messageId ?? `${msg.uid}@unknown`,
+          from: toParticipant(msg.envelope?.from?.[0]),
+          to: toParticipants(msg.envelope?.to),
+          cc: toParticipants(msg.envelope?.cc),
+          date: msg.envelope?.date?.toISOString() ?? new Date().toISOString(),
+          subject: msg.envelope?.subject ?? '(no subject)',
+          bodyText: '',
+          inReplyTo: inReplyTo ?? undefined,
+          references,
+          flags: Array.from(msg.flags ?? []),
+          listUnsubscribe: listUnsubscribe ?? undefined,
+          mailbox,
+          snippet: extractSnippet(msg.source ?? Buffer.alloc(0)),
+        });
+      }
+      return results;
+    } finally {
+      lock.release();
+    }
+  }
+
+  /**
+   * Fetch additional messages from a mailbox whose References/In-Reply-To
+   * mention any of the given root Message-Ids. Used to reconstruct thread
+   * context for a candidate message.
+   *
+   * Caps the result at `maxMessages` (default 50) to defend against cycles
+   * or huge threads.
+   */
+  async fetchThreadContext(
+    mailbox: string,
+    rootMessageIds: string[],
+    maxMessages = 50
+  ): Promise<Array<EmailMessage & { snippet: string }>> {
+    if (rootMessageIds.length === 0) return [];
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      const results: Array<EmailMessage & { snippet: string }> = [];
+      const seenUids = new Set<number>();
+
+      for (const root of rootMessageIds) {
+        const orQuery = {
+          or: [
+            { header: { References: root } },
+            { header: { 'In-Reply-To': root } },
+            { header: { 'Message-Id': root } },
+          ],
+        };
+        const searchResult = await this.client.search(orQuery as any, { uid: true });
+        const uids = Array.isArray(searchResult) ? searchResult : [];
+        const newUids = uids.filter((u) => !seenUids.has(u));
+        for (const u of newUids) seenUids.add(u);
+        if (newUids.length === 0) continue;
+
+        // Limit per-root to protect against cycles
+        const clipped = newUids.slice(0, maxMessages - results.length);
+        if (clipped.length === 0) break;
+
+        for await (const msg of this.client.fetch(
+          clipped.join(','),
+          {
+            uid: true,
+            envelope: true,
+            flags: true,
+            source: { start: 0, maxLength: 2048 },
+          },
+          { uid: true }
+        )) {
+          const source = msg.source?.toString('utf-8') ?? '';
+          const inReplyTo = extractHeader(source, 'In-Reply-To');
+          const references =
+            extractHeader(source, 'References')?.split(/\s+/).filter(Boolean) ?? [];
+
+          results.push({
+            uid: msg.uid,
+            messageId: msg.envelope?.messageId ?? `${msg.uid}@unknown`,
+            from: toParticipant(msg.envelope?.from?.[0]),
+            to: toParticipants(msg.envelope?.to),
+            cc: toParticipants(msg.envelope?.cc),
+            date: msg.envelope?.date?.toISOString() ?? new Date().toISOString(),
+            subject: msg.envelope?.subject ?? '(no subject)',
+            bodyText: '',
+            inReplyTo: inReplyTo ?? undefined,
+            references,
+            flags: Array.from(msg.flags ?? []),
+            mailbox,
+            snippet: extractSnippet(msg.source ?? Buffer.alloc(0)),
+          });
+          if (results.length >= maxMessages) break;
+        }
+        if (results.length >= maxMessages) break;
+      }
+
+      // Sort chronologically
+      results.sort(
+        (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()
+      );
       return results;
     } finally {
       lock.release();
@@ -107,18 +301,9 @@ export class ImapProvider {
 
       const msg = result;
 
-      const fromAddr =
-        msg.envelope?.from?.[0]
-          ? `${msg.envelope.from[0].name ?? ''} <${msg.envelope.from[0].address ?? ''}>`
-          : 'unknown';
-
-      const toAddrs = (msg.envelope?.to ?? []).map(
-        (a: any) => `${a.name ?? ''} <${a.address ?? ''}>`
-      );
-
-      const ccAddrs = (msg.envelope?.cc ?? []).map(
-        (a: any) => `${a.name ?? ''} <${a.address ?? ''}>`
-      );
+      const fromAddr = toParticipant(msg.envelope?.from?.[0]);
+      const toAddrs = toParticipants(msg.envelope?.to);
+      const ccAddrs = toParticipants(msg.envelope?.cc);
 
       // Parse headers from source for threading
       const source = msg.source?.toString('utf-8') ?? '';

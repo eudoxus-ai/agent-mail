@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { openDatabase } from '../ledger/db.js';
 import { loadAccounts } from '../provider/accounts.js';
+import { ImapConnectionPool } from '../provider/imap-pool.js';
 import { Executor } from '../executor/executor.js';
 import { createReviewerApp } from '../reviewer/app.js';
 import { createLogger } from '../logger.js';
@@ -26,10 +27,22 @@ export async function startReviewer(port: number = 4242): Promise<void> {
 
   const db = openDatabase();
   const accounts = loadAccounts();
-  const executor = new Executor({ db, accounts, logger });
+  const pool = new ImapConnectionPool({ accounts, logger });
+  const executor = new Executor({ db, accounts, pool, logger });
   const app = createReviewerApp({ db, executor, logger });
 
   const token = loadReviewerToken();
+
+  const shutdown = async (code = 0) => {
+    try {
+      await pool.closeAll();
+    } catch {
+      // best-effort
+    }
+    process.exit(code);
+  };
+  process.once('SIGINT', () => void shutdown(0));
+  process.once('SIGTERM', () => void shutdown(0));
 
   app.listen(port, () => {
     logger.info(`agent-mail reviewer running at http://localhost:${port}`);

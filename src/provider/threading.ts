@@ -1,4 +1,4 @@
-import type { EmailMessage, EmailThread } from '../types.js';
+import type { EmailMessage, EmailThread, Participant } from '../types.js';
 
 /**
  * Build threads from a flat list of messages using In-Reply-To and References headers.
@@ -69,17 +69,28 @@ export function buildThreads(
       (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()
     );
 
-    const participants = new Set<string>();
+    // Union of participants across the thread, ordered by first appearance.
+    // Participant.address is contractually pre-normalized (trimmed + lowercased)
+    // by toParticipant at the IMAP boundary — trust the type here.
+    const seen = new Set<string>();
+    const participants: Participant[] = [];
+    const addParticipant = (p: Participant) => {
+      if (!seen.has(p.address)) {
+        seen.add(p.address);
+        participants.push(p);
+      }
+    };
     for (const msg of msgs) {
-      participants.add(msg.from);
-      for (const to of msg.to) participants.add(to);
+      addParticipant(msg.from);
+      for (const to of msg.to) addParticipant(to);
+      for (const cc of msg.cc) addParticipant(cc);
     }
 
     threads.push({
       threadId,
       accountId,
       subject: msgs[0].subject,
-      participants: Array.from(participants),
+      participants,
       messageCount: msgs.length,
       messages: msgs,
     });
