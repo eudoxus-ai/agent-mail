@@ -92,6 +92,34 @@ function parsePolicyConfig(raw: unknown): PolicyConfig {
     if (!['ungated', 'configurable', 'always_gated'].includes(gate ?? '')) {
       throw new Error(`Invalid policy.yaml: tool "${toolName}" has invalid gate`);
     }
+
+    if (gate === 'configurable') {
+      const defaultVal = (toolPolicy as ToolPolicy).default;
+      if (
+        defaultVal !== undefined &&
+        !['ungated', 'approval_required'].includes(defaultVal)
+      ) {
+        throw new Error(
+          `Invalid policy.yaml: tool "${toolName}" has invalid default "${defaultVal}"`
+        );
+      }
+
+      const overrides = (toolPolicy as ToolPolicy).override;
+      if (overrides !== undefined) {
+        if (typeof overrides !== 'object' || Array.isArray(overrides)) {
+          throw new Error(
+            `Invalid policy.yaml: tool "${toolName}" override must be an object`
+          );
+        }
+        for (const [condition, result] of Object.entries(overrides)) {
+          if (!['ungated', 'approval_required'].includes(result as string)) {
+            throw new Error(
+              `Invalid policy.yaml: tool "${toolName}" override condition "${condition}" has invalid value "${result as string}"`
+            );
+          }
+        }
+      }
+    }
   }
 
   return policy;

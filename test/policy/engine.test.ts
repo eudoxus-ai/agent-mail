@@ -65,4 +65,26 @@ describe('evaluatePolicy', () => {
 
     expect(() => loadPolicy(path)).toThrow('Invalid policy.yaml');
   });
+
+  it('throws when a configurable tool has an invalid default value', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agent-mail-policy-'));
+    const path = join(dir, 'policy.yaml');
+    writeFileSync(
+      path,
+      'tools:\n  some_tool:\n    risk: medium\n    gate: configurable\n    default: always_approve\n'
+    );
+
+    expect(() => loadPolicy(path)).toThrow('invalid default');
+  });
+
+  it('throws when a configurable tool has an invalid override value', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agent-mail-policy-'));
+    const path = join(dir, 'policy.yaml');
+    writeFileSync(
+      path,
+      'tools:\n  some_tool:\n    risk: medium\n    gate: configurable\n    override:\n      when_thread_has_replies: maybe\n'
+    );
+
+    expect(() => loadPolicy(path)).toThrow('invalid value');
+  });
 });

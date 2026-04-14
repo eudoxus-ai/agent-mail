@@ -37,6 +37,12 @@ export class Executor {
   private accounts: AccountConfig[];
   private pool: ImapConnectionPool;
   private logger: Logger;
+  /**
+   * Intent IDs for which an undo is currently in flight. Used as an in-process
+   * mutex to prevent two concurrent undo requests from both executing the
+   * reversible IMAP side effect before the DB CAS has a chance to settle.
+   */
+  private readonly pendingUndos = new Set<string>();
 
   constructor(deps: ExecutorDeps) {
     this.db = deps.db;
@@ -170,6 +176,11 @@ export class Executor {
         action: 'approved',
         actor: 'user',
       });
+      // Both 'approved' and 'executing' are logged inside the same transaction
+      // so they always appear as an atomic pair in the audit log. The user
+      // approval signal and the execution kick-off are intentionally collapsed
+      // into one unit — the CAS (pending → executing) already captures the
+      // approval decision durably.
       logAudit(this.db, {
         intent_id: intentId,
         account_id: current.account_id,
@@ -251,6 +262,14 @@ export class Executor {
   async undoIntent(
     intentId: string
   ): Promise<{ success: boolean; message: string }> {
+    // Prevent two concurrent undo calls from both running the reversible IMAP
+    // side effect. The in-process check fires before the DB CAS so that the
+    // second caller never reaches performUndo(), even if the first call is
+    // still awaiting the IMAP response.
+    if (this.pendingUndos.has(intentId)) {
+      return { success: false, message: 'Undo already in progress for this intent' };
+    }
+
     const intent = getIntent(this.db, intentId);
     if (!intent) return { success: false, message: 'Intent not found' };
     if (intent.status !== 'executed') {
@@ -279,6 +298,8 @@ export class Executor {
       return { success: false, message: 'Undo window has expired' };
     }
 
+    // Claim the undo slot before performing the async side effect.
+    this.pendingUndos.add(intentId);
     try {
       await this.performUndo(intent, undoOp);
 
@@ -310,6 +331,8 @@ export class Executor {
         success: false,
         message: error instanceof Error ? error.message : String(error),
       };
+    } finally {
+      this.pendingUndos.delete(intentId);
     }
   }
 
@@ -534,13 +557,14 @@ export class Executor {
         }
 
         case 'unsubscribe_sender': {
-          const url = await assertSafeRemoteUrl(
+          const { url, headers } = await assertSafeRemoteUrl(
             intent.params.unsubscribe_url as string
           );
           const response = await fetch(url, {
             method: 'POST',
             redirect: 'manual',
             signal: createTimedAbortSignal(),
+            headers,
           });
           return [
             {

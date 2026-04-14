@@ -89,7 +89,7 @@ function renderPendingIntents(intents) {
 
     const header = document.createElement('div');
     header.className = 'card-header';
-    header.appendChild(createBadge(intent.tool, intent.risk));
+    header.appendChild(createBadge(intent.tool, 'none'));
     header.appendChild(createBadge(intent.risk, intent.risk));
     card.appendChild(header);
 

@@ -267,6 +267,30 @@ describe('Executor.undoIntent', () => {
     expect(result.message).toContain('not reversible');
   });
 
+  it('prevents concurrent undo calls from executing the side effect twice', async () => {
+    const { intent } = await executor.executeImmediate({
+      tool: 'quarantine_thread',
+      toolParams: { uids: [1, 2], mailbox: 'INBOX' },
+      accountId: 'test',
+      agentId: 'claude',
+      risk: 'medium',
+    });
+
+    // Start first undo — it will be in flight while the second is attempted
+    const firstUndo = executor.undoIntent(intent.id);
+    const secondUndo = executor.undoIntent(intent.id);
+
+    const [first, second] = await Promise.all([firstUndo, secondUndo]);
+
+    // Exactly one should succeed
+    expect([first.success, second.success]).toContain(true);
+    expect([first.success, second.success]).toContain(false);
+
+    // The DB should reflect undone
+    const undone = getIntent(db, intent.id)!;
+    expect(undone.status).toBe('undone');
+  });
+
   it('returns error for non-existent intent', async () => {
     const result = await executor.undoIntent('nonexistent');
     expect(result.success).toBe(false);
