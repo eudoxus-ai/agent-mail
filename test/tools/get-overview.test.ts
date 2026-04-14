@@ -151,3 +151,195 @@ describe('runGetOverview', () => {
     expect(sinceMs).toBeLessThanOrEqual(after - sevenDaysMs + 5000);
   });
 });
+
+describe('runGetOverview — all categories', () => {
+  it('returns flagged, recent_direct, awaiting_you', async () => {
+    const pool = new ImapConnectionPool({
+      accounts: [personal],
+      logger: createLogger('cli', { minLevel: 'error' }),
+    });
+
+    accountImapBehavior.personal = {
+      imap: {
+        searchUids: vi.fn(async (_m: string, criteria: any) => {
+          if (criteria.unseen) return [101];
+          if (criteria.flagged) return [201];
+          if (criteria.unanswered) return [301];
+          // recent_direct is a plain since query
+          if (criteria.since && !criteria.unseen && !criteria.flagged && !criteria.unanswered) {
+            return [401];
+          }
+          return [];
+        }),
+        fetchEnvelopes: vi.fn(async (_m: string, uids: number[]) =>
+          uids.map((uid) => ({
+            uid,
+            messageId: `<m${uid}@x.com>`,
+            from: { address: 'alice@x.com', name: null },
+            to: [{ address: 'you@example.com', name: null }],
+            cc: [],
+            date: '2026-04-12T10:00:00Z',
+            subject: `s${uid}`,
+            bodyText: '',
+            references: [],
+            flags: [],
+            mailbox: 'INBOX',
+            snippet: `snip ${uid}`,
+            listUnsubscribe: undefined,
+          }))
+        ),
+      },
+    };
+
+    const result = await runGetOverview({
+      pool,
+      accounts: [personal],
+      input: {},
+    });
+
+    const threads = result.accounts[0].threads;
+    const uids = threads.map((t) => t.latest_message.uid);
+    expect(uids).toContain(101);
+    expect(uids).toContain(201);
+    expect(uids).toContain(301);
+    expect(uids).toContain(401);
+  });
+
+  it('dedupes threads that appear in multiple categories', async () => {
+    const pool = new ImapConnectionPool({
+      accounts: [personal],
+      logger: createLogger('cli', { minLevel: 'error' }),
+    });
+
+    // Same UID 999 appears in both unread and flagged
+    accountImapBehavior.personal = {
+      imap: {
+        searchUids: vi.fn(async (_m: string, criteria: any) => {
+          if (criteria.unseen) return [999];
+          if (criteria.flagged) return [999];
+          return [];
+        }),
+        fetchEnvelopes: vi.fn(async (_m: string, uids: number[]) =>
+          uids.map((uid) => ({
+            uid,
+            messageId: `<shared@x.com>`,
+            from: { address: 'alice@x.com', name: null },
+            to: [{ address: 'you@example.com', name: null }],
+            cc: [],
+            date: '2026-04-12T10:00:00Z',
+            subject: 'shared',
+            bodyText: '',
+            references: [],
+            flags: ['\\Flagged'],
+            mailbox: 'INBOX',
+            snippet: 'shared snippet',
+            listUnsubscribe: undefined,
+          }))
+        ),
+      },
+    };
+
+    const result = await runGetOverview({
+      pool,
+      accounts: [personal],
+      input: { include: ['unread', 'flagged'] },
+    });
+
+    expect(result.accounts[0].threads).toHaveLength(1);
+    const categories = result.accounts[0].threads[0].categories;
+    expect(categories).toContain('unread');
+    expect(categories).toContain('flagged');
+  });
+
+  it('filters recent_direct to messages where you are in to', async () => {
+    const pool = new ImapConnectionPool({
+      accounts: [personal],
+      logger: createLogger('cli', { minLevel: 'error' }),
+    });
+
+    accountImapBehavior.personal = {
+      imap: {
+        searchUids: vi.fn(async (_m: string, criteria: any) => {
+          if (criteria.since && !criteria.unseen && !criteria.flagged && !criteria.unanswered) {
+            return [500, 501];
+          }
+          return [];
+        }),
+        fetchEnvelopes: vi.fn(async (_m: string, uids: number[]) =>
+          uids.map((uid) => {
+            const direct = uid === 500;
+            return {
+              uid,
+              messageId: `<m${uid}@x.com>`,
+              from: { address: 'alice@x.com', name: null },
+              to: direct
+                ? [{ address: 'you@example.com', name: null }]
+                : [{ address: 'list@x.com', name: null }],
+              cc: [],
+              date: '2026-04-12T10:00:00Z',
+              subject: `s${uid}`,
+              bodyText: '',
+              references: [],
+              flags: [],
+              mailbox: 'INBOX',
+              snippet: `snip ${uid}`,
+              listUnsubscribe: undefined,
+            };
+          })
+        ),
+      },
+    };
+
+    const result = await runGetOverview({
+      pool,
+      accounts: [personal],
+      input: { include: ['recent_direct'] },
+    });
+
+    const uids = result.accounts[0].threads.map((t) => t.latest_message.uid);
+    expect(uids).toContain(500); // direct-to-you
+    expect(uids).not.toContain(501); // not direct
+  });
+
+  it('filters awaiting_you to threads where state is awaiting_you', async () => {
+    const pool = new ImapConnectionPool({
+      accounts: [personal],
+      logger: createLogger('cli', { minLevel: 'error' }),
+    });
+
+    accountImapBehavior.personal = {
+      imap: {
+        searchUids: vi.fn(async (_m: string, criteria: any) => {
+          if (criteria.unanswered) return [700];
+          return [];
+        }),
+        fetchEnvelopes: vi.fn(async (_m: string, uids: number[]) =>
+          uids.map((uid) => ({
+            uid,
+            messageId: `<m${uid}@x.com>`,
+            from: { address: 'notifications@github.com', name: null },
+            to: [{ address: 'you@example.com', name: null }],
+            cc: [],
+            date: '2026-04-12T10:00:00Z',
+            subject: `s${uid}`,
+            bodyText: '',
+            references: [],
+            flags: [],
+            mailbox: 'INBOX',
+            snippet: 'pr notification',
+            listUnsubscribe: undefined,
+          }))
+        ),
+      },
+    };
+
+    const result = await runGetOverview({
+      pool,
+      accounts: [personal],
+      input: { include: ['awaiting_you'] },
+    });
+
+    // Automated notifications should NOT be awaiting_you even though UNANSWERED
+    expect(result.accounts[0].threads).toHaveLength(0);
+  });
+});
