@@ -48,7 +48,7 @@ export class ImapProvider {
     mailbox: string,
     criteria: SearchCriteria,
     limit: number = 20
-  ): Promise<Array<{ uid: number; envelope: { subject: string; from: Participant; date: string }; snippet: string; flags: string[] }>> {
+  ): Promise<Array<{ uid: number; envelope: { message_id: string; subject: string; from: Participant; date: string }; snippet: string; flags: string[] }>> {
     const lock = await this.client.getMailboxLock(mailbox);
     try {
       const searchQuery: Record<string, unknown> = {};
@@ -74,7 +74,7 @@ export class ImapProvider {
       // Phase 2: hydrate envelopes + partial source for the selected UIDs.
       const results: Array<{
         uid: number;
-        envelope: { subject: string; from: Participant; date: string };
+        envelope: { message_id: string; subject: string; from: Participant; date: string };
         snippet: string;
         flags: string[];
       }> = [];
@@ -92,6 +92,7 @@ export class ImapProvider {
         results.push({
           uid: msg.uid,
           envelope: {
+            message_id: msg.envelope?.messageId ?? `${msg.uid}@unknown`,
             subject: msg.envelope?.subject ?? '(no subject)',
             from: toParticipant(msg.envelope?.from?.[0]),
             date: msg.envelope?.date?.toISOString() ?? new Date().toISOString(),

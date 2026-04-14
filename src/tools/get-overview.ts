@@ -169,9 +169,9 @@ interface CollectDeps {
 
 async function collectAccountBundle(deps: CollectDeps): Promise<OverviewAccountBundle> {
   const threads = await deps.pool.withConnection(deps.account.id, async (imap) => {
-    // uid → { message, categories, mailbox }
+    // (mailbox, uid) → { message, categories, mailbox }
     const seen = new Map<
-      number,
+      string,
       { message: EmailMessage & { snippet: string }; categories: Set<Category>; mailbox: string }
     >();
 
@@ -214,11 +214,12 @@ async function collectAccountBundle(deps: CollectDeps): Promise<OverviewAccountB
             if (signals.is_automated || signals.is_list_mail) continue;
           }
 
-          const entry = seen.get(uid);
+          const key = `${mailbox}:${uid}`;
+          const entry = seen.get(key);
           if (entry) {
             entry.categories.add(cat);
           } else {
-            seen.set(uid, {
+            seen.set(key, {
               message: env,
               categories: new Set([cat]),
               mailbox,
