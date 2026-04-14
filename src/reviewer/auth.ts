@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import type { Request, Response, NextFunction } from 'express';
 import { REVIEWER_TOKEN_PATH } from '../config.js';
@@ -20,13 +20,6 @@ export function authMiddleware(
   token: string
 ): (req: Request, res: Response, next: NextFunction) => void {
   return (req: Request, res: Response, next: NextFunction) => {
-    // GET requests are read-only, no auth required
-    if (req.method === 'GET') {
-      next();
-      return;
-    }
-
-    // POST/PUT/DELETE require bearer token
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       res.status(401).json({ error: 'Missing Authorization header' });
@@ -34,7 +27,13 @@ export function authMiddleware(
     }
 
     const provided = authHeader.slice(7);
-    if (provided !== token) {
+    const expected = Buffer.from(token);
+    const actual = Buffer.from(provided);
+
+    if (
+      expected.length !== actual.length ||
+      !timingSafeEqual(expected, actual)
+    ) {
       res.status(403).json({ error: 'Invalid token' });
       return;
     }

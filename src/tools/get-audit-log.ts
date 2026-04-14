@@ -6,9 +6,9 @@ export const getAuditLogTool: ToolDefinition = {
   name: 'get_audit_log',
   description: 'View the history of all actions taken by agents and users. Filterable by account.',
   inputSchema: z.object({
-    account_id: z.string().optional().describe('Filter by account'),
-    limit: z.number().optional().describe('Max entries (default: 50)'),
-    offset: z.number().optional().describe('Pagination offset'),
+    account_id: z.string().min(1).optional().describe('Filter by account'),
+    limit: z.number().int().nonnegative().max(200).optional().describe('Max entries (default: 50)'),
+    offset: z.number().int().nonnegative().optional().describe('Pagination offset'),
   }),
   annotations: { readOnlyHint: true },
   async execute(params, context) {

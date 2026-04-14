@@ -3,15 +3,26 @@ import type { AccountConfig, Intent, RiskLevel } from '../types.js';
 import { isAutomatedSender } from '../attention/signals.js';
 import type { Logger } from '../logger.js';
 import type { ImapConnectionPool } from '../provider/imap-pool.js';
+import type { ImapProvider } from '../provider/imap.js';
 import {
   createIntent,
   getIntent,
   updateIntentStatus,
+  updateIntentStatusIfCurrent,
+  withImmediateTransaction,
 } from '../ledger/intents.js';
 import { logAudit } from '../ledger/audit.js';
 import { getAccount } from '../provider/accounts.js';
 import { resolveCredentials } from '../provider/credentials.js';
-import { createSmtpTransport, sendMail } from '../provider/smtp.js';
+import {
+  buildDraftMessage,
+  createSmtpTransport,
+  sendMail,
+} from '../provider/smtp.js';
+import {
+  assertSafeRemoteUrl,
+  createTimedAbortSignal,
+} from '../provider/url-safety.js';
 import { generateUndoToken, getUndoExpiry, parseUndoToken } from './undo.js';
 
 export interface ExecutorDeps {
@@ -26,6 +37,12 @@ export class Executor {
   private accounts: AccountConfig[];
   private pool: ImapConnectionPool;
   private logger: Logger;
+  /**
+   * Intent IDs for which an undo is currently in flight. Used as an in-process
+   * mutex to prevent two concurrent undo requests from both executing the
+   * reversible IMAP side effect before the DB CAS has a chance to settle.
+   */
+  private readonly pendingUndos = new Set<string>();
 
   constructor(deps: ExecutorDeps) {
     this.db = deps.db;
@@ -133,29 +150,45 @@ export class Executor {
   }
 
   async approveAndExecute(intentId: string): Promise<Intent> {
-    const intent = getIntent(this.db, intentId);
-    if (!intent) throw new Error(`Intent not found: ${intentId}`);
-    if (intent.status !== 'pending') {
-      throw new Error(`Intent ${intentId} is ${intent.status}, not pending`);
-    }
+    const intent = withImmediateTransaction(this.db, () => {
+      const current = getIntent(this.db, intentId);
+      if (!current) {
+        throw new Error(`Intent not found: ${intentId}`);
+      }
 
-    updateIntentStatus(this.db, intentId, 'approved', {
-      resolved_by: 'user',
-    });
-    logAudit(this.db, {
-      intent_id: intentId,
-      account_id: intent.account_id,
-      action: 'approved',
-      actor: 'user',
-    });
+      const claimed = updateIntentStatusIfCurrent(
+        this.db,
+        intentId,
+        'pending',
+        'executing',
+        { resolved_by: 'user' }
+      );
+      if (!claimed) {
+        const latest = getIntent(this.db, intentId);
+        throw new Error(
+          `Intent ${intentId} is ${latest?.status ?? 'missing'}, not pending`
+        );
+      }
 
-    // Set executing for crash consistency
-    updateIntentStatus(this.db, intentId, 'executing');
-    logAudit(this.db, {
-      intent_id: intentId,
-      account_id: intent.account_id,
-      action: 'executing',
-      actor: 'user',
+      logAudit(this.db, {
+        intent_id: intentId,
+        account_id: current.account_id,
+        action: 'approved',
+        actor: 'user',
+      });
+      // Both 'approved' and 'executing' are logged inside the same transaction
+      // so they always appear as an atomic pair in the audit log. The user
+      // approval signal and the execution kick-off are intentionally collapsed
+      // into one unit — the CAS (pending → executing) already captures the
+      // approval decision durably.
+      logAudit(this.db, {
+        intent_id: intentId,
+        account_id: current.account_id,
+        action: 'executing',
+        actor: 'user',
+      });
+
+      return getIntent(this.db, intentId)!;
     });
 
     try {
@@ -196,63 +229,95 @@ export class Executor {
   }
 
   async rejectIntent(intentId: string, reason?: string): Promise<Intent> {
-    const intent = getIntent(this.db, intentId);
-    if (!intent) throw new Error(`Intent not found: ${intentId}`);
-    if (intent.status !== 'pending') {
-      throw new Error(`Intent ${intentId} is ${intent.status}, not pending`);
-    }
+    return withImmediateTransaction(this.db, () => {
+      const intent = getIntent(this.db, intentId);
+      if (!intent) throw new Error(`Intent not found: ${intentId}`);
 
-    updateIntentStatus(this.db, intentId, 'rejected', {
-      resolved_by: 'user',
-    });
-    logAudit(this.db, {
-      intent_id: intentId,
-      account_id: intent.account_id,
-      action: 'rejected',
-      actor: 'user',
-      detail: reason ? { reason } : undefined,
-    });
+      const rejected = updateIntentStatusIfCurrent(
+        this.db,
+        intentId,
+        'pending',
+        'rejected',
+        { resolved_by: 'user' }
+      );
+      if (!rejected) {
+        const latest = getIntent(this.db, intentId);
+        throw new Error(
+          `Intent ${intentId} is ${latest?.status ?? 'missing'}, not pending`
+        );
+      }
 
-    return getIntent(this.db, intentId)!;
+      logAudit(this.db, {
+        intent_id: intentId,
+        account_id: intent.account_id,
+        action: 'rejected',
+        actor: 'user',
+        detail: reason ? { reason } : undefined,
+      });
+
+      return getIntent(this.db, intentId)!;
+    });
   }
 
   async undoIntent(
     intentId: string
   ): Promise<{ success: boolean; message: string }> {
-    const intent = getIntent(this.db, intentId);
-    if (!intent) return { success: false, message: 'Intent not found' };
-    if (intent.status !== 'executed') {
-      return {
-        success: false,
-        message: `Cannot undo: intent is ${intent.status}`,
-      };
+    // Prevent duplicate concurrent undo calls from executing the reversible IMAP
+    // side effect. The in-process guard fires synchronously after the has() check
+    // with no await in between, so no two calls can both pass it in the same
+    // event-loop turn. add() runs immediately after the check so that the
+    // finally block always cleans up the slot, even on early returns.
+    if (this.pendingUndos.has(intentId)) {
+      return { success: false, message: 'Undo already in progress for this intent' };
     }
-    if (!intent.undo_token) {
-      return { success: false, message: 'No undo token available' };
-    }
-
-    const undoOp = parseUndoToken(intent.undo_token);
-
-    if (undoOp.reverseAction === 'not_reversible') {
-      return {
-        success: false,
-        message: `Action ${intent.tool} is not reversible`,
-      };
-    }
-
-    if (
-      intent.undo_expires_at &&
-      new Date(intent.undo_expires_at) < new Date()
-    ) {
-      return { success: false, message: 'Undo window has expired' };
-    }
+    this.pendingUndos.add(intentId);
 
     try {
+      const intent = getIntent(this.db, intentId);
+      if (!intent) return { success: false, message: 'Intent not found' };
+      if (intent.status !== 'executed') {
+        return {
+          success: false,
+          message: `Cannot undo: intent is ${intent.status}`,
+        };
+      }
+      if (!intent.undo_token) {
+        return { success: false, message: 'No undo token available' };
+      }
+
+      const undoOp = parseUndoToken(intent.undo_token);
+
+      if (undoOp.reverseAction === 'not_reversible') {
+        return {
+          success: false,
+          message: `Action ${intent.tool} is not reversible`,
+        };
+      }
+
+      if (
+        intent.undo_expires_at &&
+        new Date(intent.undo_expires_at) < new Date()
+      ) {
+        return { success: false, message: 'Undo window has expired' };
+      }
+
       await this.performUndo(intent, undoOp);
 
-      updateIntentStatus(this.db, intentId, 'undone', {
-        resolved_by: 'user',
-      });
+      const undone = updateIntentStatusIfCurrent(
+        this.db,
+        intentId,
+        'executed',
+        'undone',
+        { resolved_by: 'user' }
+      );
+      if (!undone) {
+        const latest = getIntent(this.db, intentId);
+        return {
+          success: false,
+          message: `Cannot undo: intent is ${latest?.status ?? 'missing'}`,
+        };
+      }
+
       logAudit(this.db, {
         intent_id: intentId,
         account_id: intent.account_id,
@@ -266,7 +331,137 @@ export class Executor {
         success: false,
         message: error instanceof Error ? error.message : String(error),
       };
+    } finally {
+      this.pendingUndos.delete(intentId);
     }
+  }
+
+  async threadHasReplies(
+    accountId: string,
+    mailbox: string,
+    uids: number[]
+  ): Promise<boolean> {
+    return this.pool.withConnection(accountId, async (imap) => {
+      const selected = await imap.fetchMessages(mailbox, uids);
+      const selectedIds = new Set(
+        selected.map((message) => message.messageId).filter(Boolean)
+      );
+
+      if (selectedIds.size === 0) {
+        return false;
+      }
+
+      const context = await imap.fetchThreadContext(
+        mailbox,
+        Array.from(selectedIds),
+        100
+      );
+
+      return context.some((message) => {
+        if (uids.includes(message.uid)) {
+          return false;
+        }
+
+        if (message.inReplyTo && selectedIds.has(message.inReplyTo)) {
+          return true;
+        }
+
+        return message.references.some((reference) => selectedIds.has(reference));
+      });
+    });
+  }
+
+  private async resolveQueuedSend(
+    intent: Intent,
+    account: AccountConfig
+  ): Promise<{
+    from: string;
+    to: string | string[];
+    subject: string;
+    text: string;
+    inReplyTo?: string;
+    references?: string[];
+  }> {
+    const draftId = intent.params.draft_id as number | undefined;
+    if (draftId !== undefined) {
+      const draft = await this.pool.withConnection(
+        intent.account_id,
+        async (imap) => {
+          const draftsMailbox = await imap.getMailboxPath('drafts');
+          return imap.fetchMessage(draftsMailbox, draftId);
+        }
+      );
+
+      return {
+        from: account.email,
+        to: draft.to.map((participant) => participant.address).filter(Boolean),
+        subject: draft.subject,
+        text: draft.bodyText,
+        inReplyTo: draft.inReplyTo,
+        references: draft.references,
+      };
+    }
+
+    return {
+      from: account.email,
+      to: intent.params.to as string,
+      subject: intent.params.subject as string,
+      text: intent.params.body as string,
+      inReplyTo: intent.params.in_reply_to as string | undefined,
+      references: intent.params.references as string[] | undefined,
+    };
+  }
+
+  private async searchThreads(
+    intent: Intent,
+    imap: ImapProvider
+  ): Promise<Array<{
+    uid: number;
+    envelope: {
+      message_id: string;
+      subject: string;
+      from: { address: string; name: string | null };
+      date: string;
+    };
+    snippet: string;
+    flags: string[];
+    is_automated: boolean;
+  }>> {
+    const mailbox = (intent.params.mailbox as string) ?? 'INBOX';
+    const baseCriteria = {
+      from: intent.params.from as string | undefined,
+      to: intent.params.to as string | undefined,
+      subject: intent.params.subject as string | undefined,
+      since: intent.params.since
+        ? new Date(intent.params.since as string)
+        : undefined,
+    };
+    const limit = (intent.params.limit as number) ?? 20;
+    const query = intent.params.query as string | undefined;
+    const resultSets = query
+      ? await Promise.all([
+          imap.search(mailbox, { ...baseCriteria, subject: query }, limit),
+          imap.search(mailbox, { ...baseCriteria, body: query }, limit),
+        ])
+      : [await imap.search(mailbox, baseCriteria, limit)];
+
+    const merged = new Map<number, Awaited<(typeof resultSets)[number][number]>>();
+    for (const set of resultSets) {
+      for (const result of set) {
+        merged.set(result.uid, result);
+      }
+    }
+
+    return Array.from(merged.values())
+      .sort(
+        (a, b) =>
+          new Date(b.envelope.date).getTime() - new Date(a.envelope.date).getTime()
+      )
+      .slice(0, limit)
+      .map((result) => ({
+        ...result,
+        is_automated: isAutomatedSender(result.envelope.from.address),
+      }));
   }
 
   private async performAction(
@@ -279,15 +474,9 @@ export class Executor {
     // per-account IMAP serialization lock.
     if (intent.tool === 'queue_send') {
       const resolved = resolveCredentials(account);
+      const message = await this.resolveQueuedSend(intent, account);
       const transport = createSmtpTransport(resolved);
-      const result = await sendMail(transport, {
-        from: account.email,
-        to: intent.params.to as string,
-        subject: intent.params.subject as string,
-        text: intent.params.body as string,
-        inReplyTo: intent.params.in_reply_to as string | undefined,
-        references: intent.params.references as string[] | undefined,
-      });
+      const result = await sendMail(transport, message);
       return [
         {
           type: 'text',
@@ -303,30 +492,8 @@ export class Executor {
     return this.pool.withConnection(intent.account_id, async (imap) => {
       switch (intent.tool) {
         case 'search_threads': {
-          const results = await imap.search(
-            (intent.params.mailbox as string) ?? 'INBOX',
-            {
-              from: intent.params.from as string | undefined,
-              to: intent.params.to as string | undefined,
-              subject: intent.params.subject as string | undefined,
-              body: intent.params.body as string | undefined,
-              since: intent.params.since
-                ? new Date(intent.params.since as string)
-                : undefined,
-            },
-            (intent.params.limit as number) ?? 20
-          );
-
-          // Decorate with the only signal that's reliably computable from
-          // partial envelope data. Full triage signals (direct_to_me, thread
-          // state, network, etc.) require thread context and are delivered
-          // by get_overview.
-          const decorated = results.map((r) => ({
-            ...r,
-            is_automated: isAutomatedSender(r.envelope.from.address),
-          }));
-
-          return [{ type: 'text', text: JSON.stringify(decorated, null, 2) }];
+          const results = await this.searchThreads(intent, imap);
+          return [{ type: 'text', text: JSON.stringify(results, null, 2) }];
         }
 
         case 'read_thread': {
@@ -337,24 +504,14 @@ export class Executor {
         }
 
         case 'draft_reply': {
-          const raw = Buffer.from(
-            [
-              `From: ${account.email}`,
-              `To: ${intent.params.to as string}`,
-              `Subject: ${intent.params.subject as string}`,
-              intent.params.in_reply_to
-                ? `In-Reply-To: ${intent.params.in_reply_to}`
-                : '',
-              intent.params.references
-                ? `References: ${(intent.params.references as string[]).join(' ')}`
-                : '',
-              `Date: ${new Date().toUTCString()}`,
-              '',
-              intent.params.body as string,
-            ]
-              .filter(Boolean)
-              .join('\r\n')
-          );
+          const raw = buildDraftMessage({
+            from: account.email,
+            to: intent.params.to as string,
+            subject: intent.params.subject as string,
+            text: intent.params.body as string,
+            inReplyTo: intent.params.in_reply_to as string | undefined,
+            references: intent.params.references as string[] | undefined,
+          });
           const result = await imap.createDraft(raw);
           return [
             {
@@ -400,21 +557,15 @@ export class Executor {
         }
 
         case 'unsubscribe_sender': {
-          const url = intent.params.unsubscribe_url as string;
-          if (!url) {
-            return [
-              { type: 'text', text: 'No unsubscribe URL found for this message' },
-            ];
-          }
-          if (url.startsWith('mailto:')) {
-            return [
-              {
-                type: 'text',
-                text: 'Mailto unsubscribe not supported directly. Use queue_send to send an unsubscribe email.',
-              },
-            ];
-          }
-          const response = await fetch(url, { method: 'POST' });
+          const { url, headers } = await assertSafeRemoteUrl(
+            intent.params.unsubscribe_url as string
+          );
+          const response = await fetch(url, {
+            method: 'POST',
+            redirect: 'manual',
+            signal: createTimedAbortSignal(),
+            headers,
+          });
           return [
             {
               type: 'text',

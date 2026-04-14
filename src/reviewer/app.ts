@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import type { Database } from '../ledger/sqlite.js';
 import type { Executor } from '../executor/executor.js';
 import type { Logger } from '../logger.js';
-import { loadReviewerToken, authMiddleware } from './auth.js';
+import { authMiddleware } from './auth.js';
 import { createRouter } from './routes.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -13,17 +13,25 @@ export function createReviewerApp(deps: {
   db: Database;
   executor: Executor;
   logger: Logger;
+  token: string;
 }): express.Application {
   const app = express();
 
   app.use(express.json());
 
-  // Auth middleware
-  const token = loadReviewerToken();
-  app.use(authMiddleware(token));
+  app.use((_req, res, next) => {
+    res.setHeader(
+      'Content-Security-Policy',
+      "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    );
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('X-Frame-Options', 'DENY');
+    next();
+  });
 
   // API routes
-  app.use(createRouter(deps));
+  app.use('/api', authMiddleware(deps.token), createRouter(deps));
 
   // Serve static files
   app.use(express.static(join(__dirname, 'static')));

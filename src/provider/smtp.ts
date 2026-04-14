@@ -26,6 +26,49 @@ export interface SendMailOptions {
   references?: string[];
 }
 
+export interface DraftMessageOptions {
+  from: string;
+  to: string | string[];
+  subject: string;
+  text: string;
+  inReplyTo?: string;
+  references?: string[];
+}
+
+function sanitizeHeaderValue(value: string): string {
+  return value.replace(/[\r\n]+/g, ' ').trim();
+}
+
+function normalizeAddressList(value: string | string[]): string {
+  return (Array.isArray(value) ? value : [value])
+    .map((entry) => sanitizeHeaderValue(entry))
+    .filter(Boolean)
+    .join(', ');
+}
+
+export function buildDraftMessage(options: DraftMessageOptions): Buffer {
+  const lines = [
+    `From: ${sanitizeHeaderValue(options.from)}`,
+    `To: ${normalizeAddressList(options.to)}`,
+    `Subject: ${sanitizeHeaderValue(options.subject)}`,
+    options.inReplyTo
+      ? `In-Reply-To: ${sanitizeHeaderValue(options.inReplyTo)}`
+      : '',
+    options.references && options.references.length > 0
+      ? `References: ${options.references
+          .map((entry) => sanitizeHeaderValue(entry))
+          .join(' ')}`
+      : '',
+    `Date: ${new Date().toUTCString()}`,
+    'Content-Type: text/plain; charset=utf-8',
+    'Content-Transfer-Encoding: 8bit',
+    '',
+    options.text.replace(/\r?\n/g, '\r\n'),
+  ].filter(Boolean);
+
+  return Buffer.from(lines.join('\r\n'), 'utf-8');
+}
+
 export async function sendMail(
   transport: Transporter,
   options: SendMailOptions

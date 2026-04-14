@@ -7,9 +7,17 @@ import type { PolicyConfig, PolicyResult, ToolPolicy, GateType, RiskLevel } from
 export function loadPolicy(policyPath: string = POLICY_YAML_PATH): PolicyConfig {
   try {
     const content = readFileSync(policyPath, 'utf-8');
-    return yaml.load(content) as PolicyConfig;
-  } catch {
-    return yaml.load(DEFAULT_POLICY_YAML) as PolicyConfig;
+    return parsePolicyConfig(yaml.load(content));
+  } catch (error) {
+    if (
+      error &&
+      typeof error === 'object' &&
+      'code' in error &&
+      error.code === 'ENOENT'
+    ) {
+      return parsePolicyConfig(yaml.load(DEFAULT_POLICY_YAML));
+    }
+    throw error;
   }
 }
 
@@ -59,4 +67,60 @@ export function evaluatePolicy(
   }
 
   return { decision: 'execute', risk, reason: 'Policy: configurable, default ungated' };
+}
+
+function parsePolicyConfig(raw: unknown): PolicyConfig {
+  if (!raw || typeof raw !== 'object') {
+    throw new Error('Invalid policy.yaml: expected a YAML object');
+  }
+
+  const policy = raw as PolicyConfig;
+  if (!policy.tools || typeof policy.tools !== 'object') {
+    throw new Error('Invalid policy.yaml: missing "tools" map');
+  }
+
+  for (const [toolName, toolPolicy] of Object.entries(policy.tools)) {
+    if (!toolPolicy || typeof toolPolicy !== 'object') {
+      throw new Error(`Invalid policy.yaml: tool "${toolName}" must be an object`);
+    }
+
+    const risk = (toolPolicy as { risk?: RiskLevel }).risk;
+    const gate = (toolPolicy as { gate?: GateType }).gate;
+    if (!['none', 'low', 'medium', 'high'].includes(risk ?? '')) {
+      throw new Error(`Invalid policy.yaml: tool "${toolName}" has invalid risk`);
+    }
+    if (!['ungated', 'configurable', 'always_gated'].includes(gate ?? '')) {
+      throw new Error(`Invalid policy.yaml: tool "${toolName}" has invalid gate`);
+    }
+
+    if (gate === 'configurable') {
+      const defaultVal = (toolPolicy as ToolPolicy).default;
+      if (
+        defaultVal !== undefined &&
+        !['ungated', 'approval_required'].includes(defaultVal)
+      ) {
+        throw new Error(
+          `Invalid policy.yaml: tool "${toolName}" has invalid default "${defaultVal}"`
+        );
+      }
+
+      const overrides = (toolPolicy as ToolPolicy).override;
+      if (overrides !== undefined) {
+        if (typeof overrides !== 'object' || Array.isArray(overrides)) {
+          throw new Error(
+            `Invalid policy.yaml: tool "${toolName}" override must be an object`
+          );
+        }
+        for (const [condition, result] of Object.entries(overrides)) {
+          if (!['ungated', 'approval_required'].includes(result as string)) {
+            throw new Error(
+              `Invalid policy.yaml: tool "${toolName}" override condition "${condition}" has invalid value "${result as string}"`
+            );
+          }
+        }
+      }
+    }
+  }
+
+  return policy;
 }
