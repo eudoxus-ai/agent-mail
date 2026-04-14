@@ -54,7 +54,7 @@ One MCP server manages all your email accounts. Gmail, iCloud, work IMAP, whatev
 
 ### Prerequisites
 
-- Node.js 20+
+- Node.js 22+
 - App-specific passwords for Gmail and iCloud (not your regular password)
   - Gmail: [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
   - iCloud: [appleid.apple.com](https://appleid.apple.com) → Sign-In and Security → App-Specific Passwords
@@ -122,7 +122,9 @@ In a separate terminal:
 ./bin/agent-mail.mjs reviewer
 ```
 
-Opens at `http://localhost:4242`. You'll need the bearer token (printed on startup, also at `~/.agent-mail/reviewer-token`) to approve or reject actions.
+Opens at `http://127.0.0.1:4242`. Enter the bearer token (printed on startup, also at `~/.agent-mail/reviewer-token`) into the page to load reviewer data and approve or reject actions.
+
+Every reviewer API request requires that bearer token, including read-only views like pending actions and the audit log.
 
 ## Tools
 
@@ -170,6 +172,8 @@ quarantine_thread:
 ```bash
 npm test              # Run tests (vitest)
 npm run typecheck     # TypeScript type checking
+npm run audit         # Dependency vulnerability check
+npm run validate      # Full local validation
 npm run build         # Compile to dist/
 ```
 

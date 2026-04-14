@@ -33,6 +33,7 @@ vi.mock('../../src/provider/imap.js', () => ({
 vi.mock('../../src/provider/smtp.js', () => ({
   createSmtpTransport: vi.fn().mockReturnValue({}),
   sendMail: vi.fn().mockResolvedValue({ messageId: 'sent-456' }),
+  buildDraftMessage: vi.fn().mockReturnValue(Buffer.from('draft')),
 }));
 
 vi.mock('../../src/provider/credentials.js', () => ({

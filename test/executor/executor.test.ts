@@ -7,6 +7,7 @@ import { Executor } from '../../src/executor/executor.js';
 import { ImapConnectionPool } from '../../src/provider/imap-pool.js';
 import { createLogger } from '../../src/logger.js';
 import type { AccountConfig } from '../../src/types.js';
+import { sendMail } from '../../src/provider/smtp.js';
 
 // Mock the IMAP and SMTP modules
 vi.mock('../../src/provider/imap.js', () => ({
@@ -50,6 +51,7 @@ vi.mock('../../src/provider/imap.js', () => ({
 vi.mock('../../src/provider/smtp.js', () => ({
   createSmtpTransport: vi.fn().mockReturnValue({}),
   sendMail: vi.fn().mockResolvedValue({ messageId: 'sent-123' }),
+  buildDraftMessage: vi.fn().mockReturnValue(Buffer.from('draft')),
 }));
 
 vi.mock('../../src/provider/credentials.js', () => ({
@@ -86,6 +88,7 @@ let executor: Executor;
 let pool: ImapConnectionPool;
 
 beforeEach(() => {
+  vi.clearAllMocks();
   db = openDatabase(':memory:');
   pool = new ImapConnectionPool({
     accounts: [testAccount],
@@ -147,6 +150,33 @@ describe('Executor.approveAndExecute', () => {
     await expect(executor.approveAndExecute(intent.id)).rejects.toThrow(
       'not pending'
     );
+  });
+
+  it('claims a pending intent exactly once under concurrent approval attempts', async () => {
+    let resolveSend!: (value: { messageId: string }) => void;
+    const pendingSend = new Promise<{ messageId: string }>((resolve) => {
+      resolveSend = resolve;
+    });
+    vi.mocked(sendMail).mockReturnValueOnce(pendingSend as any);
+
+    const intent = await executor.createGatedIntent({
+      tool: 'queue_send',
+      toolParams: { to: 'bob@test.com', subject: 'Hi', body: 'Hello' },
+      accountId: 'test',
+      agentId: 'claude',
+      risk: 'high',
+    });
+
+    const firstApproval = executor.approveAndExecute(intent.id);
+    await Promise.resolve();
+
+    await expect(executor.approveAndExecute(intent.id)).rejects.toThrow(
+      'not pending'
+    );
+
+    resolveSend({ messageId: 'sent-123' });
+    await expect(firstApproval).resolves.toMatchObject({ status: 'executed' });
+    expect(vi.mocked(sendMail)).toHaveBeenCalledTimes(1);
   });
 });
 

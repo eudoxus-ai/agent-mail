@@ -6,7 +6,7 @@ export const getPendingActionsTool: ToolDefinition = {
   name: 'get_pending_actions',
   description: 'List all actions awaiting human approval. Use this to check the status of queued sends or other gated operations.',
   inputSchema: z.object({
-    account_id: z.string().optional().describe('Filter by account (omit for all)'),
+    account_id: z.string().min(1).optional().describe('Filter by account (omit for all)'),
   }),
   annotations: { readOnlyHint: true },
   async execute(params, context) {

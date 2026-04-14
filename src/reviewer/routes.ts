@@ -16,13 +16,13 @@ export interface RouterDeps {
 export function createRouter(deps: RouterDeps): Router {
   const router = Router();
 
-  router.get('/api/pending', (req, res) => {
+  router.get('/pending', (req, res) => {
     const accountId = req.query.account_id as string | undefined;
     const pending = getPendingIntents(deps.db, accountId);
     res.json(pending);
   });
 
-  router.get('/api/audit', (req, res) => {
+  router.get('/audit', (req, res) => {
     const entries = getAuditLog(deps.db, {
       account_id: req.query.account_id as string | undefined,
       limit: parseInt(req.query.limit as string) || 50,
@@ -31,7 +31,7 @@ export function createRouter(deps: RouterDeps): Router {
     res.json(entries);
   });
 
-  router.get('/api/intent/:id', (req, res) => {
+  router.get('/intent/:id', (req, res) => {
     const intent = getIntent(deps.db, req.params.id);
     if (!intent) {
       res.status(404).json({ error: 'Intent not found' });
@@ -40,7 +40,7 @@ export function createRouter(deps: RouterDeps): Router {
     res.json(intent);
   });
 
-  router.post('/api/intent/:id/approve', async (req, res) => {
+  router.post('/intent/:id/approve', async (req, res) => {
     try {
       const intent = await deps.executor.approveAndExecute(req.params.id);
       res.json(intent);
@@ -55,7 +55,7 @@ export function createRouter(deps: RouterDeps): Router {
     }
   });
 
-  router.post('/api/intent/:id/reject', async (req, res) => {
+  router.post('/intent/:id/reject', async (req, res) => {
     try {
       const reason = req.body?.reason as string | undefined;
       const intent = await deps.executor.rejectIntent(req.params.id, reason);
@@ -71,7 +71,7 @@ export function createRouter(deps: RouterDeps): Router {
     }
   });
 
-  router.get('/api/accounts', (_req, res) => {
+  router.get('/accounts', (_req, res) => {
     try {
       const accounts = loadAccounts();
       res.json(
@@ -82,7 +82,7 @@ export function createRouter(deps: RouterDeps): Router {
     }
   });
 
-  router.get('/api/stuck', (_req, res) => {
+  router.get('/stuck', (_req, res) => {
     const stuck = checkStuckExecuting(deps.db);
     res.json(stuck);
   });

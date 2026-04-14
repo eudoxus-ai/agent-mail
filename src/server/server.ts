@@ -102,8 +102,18 @@ export async function createMcpServer(): Promise<McpServerBundle> {
     { capabilities: { tools: {} } }
   );
 
-  // Determine agent ID (will be populated from client info)
-  const agentId = 'unknown';
+  // Fallback until client metadata is available from the transport.
+  const agentId = process.env.AGENT_MAIL_AGENT_ID ?? 'unknown';
+
+  const validateParams = (
+    toolDef: ToolDefinition,
+    params: Record<string, unknown>
+  ): Record<string, unknown> => {
+    if (toolDef.validate) {
+      return toolDef.validate(params);
+    }
+    return toolDef.inputSchema.parse(params);
+  };
 
   // Register all tools
   for (const toolDef of ALL_TOOLS) {
@@ -115,10 +125,11 @@ export async function createMcpServer(): Promise<McpServerBundle> {
         toolDef.inputSchema.shape,
         async (params: Record<string, unknown>) => {
           try {
+            const validated = validateParams(toolDef, params);
             const result = await runGetOverview({
               pool,
               accounts,
-              input: params as any,
+              input: validated as any,
             });
             return {
               content: [
@@ -156,6 +167,7 @@ export async function createMcpServer(): Promise<McpServerBundle> {
         toolDef.description,
         toolDef.inputSchema.shape,
         async (params: Record<string, unknown>) => {
+          const validated = validateParams(toolDef, params);
           const context = {
             accountId: '',
             agentId,
@@ -163,7 +175,7 @@ export async function createMcpServer(): Promise<McpServerBundle> {
             accounts,
             logger,
           };
-          const result = await toolDef.execute(params, context);
+          const result = await toolDef.execute(validated, context);
           return { content: result.content ?? [] };
         }
       );
@@ -177,7 +189,8 @@ export async function createMcpServer(): Promise<McpServerBundle> {
         toolDef.description,
         toolDef.inputSchema.shape,
         async (params: Record<string, unknown>) => {
-          const intentId = params.intent_id as string;
+          const validated = validateParams(toolDef, params);
+          const intentId = validated.intent_id as string;
           const result = await executor.undoIntent(intentId);
           return {
             content: [{ type: 'text' as const, text: JSON.stringify(result) }],
@@ -202,7 +215,7 @@ export async function createMcpServer(): Promise<McpServerBundle> {
       toolDef.description,
       toolDef.inputSchema.shape,
       async (params: Record<string, unknown>) => {
-        return handler(params);
+        return handler(validateParams(toolDef, params));
       }
     );
   }

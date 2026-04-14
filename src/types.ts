@@ -1,3 +1,4 @@
+import type { ZodObject } from 'zod';
 import type { Database } from './ledger/sqlite.js';
 import type { ImapFlow } from 'imapflow';
 import type { Transporter } from 'nodemailer';
@@ -111,7 +112,8 @@ export interface ToolResult {
 export interface ToolDefinition {
   name: string;
   description: string;
-  inputSchema: import('zod').ZodObject<any>;
+  inputSchema: ZodObject<any>;
+  validate?: (params: Record<string, unknown>) => Record<string, unknown>;
   annotations?: {
     readOnlyHint?: boolean;
     destructiveHint?: boolean;

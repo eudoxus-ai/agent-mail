@@ -10,6 +10,7 @@ import { ACCOUNTS_YAML_PATH, LEDGER_DB_PATH } from '../config.js';
 
 export async function startReviewer(port: number = 4242): Promise<void> {
   const logger = createLogger('cli');
+  const host = '127.0.0.1';
 
   if (!existsSync(ACCOUNTS_YAML_PATH)) {
     logger.error(
@@ -29,9 +30,8 @@ export async function startReviewer(port: number = 4242): Promise<void> {
   const accounts = loadAccounts();
   const pool = new ImapConnectionPool({ accounts, logger });
   const executor = new Executor({ db, accounts, pool, logger });
-  const app = createReviewerApp({ db, executor, logger });
-
   const token = loadReviewerToken();
+  const app = createReviewerApp({ db, executor, logger, token });
 
   const shutdown = async (code = 0) => {
     try {
@@ -44,8 +44,8 @@ export async function startReviewer(port: number = 4242): Promise<void> {
   process.once('SIGINT', () => void shutdown(0));
   process.once('SIGTERM', () => void shutdown(0));
 
-  app.listen(port, () => {
-    logger.info(`agent-mail reviewer running at http://localhost:${port}`);
+  app.listen(port, host, () => {
+    logger.info(`agent-mail reviewer running at http://${host}:${port}`);
     logger.info(`Bearer token: ${token.substring(0, 8)}...`);
     logger.info(`${accounts.length} account(s) configured`);
   });

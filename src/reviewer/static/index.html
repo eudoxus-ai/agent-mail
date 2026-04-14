@@ -15,13 +15,16 @@
 
     <div class="auth-bar" id="auth-bar">
       <input type="password" id="token-input" placeholder="Bearer token" />
-      <button onclick="setToken()">Set Token</button>
+      <button type="button" id="set-token-button">Set Token</button>
     </div>
+    <p class="subtitle">
+      Read the reviewer token from <code>~/.agent-mail/reviewer-token</code> and paste it here.
+    </p>
 
     <div class="tabs">
-      <button class="tab active" onclick="showTab('pending')">Pending</button>
-      <button class="tab" onclick="showTab('audit')">Audit Log</button>
-      <button class="tab" onclick="showTab('stuck')">Stuck</button>
+      <button class="tab active" type="button" data-tab="pending">Pending</button>
+      <button class="tab" type="button" data-tab="audit">Audit Log</button>
+      <button class="tab" type="button" data-tab="stuck">Stuck</button>
     </div>
 
     <div id="pending-tab" class="tab-content active">

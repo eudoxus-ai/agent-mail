@@ -36,11 +36,14 @@ export function wrapToolHandler(
       // Evaluate policy
       const policyContext: { threadHasReplies?: boolean } = {};
 
-      // For quarantine_thread, we need to check if thread has replies (eager evaluation)
+      // For quarantine_thread, inspect actual thread context before applying policy.
       if (toolDef.name === 'quarantine_thread' && params.uids) {
-        // Simplified: if multiple UIDs, thread has replies
         const uids = params.uids as number[];
-        policyContext.threadHasReplies = uids.length > 1;
+        policyContext.threadHasReplies = await deps.executor.threadHasReplies(
+          resolvedAccountId,
+          (params.mailbox as string) ?? 'INBOX',
+          uids
+        );
       }
 
       const policyResult = evaluatePolicy(deps.policy, toolDef.name, policyContext);
