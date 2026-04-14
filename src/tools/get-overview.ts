@@ -172,15 +172,12 @@ async function collectAccountBundle(deps: CollectDeps): Promise<OverviewAccountB
 
     for (const mailbox of deps.mailboxes) {
       if (deps.categories.includes('unread')) {
-        const uids = (await (imap as any).searchUids(mailbox, {
+        const uids = await imap.searchUids(mailbox, {
           unseen: true,
           since: deps.since,
-        })) as number[];
+        });
         const newest = uids.slice(-deps.limitPerCategory);
-        const messages = (await (imap as any).fetchEnvelopes(
-          mailbox,
-          newest
-        )) as Array<EmailMessage & { snippet?: string }>;
+        const messages = await imap.fetchEnvelopes(mailbox, newest);
         for (const msg of messages) {
           found.push(toOverviewThread(deps.account, mailbox, msg, ['unread']));
         }
@@ -201,7 +198,7 @@ async function collectAccountBundle(deps: CollectDeps): Promise<OverviewAccountB
 function toOverviewThread(
   account: AccountConfig,
   mailbox: string,
-  msg: EmailMessage & { snippet?: string },
+  msg: EmailMessage & { snippet: string },
   categories: Category[]
 ): OverviewThread {
   const signals = computeSignals(msg, {
@@ -221,7 +218,7 @@ function toOverviewThread(
       cc: msg.cc,
       date: msg.date,
       subject: msg.subject,
-      snippet: msg.snippet ?? '',
+      snippet: msg.snippet,
       flags: msg.flags,
     },
     thread: {
