@@ -12,6 +12,7 @@ import {
   withImmediateTransaction,
 } from '../ledger/intents.js';
 import { logAudit } from '../ledger/audit.js';
+import { buildAuditSummary } from '../ledger/audit-summary.js';
 import { getAccount } from '../provider/accounts.js';
 import { resolveCredentials } from '../provider/credentials.js';
 import {
@@ -71,6 +72,7 @@ export class Executor {
       account_id: params.accountId,
       action: 'created',
       actor: params.agentId,
+      detail: buildAuditSummary(params.tool, 'created', params.toolParams),
     });
 
     // Set executing status for crash consistency
@@ -80,6 +82,7 @@ export class Executor {
       account_id: params.accountId,
       action: 'executing',
       actor: 'policy',
+      detail: buildAuditSummary(params.tool, 'executing', params.toolParams),
     });
 
     try {
@@ -99,6 +102,7 @@ export class Executor {
         account_id: params.accountId,
         action: 'executed',
         actor: 'policy',
+        detail: buildAuditSummary(params.tool, 'executed', params.toolParams),
       });
 
       return { intent: getIntent(this.db, intent.id)!, result };
@@ -114,7 +118,7 @@ export class Executor {
         account_id: params.accountId,
         action: 'failed',
         actor: 'policy',
-        detail: errorDetail,
+        detail: buildAuditSummary(params.tool, 'failed', params.toolParams, errorDetail),
       });
       throw error;
     }
@@ -140,6 +144,7 @@ export class Executor {
       account_id: params.accountId,
       action: 'created',
       actor: params.agentId,
+      detail: buildAuditSummary(params.tool, 'created', params.toolParams),
     });
 
     this.logger.info(
@@ -175,6 +180,7 @@ export class Executor {
         account_id: current.account_id,
         action: 'approved',
         actor: 'user',
+        detail: buildAuditSummary(current.tool, 'approved', current.params),
       });
       // Both 'approved' and 'executing' are logged inside the same transaction
       // so they always appear as an atomic pair in the audit log. The user
@@ -186,6 +192,7 @@ export class Executor {
         account_id: current.account_id,
         action: 'executing',
         actor: 'user',
+        detail: buildAuditSummary(current.tool, 'executing', current.params),
       });
 
       return getIntent(this.db, intentId)!;
@@ -207,6 +214,7 @@ export class Executor {
         account_id: intent.account_id,
         action: 'executed',
         actor: 'user',
+        detail: buildAuditSummary(intent.tool, 'executed', intent.params),
       });
 
       return getIntent(this.db, intentId)!;
@@ -222,7 +230,7 @@ export class Executor {
         account_id: intent.account_id,
         action: 'failed',
         actor: 'user',
-        detail: errorDetail,
+        detail: buildAuditSummary(intent.tool, 'failed', intent.params, errorDetail),
       });
       throw error;
     }
@@ -252,7 +260,10 @@ export class Executor {
         account_id: intent.account_id,
         action: 'rejected',
         actor: 'user',
-        detail: reason ? { reason } : undefined,
+        detail: {
+          ...buildAuditSummary(intent.tool, 'rejected', intent.params),
+          ...(reason ? { reason } : {}),
+        },
       });
 
       return getIntent(this.db, intentId)!;
@@ -323,6 +334,7 @@ export class Executor {
         account_id: intent.account_id,
         action: 'undone',
         actor: 'user',
+        detail: buildAuditSummary(intent.tool, 'undone', intent.params),
       });
 
       return { success: true, message: `Undone: ${intent.tool}` };
