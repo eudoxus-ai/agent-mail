@@ -107,7 +107,11 @@ function renderPendingIntents(intents) {
     header.appendChild(createBadge(intent.risk, intent.risk));
     card.appendChild(header);
 
-    appendText(card, 'card-title', formatIntentTitle(intent));
+    const titleEl = document.createElement('div');
+    titleEl.className = 'card-title card-title-link';
+    titleEl.textContent = formatIntentTitle(intent);
+    titleEl.addEventListener('click', () => showIntentDetail(intent));
+    card.appendChild(titleEl);
     const detail = document.createElement('div');
     detail.className = 'card-detail';
     detail.innerHTML = formatIntentDetail(intent);
@@ -270,6 +274,141 @@ async function rejectIntent(id) {
     if (!res.ok) {
       const err = await res.json();
       alert(`Reject failed: ${err.error}`);
+      return;
+    }
+    await loadPending();
+  } catch (error) {
+    alert(`Error: ${formatError(error)}`);
+  }
+}
+
+function showIntentDetail(intent) {
+  // Hide tabs, show detail view
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+  document.getElementById('intent-detail-tab').classList.add('active');
+
+  const container = document.getElementById('intent-detail');
+  clearElement(container);
+
+  const backBtn = document.createElement('button');
+  backBtn.className = 'btn';
+  backBtn.textContent = '\u2190 Back to Pending';
+  backBtn.addEventListener('click', () => {
+    document.getElementById('intent-detail-tab').classList.remove('active');
+    document.querySelector('[data-tab="pending"]').click();
+  });
+  container.appendChild(backBtn);
+
+  const p = intent.params;
+
+  if (intent.tool === 'queue_send') {
+    const header = document.createElement('div');
+    header.className = 'detail-header';
+    header.innerHTML = `<span>Send email from <strong>${escapeHtml(intent.account_id)}</strong></span>
+      <span class="audit-time">${new Date(intent.created_at).toLocaleString()}</span>`;
+    container.appendChild(header);
+
+    const form = document.createElement('div');
+    form.className = 'detail-form';
+    form.innerHTML = `
+      <div class="detail-field">
+        <label>To</label>
+        <input type="text" id="edit-to" value="${escapeHtml(p.to || '')}">
+      </div>
+      <div class="detail-field">
+        <label>Subject</label>
+        <input type="text" id="edit-subject" value="${escapeHtml(p.subject || '')}">
+      </div>
+      <div class="detail-field">
+        <label>Body</label>
+        <textarea id="edit-body" rows="10">${escapeHtml(p.body || '')}</textarea>
+      </div>
+    `;
+    container.appendChild(form);
+
+    if (p.in_reply_to) {
+      const replyCtx = document.createElement('div');
+      replyCtx.className = 'reply-context';
+      replyCtx.innerHTML = `<div class="field-label">Replying to</div>
+        <div class="reply-snippet">${escapeHtml(p.in_reply_to)}</div>`;
+      container.appendChild(replyCtx);
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'card-actions';
+
+    const rejectBtn = document.createElement('button');
+    rejectBtn.className = 'btn btn-reject';
+    rejectBtn.textContent = 'Reject';
+    rejectBtn.addEventListener('click', async () => {
+      await rejectIntent(intent.id);
+      document.querySelector('[data-tab="pending"]').click();
+    });
+
+    const approveBtn = document.createElement('button');
+    approveBtn.className = 'btn btn-approve';
+    approveBtn.textContent = 'Approve & Send';
+    approveBtn.addEventListener('click', async () => {
+      const editedParams = {
+        ...p,
+        to: document.getElementById('edit-to').value,
+        subject: document.getElementById('edit-subject').value,
+        body: document.getElementById('edit-body').value,
+      };
+      await approveIntentWithParams(intent.id, editedParams);
+      document.querySelector('[data-tab="pending"]').click();
+    });
+
+    actions.appendChild(rejectBtn);
+    actions.appendChild(approveBtn);
+    container.appendChild(actions);
+  } else {
+    // Generic detail for non-send intents
+    const title = document.createElement('div');
+    title.className = 'card-title';
+    title.textContent = formatIntentTitle(intent);
+    container.appendChild(title);
+
+    const detail = document.createElement('div');
+    detail.className = 'card-detail';
+    detail.textContent = JSON.stringify(intent.params, null, 2);
+    container.appendChild(detail);
+
+    const actions = document.createElement('div');
+    actions.className = 'card-actions';
+
+    const rejectBtn = document.createElement('button');
+    rejectBtn.className = 'btn btn-reject';
+    rejectBtn.textContent = 'Reject';
+    rejectBtn.addEventListener('click', async () => {
+      await rejectIntent(intent.id);
+      document.querySelector('[data-tab="pending"]').click();
+    });
+
+    const approveBtn = document.createElement('button');
+    approveBtn.className = 'btn btn-approve';
+    approveBtn.textContent = 'Approve';
+    approveBtn.addEventListener('click', async () => {
+      await approveIntent(intent.id);
+      document.querySelector('[data-tab="pending"]').click();
+    });
+
+    actions.appendChild(rejectBtn);
+    actions.appendChild(approveBtn);
+    container.appendChild(actions);
+  }
+}
+
+async function approveIntentWithParams(id, params) {
+  try {
+    const res = await apiFetch(`/api/intent/${id}/approve`, {
+      method: 'POST',
+      body: JSON.stringify({ params }),
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      alert(`Approve failed: ${err.error}`);
       return;
     }
     await loadPending();
