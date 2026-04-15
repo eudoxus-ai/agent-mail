@@ -34,7 +34,7 @@ export async function startDaemon(port: number = 4242): Promise<void> {
     pollingIntervalMs: 3000,
     onNewIntent: (intent) => {
       logger.info(`New pending intent: ${intent.id} (${intent.tool})`);
-      notifyIntent(intent);
+      notifyIntent(intent, port);
     },
   });
   watcher.start();

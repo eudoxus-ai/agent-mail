@@ -25,8 +25,8 @@ export function createRouter(deps: RouterDeps): Router {
   router.get('/audit', (req, res) => {
     const entries = getAuditLog(deps.db, {
       account_id: req.query.account_id as string | undefined,
-      limit: parseInt(req.query.limit as string) || 50,
-      offset: parseInt(req.query.offset as string) || 0,
+      limit: parseInt(req.query.limit as string, 10) || 50,
+      offset: parseInt(req.query.offset as string, 10) || 0,
     });
     res.json(entries);
   });

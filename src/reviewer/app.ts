@@ -8,6 +8,32 @@ import { createRouter } from './routes.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+// Reject state-mutating requests whose Origin header is present but does not
+// match localhost.  Browsers always send Origin on cross-origin requests and
+// on same-origin POST/PUT/DELETE made via fetch, so this stops CSRF attempts
+// from malicious pages without requiring a per-request token.
+function csrfGuard(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+): void {
+  const method = req.method.toUpperCase();
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
+    next();
+    return;
+  }
+  const origin = req.headers.origin;
+  if (
+    origin !== undefined &&
+    !origin.startsWith('http://127.0.0.1') &&
+    !origin.startsWith('http://localhost')
+  ) {
+    res.status(403).json({ error: 'Cross-origin requests are not allowed' });
+    return;
+  }
+  next();
+}
+
 export function createReviewerApp(deps: {
   db: Database;
   executor: Executor;
@@ -27,6 +53,9 @@ export function createReviewerApp(deps: {
     res.setHeader('X-Frame-Options', 'DENY');
     next();
   });
+
+  // CSRF guard — reject mutations whose Origin is a non-localhost site
+  app.use('/api', csrfGuard);
 
   // API routes — no auth (localhost-only)
   app.use('/api', createRouter(deps));
