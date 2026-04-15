@@ -42,7 +42,8 @@ export function createRouter(deps: RouterDeps): Router {
 
   router.post('/intent/:id/approve', async (req, res) => {
     try {
-      const intent = await deps.executor.approveAndExecute(req.params.id);
+      const editedParams = req.body?.params as Record<string, unknown> | undefined;
+      const intent = await deps.executor.approveAndExecute(req.params.id, editedParams);
       res.json(intent);
     } catch (error) {
       deps.logger.error('Approve failed', {

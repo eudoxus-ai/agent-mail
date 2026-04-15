@@ -154,7 +154,10 @@ export class Executor {
     return intent;
   }
 
-  async approveAndExecute(intentId: string): Promise<Intent> {
+  async approveAndExecute(
+    intentId: string,
+    editedParams?: Record<string, unknown>
+  ): Promise<Intent> {
     const intent = withImmediateTransaction(this.db, () => {
       const current = getIntent(this.db, intentId);
       if (!current) {
@@ -173,6 +176,11 @@ export class Executor {
         throw new Error(
           `Intent ${intentId} is ${latest?.status ?? 'missing'}, not pending`
         );
+      }
+
+      if (editedParams) {
+        this.db.prepare('UPDATE intents SET params = ? WHERE id = ?')
+          .run(JSON.stringify(editedParams), intentId);
       }
 
       logAudit(this.db, {
