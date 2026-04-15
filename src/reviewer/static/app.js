@@ -400,6 +400,68 @@ function showIntentDetail(intent) {
   }
 }
 
+async function loadQuarantine() {
+  try {
+    const res = await apiFetch('/api/quarantine');
+    const items = await res.json();
+    renderQuarantine(items);
+  } catch (error) {
+    const list = document.getElementById('quarantine-list');
+    appendEmptyState(list, `Error: ${formatError(error)}`);
+  }
+}
+
+function renderQuarantine(intents) {
+  const list = document.getElementById('quarantine-list');
+  if (intents.length === 0) {
+    appendEmptyState(list, 'No quarantined items');
+    return;
+  }
+
+  clearElement(list);
+
+  const header = document.createElement('div');
+  header.className = 'quarantine-header';
+  header.innerHTML = `<strong>${intents.length} item${intents.length !== 1 ? 's' : ''}</strong> in Quarantine`;
+  list.appendChild(header);
+
+  intents.forEach((intent) => {
+    const row = document.createElement('div');
+    row.className = 'quarantine-row';
+
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = true;
+    checkbox.dataset.intentId = intent.id;
+
+    const info = document.createElement('div');
+    info.className = 'quarantine-info';
+
+    const p = intent.params;
+    const uidCount = Array.isArray(p.uids) ? p.uids.length : 0;
+    const mailbox = p.mailbox || 'INBOX';
+    info.innerHTML = `<div>${escapeHtml(intent.tool)} · ${uidCount} message${uidCount !== 1 ? 's' : ''} from ${escapeHtml(mailbox)}</div>
+      <div class="audit-time">${new Date(intent.created_at).toLocaleString()}</div>`;
+
+    const undoBtn = document.createElement('button');
+    undoBtn.className = 'btn';
+    undoBtn.textContent = 'Undo';
+    undoBtn.addEventListener('click', async () => {
+      try {
+        await apiFetch(`/api/intent/${intent.id}/undo`, { method: 'POST' });
+        await loadQuarantine();
+      } catch (error) {
+        alert(`Error: ${formatError(error)}`);
+      }
+    });
+
+    row.appendChild(checkbox);
+    row.appendChild(info);
+    row.appendChild(undoBtn);
+    list.appendChild(row);
+  });
+}
+
 async function approveIntentWithParams(id, params) {
   try {
     const res = await apiFetch(`/api/intent/${id}/approve`, {
@@ -428,6 +490,10 @@ function loadActiveTab() {
   }
   if (document.getElementById('stuck-tab').classList.contains('active')) {
     void loadStuck();
+    return;
+  }
+  if (document.getElementById('quarantine-tab').classList.contains('active')) {
+    void loadQuarantine();
   }
 }
 
