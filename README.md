@@ -55,16 +55,20 @@ One MCP server manages all your email accounts. Gmail, iCloud, work IMAP, whatev
 ### Prerequisites
 
 - Node.js 22+
+- macOS for reviewer notifications and launchd management
 - App-specific passwords for Gmail and iCloud (not your regular password)
   - Gmail: [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
   - iCloud: [appleid.apple.com](https://appleid.apple.com) → Sign-In and Security → App-Specific Passwords
 
-### Install
+### Install from source
 
 ```bash
 git clone <repo-url> && cd agent-mail
 npm install
+npm run build
 ```
+
+`agent-mail` now uses macOS's built-in Notification Center through `osascript`. There is no bundled `terminal-notifier` binary to install, patch, or remove on macOS 14+.
 
 ### Add your email accounts
 
@@ -114,7 +118,7 @@ Or if you prefer npx (after `npm link`):
 
 Restart Claude Desktop. You should see agent-mail's 10 tools in the tool list.
 
-### Launch the reviewer UI
+### Launch the reviewer UI once
 
 In a separate terminal:
 
@@ -125,6 +129,34 @@ In a separate terminal:
 Opens at `http://127.0.0.1:4242`. Enter the bearer token (printed on startup, also at `~/.agent-mail/reviewer-token`) into the page to load reviewer data and approve or reject actions.
 
 Every reviewer API request requires that bearer token, including read-only views like pending actions and the audit log.
+
+### Install the background reviewer daemon
+
+If you want notifications without manually starting the reviewer every time, install the launchd job:
+
+```bash
+./bin/agent-mail.mjs install-daemon
+```
+
+This writes `~/Library/LaunchAgents/com.agent-mail.reviewer.plist`, starts the daemon immediately, and logs to:
+
+```text
+~/.agent-mail/daemon.log
+~/.agent-mail/daemon-error.log
+```
+
+Useful lifecycle commands:
+
+```bash
+./bin/agent-mail.mjs status
+./bin/agent-mail.mjs uninstall-daemon
+```
+
+`install-daemon` prefers the compiled build in `dist/`. If you skip `npm run build`, the source checkout path requires a globally available `tsx`.
+
+### Notification behavior on macOS 14+
+
+Notifications are posted with `osascript` instead of `node-notifier`/`terminal-notifier`. That avoids the stale bundled binary path that has known compatibility issues on newer macOS releases. The notification tells you which local reviewer URL to open.
 
 ## Tools
 
@@ -176,6 +208,22 @@ npm run audit         # Dependency vulnerability check
 npm run validate      # Full local validation
 npm run build         # Compile to dist/
 ```
+
+## Uninstall
+
+To remove the background daemon:
+
+```bash
+./bin/agent-mail.mjs uninstall-daemon
+```
+
+To remove local state and credentials after uninstalling the daemon:
+
+```bash
+rm -rf ~/.agent-mail
+```
+
+To disconnect Claude Desktop, remove the `agent-mail` entry from `~/Library/Application Support/Claude/claude_desktop_config.json`.
 
 ## License
 
