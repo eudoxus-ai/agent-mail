@@ -4,7 +4,6 @@ import { fileURLToPath } from 'node:url';
 import type { Database } from '../ledger/sqlite.js';
 import type { Executor } from '../executor/executor.js';
 import type { Logger } from '../logger.js';
-import { authMiddleware } from './auth.js';
 import { createRouter } from './routes.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -13,7 +12,6 @@ export function createReviewerApp(deps: {
   db: Database;
   executor: Executor;
   logger: Logger;
-  token: string;
 }): express.Application {
   const app = express();
 
@@ -30,8 +28,8 @@ export function createReviewerApp(deps: {
     next();
   });
 
-  // API routes
-  app.use('/api', authMiddleware(deps.token), createRouter(deps));
+  // API routes — no auth (localhost-only)
+  app.use('/api', createRouter(deps));
 
   // Serve static files
   app.use(express.static(join(__dirname, 'static')));

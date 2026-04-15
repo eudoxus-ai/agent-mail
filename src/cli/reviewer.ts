@@ -5,7 +5,6 @@ import { ImapConnectionPool } from '../provider/imap-pool.js';
 import { Executor } from '../executor/executor.js';
 import { createReviewerApp } from '../reviewer/app.js';
 import { createLogger } from '../logger.js';
-import { loadReviewerToken } from '../reviewer/auth.js';
 import { ACCOUNTS_YAML_PATH, LEDGER_DB_PATH } from '../config.js';
 
 export async function startReviewer(port: number = 4242): Promise<void> {
@@ -30,8 +29,7 @@ export async function startReviewer(port: number = 4242): Promise<void> {
   const accounts = loadAccounts();
   const pool = new ImapConnectionPool({ accounts, logger });
   const executor = new Executor({ db, accounts, pool, logger });
-  const token = loadReviewerToken();
-  const app = createReviewerApp({ db, executor, logger, token });
+  const app = createReviewerApp({ db, executor, logger });
 
   const shutdown = async (code = 0) => {
     try {
@@ -46,7 +44,6 @@ export async function startReviewer(port: number = 4242): Promise<void> {
 
   app.listen(port, host, () => {
     logger.info(`agent-mail reviewer running at http://${host}:${port}`);
-    logger.info(`Bearer token: ${token.substring(0, 8)}...`);
     logger.info(`${accounts.length} account(s) configured`);
   });
 }

@@ -1,5 +1,3 @@
-let bearerToken = '';
-
 function clearElement(node) {
   while (node.firstChild) {
     node.removeChild(node.firstChild);
@@ -39,31 +37,11 @@ function formatError(error) {
 }
 
 async function apiFetch(path, options = {}) {
-  if (!bearerToken) {
-    throw new Error(
-      'Set the reviewer bearer token from ~/.agent-mail/reviewer-token to load data.'
-    );
-  }
-
   const headers = new Headers(options.headers || {});
-  headers.set('Authorization', `Bearer ${bearerToken}`);
-
   if (options.body && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
   }
-
-  const response = await fetch(path, { ...options, headers });
-  if (response.status === 401 || response.status === 403) {
-    throw new Error('Authentication failed. Check the bearer token and try again.');
-  }
-  return response;
-}
-
-function setToken() {
-  const tokenInput = document.getElementById('token-input');
-  bearerToken = tokenInput.value.trim();
-  tokenInput.value = '';
-  loadActiveTab();
+  return fetch(path, { ...options, headers });
 }
 
 function showTab(event, name) {
@@ -264,28 +242,16 @@ function loadActiveTab() {
   }
 }
 
-document.getElementById('set-token-button').addEventListener('click', setToken);
-document.getElementById('token-input').addEventListener('keydown', (event) => {
-  if (event.key === 'Enter') {
-    setToken();
-  }
-});
 document.querySelectorAll('.tab').forEach((button) => {
   button.addEventListener('click', (event) => {
     showTab(event, button.dataset.tab);
   });
 });
 
-appendEmptyState(
-  document.getElementById('pending-list'),
-  'Set the reviewer bearer token from ~/.agent-mail/reviewer-token to load data.'
-);
+loadActiveTab();
 
 setInterval(() => {
-  if (
-    bearerToken &&
-    document.getElementById('pending-tab').classList.contains('active')
-  ) {
+  if (document.getElementById('pending-tab').classList.contains('active')) {
     void loadPending();
   }
 }, 5000);

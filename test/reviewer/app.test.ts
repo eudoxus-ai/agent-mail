@@ -22,7 +22,7 @@ afterEach(async () => {
 });
 
 describe('reviewer app', () => {
-  it('requires auth for API reads and allows static shell access', async () => {
+  it('allows unauthenticated access to all API routes', async () => {
     const db = openDatabase(':memory:');
     const app = createReviewerApp({
       db,
@@ -35,7 +35,6 @@ describe('reviewer app', () => {
         },
       } as any,
       logger: createLogger('cli', { minLevel: 'error' }),
-      token: 'secret-token',
     });
 
     server = await new Promise<Server>((resolve) => {
@@ -52,12 +51,7 @@ describe('reviewer app', () => {
     const shell = await fetch(baseUrl);
     expect(shell.status).toBe(200);
 
-    const unauthenticated = await fetch(`${baseUrl}/api/pending`);
-    expect(unauthenticated.status).toBe(401);
-
-    const authenticated = await fetch(`${baseUrl}/api/pending`, {
-      headers: { Authorization: 'Bearer secret-token' },
-    });
-    expect(authenticated.status).toBe(200);
+    const pending = await fetch(`${baseUrl}/api/pending`);
+    expect(pending.status).toBe(200);
   });
 });
