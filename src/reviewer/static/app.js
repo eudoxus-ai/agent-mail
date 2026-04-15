@@ -52,6 +52,42 @@ function showTab(event, name) {
   loadActiveTab();
 }
 
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+function formatIntentTitle(intent) {
+  const p = intent.params;
+  switch (intent.tool) {
+    case 'queue_send':
+      return `Send email to ${p.to || 'unknown'}`;
+    case 'quarantine_thread': {
+      const count = Array.isArray(p.uids) ? p.uids.length : 0;
+      return `Quarantine ${count} message${count !== 1 ? 's' : ''}`;
+    }
+    case 'permanent_delete': {
+      const count = Array.isArray(p.uids) ? p.uids.length : 0;
+      return `Permanently delete ${count} item${count !== 1 ? 's' : ''}`;
+    }
+    default:
+      return `${intent.tool} on ${intent.account_id}`;
+  }
+}
+
+function formatIntentDetail(intent) {
+  const p = intent.params;
+  switch (intent.tool) {
+    case 'queue_send':
+      return `<div class="intent-field"><span class="field-label">Subject:</span> ${escapeHtml(p.subject || '(no subject)')}</div>`
+        + `<div class="intent-field"><span class="field-label">Body:</span></div>`
+        + `<div class="intent-body">${escapeHtml(p.body || '').substring(0, 500)}</div>`;
+    default:
+      return `<pre>${escapeHtml(JSON.stringify(p, null, 2))}</pre>`;
+  }
+}
+
 function renderPendingIntents(intents) {
   const list = document.getElementById('pending-list');
   if (intents.length === 0) {
@@ -71,12 +107,15 @@ function renderPendingIntents(intents) {
     header.appendChild(createBadge(intent.risk, intent.risk));
     card.appendChild(header);
 
-    appendText(card, 'card-title', `${intent.tool} on ${intent.account_id}`);
-    appendText(card, 'card-detail', JSON.stringify(intent.params, null, 2));
+    appendText(card, 'card-title', formatIntentTitle(intent));
+    const detail = document.createElement('div');
+    detail.className = 'card-detail';
+    detail.innerHTML = formatIntentDetail(intent);
+    card.appendChild(detail);
     appendText(
       card,
       'card-meta',
-      `Intent: ${intent.id.substring(0, 8)}... | Created: ${new Date(intent.created_at).toLocaleString()}`
+      `${intent.account_id} · ${new Date(intent.created_at).toLocaleString()}`
     );
 
     const actions = document.createElement('div');
@@ -118,15 +157,26 @@ function renderAuditLog(entries) {
     row.className = 'audit-row';
 
     const left = document.createElement('span');
-    const action = document.createElement('span');
-    action.className = 'audit-action';
-    action.textContent = entry.action;
-    left.appendChild(action);
-    left.appendChild(
-      document.createTextNode(
-        ` by ${entry.actor}${entry.account_id ? ` (${entry.account_id})` : ''}`
-      )
-    );
+    const summary = entry.detail?.summary;
+    if (summary) {
+      const summaryEl = document.createElement('strong');
+      summaryEl.textContent = summary;
+      left.appendChild(summaryEl);
+      const action = document.createElement('span');
+      action.className = 'audit-action';
+      action.textContent = ` · ${entry.action}`;
+      left.appendChild(action);
+    } else {
+      const action = document.createElement('span');
+      action.className = 'audit-action';
+      action.textContent = entry.action;
+      left.appendChild(action);
+      left.appendChild(
+        document.createTextNode(
+          ` by ${entry.actor}${entry.account_id ? ` (${entry.account_id})` : ''}`
+        )
+      );
+    }
 
     const right = document.createElement('span');
     right.className = 'audit-time';
