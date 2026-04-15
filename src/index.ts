@@ -19,6 +19,12 @@ switch (command) {
     await startReviewer(port);
     break;
   }
+  case 'daemon': {
+    const { startDaemon } = await import('./reviewer/daemon.js');
+    const port = process.argv[3] ? parseInt(process.argv[3]) : undefined;
+    await startDaemon(port);
+    break;
+  }
   case 'config': {
     const { printConfig } = await import('./cli/config.js');
     printConfig();
@@ -30,6 +36,6 @@ switch (command) {
     break;
   }
   default:
-    console.error('Usage: agent-mail <add-account|serve|reviewer [port]|config|install>');
+    console.error('Usage: agent-mail <add-account|serve|reviewer [port]|daemon [port]|config|install>');
     process.exit(1);
 }
