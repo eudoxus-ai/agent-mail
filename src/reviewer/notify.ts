@@ -1,12 +1,11 @@
 import notifier from 'node-notifier';
 import type { Intent } from '../types.js';
-import { buildAuditSummary } from '../ledger/audit-summary.js';
+import { describeIntent } from '../ledger/audit-summary.js';
 
 const REVIEWER_PORT = 4242;
 
 export function notifyIntent(intent: Intent): void {
-  const detail = buildAuditSummary(intent.tool, 'created', intent.params);
-  const summary = (detail.summary as string) ?? `${intent.tool} on ${intent.account_id}`;
+  const summary = describeIntent(intent.tool, intent.params);
 
   notifier.notify({
     title: 'agent-mail',

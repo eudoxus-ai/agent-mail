@@ -9,25 +9,29 @@ const PLIST_PATH = join(homedir(), 'Library', 'LaunchAgents', `${PLIST_NAME}.pli
 const LOG_PATH = join(homedir(), '.agent-mail', 'daemon.log');
 const ERR_LOG_PATH = join(homedir(), '.agent-mail', 'daemon-error.log');
 
-function getNodePath(): string {
-  try {
-    return execSync('which node', { encoding: 'utf-8' }).trim();
-  } catch {
-    throw new Error('Could not find node binary. Ensure Node.js is in your PATH.');
+function resolveRunner(): { bin: string; script: string } {
+  const builtScript = join(import.meta.dirname, '..', 'index.js');
+  if (existsSync(builtScript)) {
+    // Built project — use plain node
+    const nodePath = execSync('which node', { encoding: 'utf-8' }).trim();
+    return { bin: nodePath, script: builtScript };
   }
-}
 
-function getEntryScript(): string {
-  const scriptPath = join(import.meta.dirname, '..', 'index.js');
-  if (!existsSync(scriptPath)) {
-    return join(import.meta.dirname, '..', 'index.ts');
+  // Unbuilt source checkout — must use tsx to run TypeScript
+  const tsScript = join(import.meta.dirname, '..', 'index.ts');
+  try {
+    const tsxPath = execSync('which tsx', { encoding: 'utf-8' }).trim();
+    return { bin: tsxPath, script: tsScript };
+  } catch {
+    throw new Error(
+      'Cannot install daemon from unbuilt source without tsx. ' +
+      'Either run "npm run build" first, or install tsx globally: npm i -g tsx'
+    );
   }
-  return scriptPath;
 }
 
 export function installDaemon(): void {
-  const nodePath = getNodePath();
-  const entryScript = getEntryScript();
+  const { bin, script } = resolveRunner();
 
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -37,8 +41,8 @@ export function installDaemon(): void {
   <string>${PLIST_NAME}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${nodePath}</string>
-    <string>${entryScript}</string>
+    <string>${bin}</string>
+    <string>${script}</string>
     <string>daemon</string>
   </array>
   <key>RunAtLoad</key>

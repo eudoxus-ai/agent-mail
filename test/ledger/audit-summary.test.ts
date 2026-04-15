@@ -51,6 +51,30 @@ describe('buildAuditSummary', () => {
     expect(detail.summary).toBe('Executed: unknown_tool');
   });
 
+  it('summarizes created action as pending', () => {
+    const detail = buildAuditSummary('queue_send', 'created', {
+      to: 'alice@example.com',
+      subject: 'Hello',
+    });
+    expect(detail.summary).toBe('Pending: Send email to alice@example.com: Hello');
+  });
+
+  it('summarizes executing action with prefix', () => {
+    const detail = buildAuditSummary('quarantine_thread', 'executing', {
+      uids: [1, 2],
+      mailbox: 'INBOX',
+    });
+    expect(detail.summary).toBe('Executing: Quarantine 2 messages');
+  });
+
+  it('summarizes undone action with prefix', () => {
+    const detail = buildAuditSummary('queue_send', 'undone', {
+      to: 'alice@example.com',
+      subject: 'Test',
+    });
+    expect(detail.summary).toBe('Undone: Send email to alice@example.com: Test');
+  });
+
   it('includes error in failed summary', () => {
     const detail = buildAuditSummary('queue_send', 'failed', {
       to: 'alice@example.com',

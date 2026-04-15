@@ -30,7 +30,22 @@ export function buildAuditSummary(
     return { summary: `Rejected: ${base}` };
   }
 
-  // 'created', 'executing', 'executed', 'undone'
+  if (action === 'created') {
+    const base = describeIntent(tool, params);
+    return { summary: `Pending: ${base}` };
+  }
+
+  if (action === 'executing') {
+    const base = describeIntent(tool, params);
+    return { summary: `Executing: ${base}` };
+  }
+
+  if (action === 'undone') {
+    const base = describeIntent(tool, params);
+    return { summary: `Undone: ${base}` };
+  }
+
+  // 'executed'
   switch (tool) {
     case 'queue_send':
       return {
@@ -61,7 +76,7 @@ export function buildAuditSummary(
   }
 }
 
-function describeIntent(tool: string, params: Record<string, unknown>): string {
+export function describeIntent(tool: string, params: Record<string, unknown>): string {
   const to = params.to as string | undefined;
   const subject = params.subject as string | undefined;
 

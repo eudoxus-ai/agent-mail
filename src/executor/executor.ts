@@ -179,8 +179,11 @@ export class Executor {
       }
 
       if (editedParams) {
+        // When the reviewer edits params, remove draft_id so the executor
+        // uses the edited fields instead of fetching the original draft.
+        const { draft_id: _, ...paramsWithoutDraft } = editedParams;
         this.db.prepare('UPDATE intents SET params = ? WHERE id = ?')
-          .run(JSON.stringify(editedParams), intentId);
+          .run(JSON.stringify(paramsWithoutDraft), intentId);
       }
 
       logAudit(this.db, {

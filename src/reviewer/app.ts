@@ -34,8 +34,8 @@ export function createReviewerApp(deps: {
   // Serve static files
   app.use(express.static(join(__dirname, 'static')));
 
-  // Fallback to index.html for SPA
-  app.get('/', (_req, res) => {
+  // SPA fallback — serve index.html for all non-API, non-static paths
+  app.get('*', (_req, res) => {
     res.sendFile(join(__dirname, 'static', 'index.html'));
   });
 
