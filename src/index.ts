@@ -35,7 +35,24 @@ switch (command) {
     await installConfig();
     break;
   }
+  case 'install-daemon': {
+    const { installDaemon } = await import('./cli/daemon.js');
+    installDaemon();
+    break;
+  }
+  case 'uninstall-daemon': {
+    const { uninstallDaemon } = await import('./cli/daemon.js');
+    uninstallDaemon();
+    break;
+  }
+  case 'status': {
+    const { daemonStatus } = await import('./cli/daemon.js');
+    await daemonStatus();
+    break;
+  }
   default:
-    console.error('Usage: agent-mail <add-account|serve|reviewer [port]|daemon [port]|config|install>');
+    console.error(
+      'Usage: agent-mail <add-account|serve|reviewer [port]|daemon [port]|config|install|install-daemon|uninstall-daemon|status>',
+    );
     process.exit(1);
 }
