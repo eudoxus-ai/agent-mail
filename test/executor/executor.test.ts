@@ -152,6 +152,22 @@ describe('Executor.approveAndExecute', () => {
     );
   });
 
+  it('executes with edited params when editedParams is provided', async () => {
+    const intent = await executor.createGatedIntent({
+      tool: 'queue_send',
+      toolParams: { to: 'original@test.com', subject: 'Original Subject', body: 'Original body' },
+      accountId: 'test',
+      agentId: 'claude',
+      risk: 'high',
+    });
+
+    const editedParams = { to: 'edited@test.com', subject: 'Edited Subject', body: 'Edited body' };
+    const result = await executor.approveAndExecute(intent.id, editedParams);
+
+    expect(result.status).toBe('executed');
+    expect(result.params).toEqual(editedParams);
+  });
+
   it('claims a pending intent exactly once under concurrent approval attempts', async () => {
     let resolveSend!: (value: { messageId: string }) => void;
     const pendingSend = new Promise<{ messageId: string }>((resolve) => {

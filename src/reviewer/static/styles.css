@@ -30,3 +30,28 @@ h1 { font-size: 20px; font-weight: 600; }
 .audit-row { font-size: 12px; color: #666; padding: 6px 0; border-bottom: 1px solid #f3f4f6; display: flex; justify-content: space-between; }
 .audit-action { font-weight: 500; }
 .audit-time { color: #aaa; font-size: 11px; }
+.card-title-link { cursor: pointer; }
+.card-title-link:hover { text-decoration: underline; }
+.detail-header { display: flex; justify-content: space-between; align-items: center; margin: 1rem 0; }
+.detail-form { margin: 1rem 0; }
+.detail-field { margin-bottom: 1rem; }
+.detail-field label { display: block; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; color: #888; margin-bottom: 0.25rem; }
+.detail-field input, .detail-field textarea { width: 100%; padding: 0.5rem; font-size: 0.875rem; font-family: inherit; background: var(--bg-secondary, #f9f9f9); border: 1px solid var(--border, #ddd); border-radius: 4px; color: inherit; }
+.reply-context { background: var(--bg-secondary, #f9f9f9); border: 1px solid var(--border, #ddd); border-radius: 4px; padding: 0.75rem; margin: 1rem 0; }
+.reply-snippet { color: #888; font-size: 0.875rem; }
+.quarantine-header {
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border, #ddd);
+}
+
+.quarantine-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--border, #ddd);
+}
+
+.quarantine-info {
+  flex: 1;
+}

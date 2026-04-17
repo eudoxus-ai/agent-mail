@@ -4,7 +4,7 @@ import type { Executor } from '../executor/executor.js';
 import type { Logger } from '../logger.js';
 import { getPendingIntents, getIntent } from '../ledger/intents.js';
 import { getAuditLog } from '../ledger/audit.js';
-import { checkStuckExecuting } from '../ledger/db.js';
+import { checkStuckExecuting, rowToIntent } from '../ledger/db.js';
 import { loadAccounts } from '../provider/accounts.js';
 
 export interface RouterDeps {
@@ -25,8 +25,8 @@ export function createRouter(deps: RouterDeps): Router {
   router.get('/audit', (req, res) => {
     const entries = getAuditLog(deps.db, {
       account_id: req.query.account_id as string | undefined,
-      limit: parseInt(req.query.limit as string) || 50,
-      offset: parseInt(req.query.offset as string) || 0,
+      limit: parseInt(req.query.limit as string, 10) || 50,
+      offset: parseInt(req.query.offset as string, 10) || 0,
     });
     res.json(entries);
   });
@@ -42,7 +42,8 @@ export function createRouter(deps: RouterDeps): Router {
 
   router.post('/intent/:id/approve', async (req, res) => {
     try {
-      const intent = await deps.executor.approveAndExecute(req.params.id);
+      const editedParams = req.body?.params as Record<string, unknown> | undefined;
+      const intent = await deps.executor.approveAndExecute(req.params.id, editedParams);
       res.json(intent);
     } catch (error) {
       deps.logger.error('Approve failed', {
@@ -85,6 +86,35 @@ export function createRouter(deps: RouterDeps): Router {
   router.get('/stuck', (_req, res) => {
     const stuck = checkStuckExecuting(deps.db);
     res.json(stuck);
+  });
+
+  router.get('/quarantine', (_req, res) => {
+    const quarantined = deps.db.prepare(`
+      SELECT * FROM intents
+      WHERE tool = 'quarantine_thread'
+        AND status = 'executed'
+        AND id NOT IN (
+          SELECT intent_id FROM audit_log WHERE action = 'undone'
+        )
+      ORDER BY created_at DESC
+    `).all() as Array<Record<string, unknown>>;
+
+    res.json(quarantined.map(rowToIntent));
+  });
+
+  router.post('/intent/:id/undo', async (req, res) => {
+    try {
+      const result = await deps.executor.undoIntent(req.params.id);
+      res.json(result);
+    } catch (error) {
+      deps.logger.error('Undo failed', {
+        id: req.params.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      res.status(400).json({
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   });
 
   return router;

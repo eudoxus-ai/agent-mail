@@ -34,18 +34,19 @@ export function evaluatePolicy(
 
   if (!toolPolicy) {
     // Unknown tool defaults to gated for safety
-    return { decision: 'gate', risk: 'high', reason: 'Unknown tool, gating by default' };
+    return { decision: 'gate', risk: 'high', reason: 'Unknown tool, gating by default', reversible: false };
   }
 
   const risk = toolPolicy.risk;
   const gate: GateType = toolPolicy.gate;
+  const reversible = toolPolicy.reversible ?? false;
 
   if (gate === 'ungated') {
-    return { decision: 'execute', risk, reason: 'Policy: ungated' };
+    return { decision: 'execute', risk, reason: 'Policy: ungated', reversible };
   }
 
   if (gate === 'always_gated') {
-    return { decision: 'gate', risk, reason: 'Policy: always gated' };
+    return { decision: 'gate', risk, reason: 'Policy: always gated', reversible };
   }
 
   // gate === 'configurable'
@@ -56,17 +57,17 @@ export function evaluatePolicy(
   for (const [condition, result] of Object.entries(overrides)) {
     if (condition === 'when_thread_has_replies' && context?.threadHasReplies) {
       if (result === 'approval_required') {
-        return { decision: 'gate', risk, reason: `Override: ${condition}` };
+        return { decision: 'gate', risk, reason: `Override: ${condition}`, reversible };
       }
     }
   }
 
   // No override triggered, use default
   if (defaultGate === 'approval_required') {
-    return { decision: 'gate', risk, reason: 'Policy: configurable, default gated' };
+    return { decision: 'gate', risk, reason: 'Policy: configurable, default gated', reversible };
   }
 
-  return { decision: 'execute', risk, reason: 'Policy: configurable, default ungated' };
+  return { decision: 'execute', risk, reason: 'Policy: configurable, default ungated', reversible };
 }
 
 function parsePolicyConfig(raw: unknown): PolicyConfig {

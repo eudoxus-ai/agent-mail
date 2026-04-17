@@ -77,6 +77,7 @@ export interface PolicyResult {
   decision: PolicyDecision;
   risk: RiskLevel;
   reason: string;
+  reversible: boolean;
 }
 
 export interface ToolPolicy {
@@ -86,6 +87,7 @@ export interface ToolPolicy {
   override?: Record<string, 'approval_required' | 'ungated'>;
   note?: string;
   auto_approve_after?: number | null;
+  reversible?: boolean;
 }
 
 export interface PolicyConfig {

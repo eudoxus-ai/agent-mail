@@ -1,5 +1,3 @@
-let bearerToken = '';
-
 function clearElement(node) {
   while (node.firstChild) {
     node.removeChild(node.firstChild);
@@ -39,31 +37,11 @@ function formatError(error) {
 }
 
 async function apiFetch(path, options = {}) {
-  if (!bearerToken) {
-    throw new Error(
-      'Set the reviewer bearer token from ~/.agent-mail/reviewer-token to load data.'
-    );
-  }
-
   const headers = new Headers(options.headers || {});
-  headers.set('Authorization', `Bearer ${bearerToken}`);
-
   if (options.body && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
   }
-
-  const response = await fetch(path, { ...options, headers });
-  if (response.status === 401 || response.status === 403) {
-    throw new Error('Authentication failed. Check the bearer token and try again.');
-  }
-  return response;
-}
-
-function setToken() {
-  const tokenInput = document.getElementById('token-input');
-  bearerToken = tokenInput.value.trim();
-  tokenInput.value = '';
-  loadActiveTab();
+  return fetch(path, { ...options, headers });
 }
 
 function showTab(event, name) {
@@ -72,6 +50,42 @@ function showTab(event, name) {
   event.currentTarget.classList.add('active');
   document.getElementById(`${name}-tab`).classList.add('active');
   loadActiveTab();
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+function formatIntentTitle(intent) {
+  const p = intent.params;
+  switch (intent.tool) {
+    case 'queue_send':
+      return `Send email to ${p.to || 'unknown'}`;
+    case 'quarantine_thread': {
+      const count = Array.isArray(p.uids) ? p.uids.length : 0;
+      return `Quarantine ${count} message${count !== 1 ? 's' : ''}`;
+    }
+    case 'permanent_delete': {
+      const count = Array.isArray(p.uids) ? p.uids.length : 0;
+      return `Permanently delete ${count} item${count !== 1 ? 's' : ''}`;
+    }
+    default:
+      return `${intent.tool} on ${intent.account_id}`;
+  }
+}
+
+function formatIntentDetail(intent) {
+  const p = intent.params;
+  switch (intent.tool) {
+    case 'queue_send':
+      return `<div class="intent-field"><span class="field-label">Subject:</span> ${escapeHtml(p.subject || '(no subject)')}</div>`
+        + `<div class="intent-field"><span class="field-label">Body:</span></div>`
+        + `<div class="intent-body">${escapeHtml(p.body || '').substring(0, 500)}</div>`;
+    default:
+      return `<pre>${escapeHtml(JSON.stringify(p, null, 2))}</pre>`;
+  }
 }
 
 function renderPendingIntents(intents) {
@@ -93,12 +107,19 @@ function renderPendingIntents(intents) {
     header.appendChild(createBadge(intent.risk, intent.risk));
     card.appendChild(header);
 
-    appendText(card, 'card-title', `${intent.tool} on ${intent.account_id}`);
-    appendText(card, 'card-detail', JSON.stringify(intent.params, null, 2));
+    const titleEl = document.createElement('div');
+    titleEl.className = 'card-title card-title-link';
+    titleEl.textContent = formatIntentTitle(intent);
+    titleEl.addEventListener('click', () => showIntentDetail(intent));
+    card.appendChild(titleEl);
+    const detail = document.createElement('div');
+    detail.className = 'card-detail';
+    detail.innerHTML = formatIntentDetail(intent);
+    card.appendChild(detail);
     appendText(
       card,
       'card-meta',
-      `Intent: ${intent.id.substring(0, 8)}... | Created: ${new Date(intent.created_at).toLocaleString()}`
+      `${intent.account_id} · ${new Date(intent.created_at).toLocaleString()}`
     );
 
     const actions = document.createElement('div');
@@ -140,15 +161,26 @@ function renderAuditLog(entries) {
     row.className = 'audit-row';
 
     const left = document.createElement('span');
-    const action = document.createElement('span');
-    action.className = 'audit-action';
-    action.textContent = entry.action;
-    left.appendChild(action);
-    left.appendChild(
-      document.createTextNode(
-        ` by ${entry.actor}${entry.account_id ? ` (${entry.account_id})` : ''}`
-      )
-    );
+    const summary = entry.detail?.summary;
+    if (summary) {
+      const summaryEl = document.createElement('strong');
+      summaryEl.textContent = summary;
+      left.appendChild(summaryEl);
+      const action = document.createElement('span');
+      action.className = 'audit-action';
+      action.textContent = ` · ${entry.action}`;
+      left.appendChild(action);
+    } else {
+      const action = document.createElement('span');
+      action.className = 'audit-action';
+      action.textContent = entry.action;
+      left.appendChild(action);
+      left.appendChild(
+        document.createTextNode(
+          ` by ${entry.actor}${entry.account_id ? ` (${entry.account_id})` : ''}`
+        )
+      );
+    }
 
     const right = document.createElement('span');
     right.className = 'audit-time';
@@ -250,6 +282,203 @@ async function rejectIntent(id) {
   }
 }
 
+function showIntentDetail(intent) {
+  // Hide tabs, show detail view
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+  document.getElementById('intent-detail-tab').classList.add('active');
+
+  const container = document.getElementById('intent-detail');
+  clearElement(container);
+
+  const backBtn = document.createElement('button');
+  backBtn.className = 'btn';
+  backBtn.textContent = '\u2190 Back to Pending';
+  backBtn.addEventListener('click', () => {
+    document.getElementById('intent-detail-tab').classList.remove('active');
+    document.querySelector('[data-tab="pending"]').click();
+  });
+  container.appendChild(backBtn);
+
+  const p = intent.params;
+
+  if (intent.tool === 'queue_send') {
+    const header = document.createElement('div');
+    header.className = 'detail-header';
+    header.innerHTML = `<span>Send email from <strong>${escapeHtml(intent.account_id)}</strong></span>
+      <span class="audit-time">${new Date(intent.created_at).toLocaleString()}</span>`;
+    container.appendChild(header);
+
+    const form = document.createElement('div');
+    form.className = 'detail-form';
+    form.innerHTML = `
+      <div class="detail-field">
+        <label>To</label>
+        <input type="text" id="edit-to" value="${escapeHtml(p.to || '')}">
+      </div>
+      <div class="detail-field">
+        <label>Subject</label>
+        <input type="text" id="edit-subject" value="${escapeHtml(p.subject || '')}">
+      </div>
+      <div class="detail-field">
+        <label>Body</label>
+        <textarea id="edit-body" rows="10">${escapeHtml(p.body || '')}</textarea>
+      </div>
+    `;
+    container.appendChild(form);
+
+    if (p.in_reply_to) {
+      const replyCtx = document.createElement('div');
+      replyCtx.className = 'reply-context';
+      replyCtx.innerHTML = `<div class="field-label">Replying to</div>
+        <div class="reply-snippet">${escapeHtml(p.in_reply_to)}</div>`;
+      container.appendChild(replyCtx);
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'card-actions';
+
+    const rejectBtn = document.createElement('button');
+    rejectBtn.className = 'btn btn-reject';
+    rejectBtn.textContent = 'Reject';
+    rejectBtn.addEventListener('click', async () => {
+      await rejectIntent(intent.id);
+      document.querySelector('[data-tab="pending"]').click();
+    });
+
+    const approveBtn = document.createElement('button');
+    approveBtn.className = 'btn btn-approve';
+    approveBtn.textContent = 'Approve & Send';
+    approveBtn.addEventListener('click', async () => {
+      const editedParams = {
+        ...p,
+        to: document.getElementById('edit-to').value,
+        subject: document.getElementById('edit-subject').value,
+        body: document.getElementById('edit-body').value,
+      };
+      await approveIntentWithParams(intent.id, editedParams);
+      document.querySelector('[data-tab="pending"]').click();
+    });
+
+    actions.appendChild(rejectBtn);
+    actions.appendChild(approveBtn);
+    container.appendChild(actions);
+  } else {
+    // Generic detail for non-send intents
+    const title = document.createElement('div');
+    title.className = 'card-title';
+    title.textContent = formatIntentTitle(intent);
+    container.appendChild(title);
+
+    const detail = document.createElement('div');
+    detail.className = 'card-detail';
+    detail.textContent = JSON.stringify(intent.params, null, 2);
+    container.appendChild(detail);
+
+    const actions = document.createElement('div');
+    actions.className = 'card-actions';
+
+    const rejectBtn = document.createElement('button');
+    rejectBtn.className = 'btn btn-reject';
+    rejectBtn.textContent = 'Reject';
+    rejectBtn.addEventListener('click', async () => {
+      await rejectIntent(intent.id);
+      document.querySelector('[data-tab="pending"]').click();
+    });
+
+    const approveBtn = document.createElement('button');
+    approveBtn.className = 'btn btn-approve';
+    approveBtn.textContent = 'Approve';
+    approveBtn.addEventListener('click', async () => {
+      await approveIntent(intent.id);
+      document.querySelector('[data-tab="pending"]').click();
+    });
+
+    actions.appendChild(rejectBtn);
+    actions.appendChild(approveBtn);
+    container.appendChild(actions);
+  }
+}
+
+async function loadQuarantine() {
+  try {
+    const res = await apiFetch('/api/quarantine');
+    const items = await res.json();
+    renderQuarantine(items);
+  } catch (error) {
+    const list = document.getElementById('quarantine-list');
+    appendEmptyState(list, `Error: ${formatError(error)}`);
+  }
+}
+
+function renderQuarantine(intents) {
+  const list = document.getElementById('quarantine-list');
+  if (intents.length === 0) {
+    appendEmptyState(list, 'No quarantined items');
+    return;
+  }
+
+  clearElement(list);
+
+  const header = document.createElement('div');
+  header.className = 'quarantine-header';
+  header.innerHTML = `<strong>${intents.length} item${intents.length !== 1 ? 's' : ''}</strong> in Quarantine`;
+  list.appendChild(header);
+
+  intents.forEach((intent) => {
+    const row = document.createElement('div');
+    row.className = 'quarantine-row';
+
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = true;
+    checkbox.dataset.intentId = intent.id;
+
+    const info = document.createElement('div');
+    info.className = 'quarantine-info';
+
+    const p = intent.params;
+    const uidCount = Array.isArray(p.uids) ? p.uids.length : 0;
+    const mailbox = p.mailbox || 'INBOX';
+    info.innerHTML = `<div>${escapeHtml(intent.tool)} · ${uidCount} message${uidCount !== 1 ? 's' : ''} from ${escapeHtml(mailbox)}</div>
+      <div class="audit-time">${new Date(intent.created_at).toLocaleString()}</div>`;
+
+    const undoBtn = document.createElement('button');
+    undoBtn.className = 'btn';
+    undoBtn.textContent = 'Undo';
+    undoBtn.addEventListener('click', async () => {
+      try {
+        await apiFetch(`/api/intent/${intent.id}/undo`, { method: 'POST' });
+        await loadQuarantine();
+      } catch (error) {
+        alert(`Error: ${formatError(error)}`);
+      }
+    });
+
+    row.appendChild(checkbox);
+    row.appendChild(info);
+    row.appendChild(undoBtn);
+    list.appendChild(row);
+  });
+}
+
+async function approveIntentWithParams(id, params) {
+  try {
+    const res = await apiFetch(`/api/intent/${id}/approve`, {
+      method: 'POST',
+      body: JSON.stringify({ params }),
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      alert(`Approve failed: ${err.error}`);
+      return;
+    }
+    await loadPending();
+  } catch (error) {
+    alert(`Error: ${formatError(error)}`);
+  }
+}
+
 function loadActiveTab() {
   if (document.getElementById('pending-tab').classList.contains('active')) {
     void loadPending();
@@ -261,31 +490,23 @@ function loadActiveTab() {
   }
   if (document.getElementById('stuck-tab').classList.contains('active')) {
     void loadStuck();
+    return;
+  }
+  if (document.getElementById('quarantine-tab').classList.contains('active')) {
+    void loadQuarantine();
   }
 }
 
-document.getElementById('set-token-button').addEventListener('click', setToken);
-document.getElementById('token-input').addEventListener('keydown', (event) => {
-  if (event.key === 'Enter') {
-    setToken();
-  }
-});
 document.querySelectorAll('.tab').forEach((button) => {
   button.addEventListener('click', (event) => {
     showTab(event, button.dataset.tab);
   });
 });
 
-appendEmptyState(
-  document.getElementById('pending-list'),
-  'Set the reviewer bearer token from ~/.agent-mail/reviewer-token to load data.'
-);
+loadActiveTab();
 
 setInterval(() => {
-  if (
-    bearerToken &&
-    document.getElementById('pending-tab').classList.contains('active')
-  ) {
+  if (document.getElementById('pending-tab').classList.contains('active')) {
     void loadPending();
   }
 }, 5000);

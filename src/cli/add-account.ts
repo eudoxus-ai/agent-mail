@@ -9,7 +9,6 @@ import { ImapProvider } from '../provider/imap.js';
 import { storePassword, KEYCHAIN_SERVICE } from '../provider/keychain.js';
 import { writeDefaultPolicy } from '../policy/defaults.js';
 import { openDatabase } from '../ledger/db.js';
-import { generateReviewerToken } from '../reviewer/auth.js';
 import type { AccountConfig, ResolvedAccount } from '../types.js';
 
 export async function addAccount(): Promise<void> {
@@ -133,7 +132,6 @@ export async function addAccount(): Promise<void> {
   // First-run setup
   writeDefaultPolicy();
   openDatabase().close(); // Initialize DB
-  generateReviewerToken();
 
   const binPath = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'bin', 'agent-mail.mjs');
   const absoluteBinPath = resolve(binPath);

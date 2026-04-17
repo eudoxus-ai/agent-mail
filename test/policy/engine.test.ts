@@ -88,3 +88,25 @@ describe('evaluatePolicy', () => {
     expect(() => loadPolicy(path)).toThrow('invalid value');
   });
 });
+
+describe('reversible policy axis', () => {
+  it('queue_send is not reversible', () => {
+    const result = evaluatePolicy(policy, 'queue_send');
+    expect(result.reversible).toBe(false);
+  });
+
+  it('quarantine_thread is reversible', () => {
+    const result = evaluatePolicy(policy, 'quarantine_thread');
+    expect(result.reversible).toBe(true);
+  });
+
+  it('label_thread is reversible', () => {
+    const result = evaluatePolicy(policy, 'label_thread');
+    expect(result.reversible).toBe(true);
+  });
+
+  it('unknown tools default to not reversible', () => {
+    const result = evaluatePolicy(policy, 'nonexistent_tool');
+    expect(result.reversible).toBe(false);
+  });
+});
