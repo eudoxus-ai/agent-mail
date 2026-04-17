@@ -1,6 +1,6 @@
 # agent-mail
 
-An MCP server that gives AI agents guardrailed access to your email. Works with Gmail, iCloud, and any standard IMAP account.
+An MCP server that gives AI agents guardrailed access to your email on macOS. Works with Gmail, iCloud, and any standard IMAP account.
 
 ## What's different
 
@@ -50,12 +50,70 @@ One MCP server manages all your email accounts. Gmail, iCloud, work IMAP, whatev
 4. You open the **reviewer UI** at `localhost:4242`, see the pending email, and click Approve or Reject.
 5. The **shared executor** sends the email via SMTP. The audit log records everything.
 
+## Getting Started
+
+If you already have Claude Desktop and you just want the email tools working, follow this section first. It is the shortest path. The more technical reference material is in `Setup` below.
+
+1. Install Node.js 22 or newer from [nodejs.org](https://nodejs.org/). If you are not sure which one to choose, install the current LTS version.
+2. Download this project to your Mac and unzip it somewhere easy to find, like `Downloads` or `Documents`.
+3. Open the Terminal app. The fastest way is to press `Command-Space`, type `Terminal`, and press Return.
+4. In Terminal, type `cd ` with a space after it, then drag the unzipped `agent-mail` folder into the Terminal window and press Return. That moves Terminal into the right folder.
+5. Copy and paste these commands, one at a time:
+
+```bash
+npm install
+npm run build
+./bin/agent-mail.mjs add-account
+```
+
+6. When `add-account` asks for your password, use an app-specific password for Gmail or iCloud, not your normal inbox password.
+7. Start the reviewer window by pasting this command into the same Terminal window:
+
+```bash
+./bin/agent-mail.mjs reviewer
+```
+
+8. Open `http://127.0.0.1:4242` in your browser. The reviewer UI is local-only, so there is no separate sign-in step.
+9. The easiest way to add `agent-mail` to Claude Desktop is to run:
+
+```bash
+./bin/agent-mail.mjs install
+```
+
+10. If you prefer to edit Claude Desktop config yourself, use this file on your Mac:
+
+```text
+~/Library/Application Support/Claude/claude_desktop_config.json
+```
+
+Paste this into the `mcpServers` section, replacing `/absolute/path/to/agent-mail` with the real folder you downloaded:
+
+```json
+{
+  "mcpServers": {
+    "agent-mail": {
+      "command": "/absolute/path/to/agent-mail/bin/agent-mail.mjs",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+11. Fully quit Claude Desktop and open it again. You should now see the `agent-mail` tools.
+12. If you want macOS notifications whenever Claude needs approval to send email, go back to Terminal and run:
+
+```bash
+./bin/agent-mail.mjs install-daemon
+```
+
+After that, `agent-mail` can keep the approval daemon running for you in the background.
+
 ## Setup
 
 ### Prerequisites
 
+- macOS
 - Node.js 22+
-- macOS for reviewer notifications and launchd management
 - App-specific passwords for Gmail and iCloud (not your regular password)
   - Gmail: [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
   - iCloud: [appleid.apple.com](https://appleid.apple.com) → Sign-In and Security → App-Specific Passwords
@@ -76,21 +134,36 @@ npm run build
 ./bin/agent-mail.mjs add-account
 ```
 
-This will prompt for your email address, auto-detect IMAP/SMTP hosts, ask for your password, and test the connection. Run it once per account.
+This will prompt for your email address, auto-detect IMAP/SMTP hosts, ask for your password, test the IMAP connection, and then store the password in the macOS Keychain. Run it once per account.
 
-Everything is stored at `~/.agent-mail/`:
+Local files are stored at `~/.agent-mail/`:
 
 ```
 ~/.agent-mail/
-  accounts.yaml      # Your email accounts (chmod 600)
+  accounts.yaml      # Your email account metadata (hosts, ports, email, account ID)
   policy.yaml        # Risk tiers and gating rules
   ledger.db          # Intent ledger + audit log (SQLite)
-  reviewer-token     # Bearer token for the reviewer UI
 ```
+
+Passwords are not stored in `~/.agent-mail/`. They are stored in the macOS Keychain under service name `agent-mail`.
 
 ### Connect to Claude Desktop
 
-Add this to your Claude Desktop MCP config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+The easiest option is:
+
+```bash
+./bin/agent-mail.mjs install
+```
+
+That updates `~/Library/Application Support/Claude/claude_desktop_config.json` for you after showing the change.
+
+If you prefer to inspect the exact JSON first:
+
+```bash
+./bin/agent-mail.mjs config
+```
+
+If you want to edit the file manually, add this to your Claude Desktop MCP config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
 ```json
 {
@@ -116,7 +189,7 @@ Or if you prefer npx (after `npm link`):
 }
 ```
 
-Restart Claude Desktop. You should see agent-mail's 10 tools in the tool list.
+Restart Claude Desktop. You should see agent-mail's 11 tools in the tool list.
 
 ### Launch the reviewer UI once
 
@@ -126,9 +199,9 @@ In a separate terminal:
 ./bin/agent-mail.mjs reviewer
 ```
 
-Opens at `http://127.0.0.1:4242`. Enter the bearer token (printed on startup, also at `~/.agent-mail/reviewer-token`) into the page to load reviewer data and approve or reject actions.
+Opens at `http://127.0.0.1:4242`.
 
-Every reviewer API request requires that bearer token, including read-only views like pending actions and the audit log.
+The reviewer UI does not use a bearer token. It is protected by only listening on localhost and rejecting cross-origin state-changing requests from non-localhost sites.
 
 ### Install the background reviewer daemon
 
@@ -164,6 +237,7 @@ Notifications are posted with `osascript` instead of `node-notifier`/`terminal-n
 |------|-------------|------|------|
 | `search_threads` | Search emails across accounts | None | Immediate |
 | `read_thread` | Read a message by UID | None | Immediate |
+| `get_overview` | Get a cross-account summary of recent mail that needs attention | None | Immediate |
 | `draft_reply` | Create a draft (saved to Drafts, not sent) | Low | Immediate |
 | `label_thread` | Add/remove IMAP flags or move to folders | Low | Immediate |
 | `unsubscribe_sender` | HTTP List-Unsubscribe (RFC 2369) | Low | Immediate |
@@ -177,7 +251,7 @@ Notifications are posted with `osascript` instead of `node-notifier`/`terminal-n
 
 Edit `~/.agent-mail/policy.yaml` to customize which actions need approval. The default policy:
 
-- **Ungated:** search, read, draft, label, unsubscribe, undo
+- **Ungated:** search, read, overview, draft, label, unsubscribe, pending-actions, audit-log, undo
 - **Always gated:** send (every outbound email needs your approval)
 - **Configurable:** quarantine (ungated by default, gated when the thread has replies)
 
@@ -217,13 +291,19 @@ To remove the background daemon:
 ./bin/agent-mail.mjs uninstall-daemon
 ```
 
-To remove local state and credentials after uninstalling the daemon:
+To remove local files after uninstalling the daemon:
 
 ```bash
 rm -rf ~/.agent-mail
 ```
 
-To disconnect Claude Desktop, remove the `agent-mail` entry from `~/Library/Application Support/Claude/claude_desktop_config.json`.
+To remove the Claude Desktop integration, delete the `agent-mail` entry from `~/Library/Application Support/Claude/claude_desktop_config.json`.
+
+To remove saved passwords from the macOS Keychain, run one command per configured account ID:
+
+```bash
+security delete-generic-password -s agent-mail -a <account-id>
+```
 
 ## License
 
