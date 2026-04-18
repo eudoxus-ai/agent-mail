@@ -54,6 +54,7 @@ interface SearchThreadsMultiPayload {
   accounts_searched: string[];
   accounts_available: string[];
   per_account_errors?: Record<string, string>;
+  per_account_counts?: Record<string, number>;
   results: SearchThreadResult[];
 }
 
@@ -536,9 +537,15 @@ export class Executor {
       )
       .slice(0, limit);
 
+    const per_account_counts: Record<string, number> = {};
+    for (const [accountId, rows] of Object.entries(fanResult.per_account)) {
+      per_account_counts[accountId] = (rows as any[]).length;
+    }
+
     const payload: SearchThreadsMultiPayload = {
       accounts_searched: fanResult.accounts_searched,
       accounts_available: allIds,
+      per_account_counts,
       results: allResults,
     };
     if (Object.keys(fanResult.errors).length > 0) {

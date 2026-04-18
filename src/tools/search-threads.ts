@@ -30,7 +30,7 @@ export const searchThreadsTool: ToolDefinition = {
       .positive()
       .max(100)
       .optional()
-      .describe('Max results per account (default: 20)'),
+      .describe('Max results per account (default: 20). When multiple accounts are queried, results are interleaved; use a single account_id for a true top-N.'),
   }),
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   async execute() {
