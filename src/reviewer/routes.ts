@@ -90,10 +90,14 @@ export function createRouter(deps: RouterDeps): Router {
   });
 
   router.get('/quarantine', (_req, res) => {
+    // Exclude dry-run previews — they have status 'executed' but moved no
+    // mail and intentionally have no undo token, so showing them in the
+    // quarantine tab would offer a broken Undo action.
     const quarantined = deps.db.prepare(`
       SELECT * FROM intents
       WHERE tool = 'quarantine_thread'
         AND status = 'executed'
+        AND COALESCE(json_extract(params, '$.dry_run'), 0) = 0
         AND id NOT IN (
           SELECT intent_id FROM audit_log WHERE action = 'undone'
         )

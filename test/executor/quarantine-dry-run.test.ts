@@ -70,6 +70,44 @@ describe('quarantine_thread', () => {
     expect(intent.undo_expires_at).toBeNull();
   });
 
+  it('approveAndExecute also skips undo registration for gated dry-runs', async () => {
+    const moveCalls: string[] = [];
+    const pool = {
+      withConnection: vi.fn(async (accountId: string, fn: any) =>
+        fn({
+          getMailboxPath: async () => 'agent-mail-quarantine',
+          moveMessages: async () => {
+            moveCalls.push(accountId);
+          },
+        })
+      ),
+    };
+
+    const executor = new Executor({
+      db: openDatabase(':memory:'),
+      accounts: makeAccounts(),
+      pool: pool as any,
+      logger,
+    });
+
+    const gated = await executor.createGatedIntent({
+      tool: 'quarantine_thread',
+      toolParams: {
+        targets: [{ account_id: 'a@x.com', uid: 1 }],
+        dry_run: true,
+      },
+      accountId: 'a@x.com',
+      agentId: 'test',
+      risk: 'medium',
+    });
+
+    const approved = await executor.approveAndExecute(gated.id);
+
+    expect(moveCalls).toEqual([]);
+    expect(approved.undo_token).toBeNull();
+    expect(approved.undo_expires_at).toBeNull();
+  });
+
   it('actual run moves messages and returns the same report shape', async () => {
     const moveCalls: Array<{ accountId: string; uids: number[] }> = [];
     const pool = {

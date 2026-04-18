@@ -64,11 +64,16 @@ function formatIntentTitle(intent) {
     case 'queue_send':
       return `Send email to ${p.to || 'unknown'}`;
     case 'quarantine_thread': {
-      const count = Array.isArray(p.uids) ? p.uids.length : 0;
-      return `Quarantine ${count} message${count !== 1 ? 's' : ''}`;
+      const count = Array.isArray(p.targets)
+        ? p.targets.length
+        : Array.isArray(p.uids) ? p.uids.length : 0;
+      const prefix = p.dry_run ? 'Preview quarantine of' : 'Quarantine';
+      return `${prefix} ${count} message${count !== 1 ? 's' : ''}`;
     }
     case 'permanent_delete': {
-      const count = Array.isArray(p.uids) ? p.uids.length : 0;
+      const count = Array.isArray(p.targets)
+        ? p.targets.length
+        : Array.isArray(p.uids) ? p.uids.length : 0;
       return `Permanently delete ${count} item${count !== 1 ? 's' : ''}`;
     }
     default:
@@ -438,9 +443,11 @@ function renderQuarantine(intents) {
     info.className = 'quarantine-info';
 
     const p = intent.params;
-    const uidCount = Array.isArray(p.uids) ? p.uids.length : 0;
-    const mailbox = p.mailbox || 'INBOX';
-    info.innerHTML = `<div>${escapeHtml(intent.tool)} · ${uidCount} message${uidCount !== 1 ? 's' : ''} from ${escapeHtml(mailbox)}</div>
+    const targets = Array.isArray(p.targets) ? p.targets : [];
+    const uidCount = targets.length || (Array.isArray(p.uids) ? p.uids.length : 0);
+    const accounts = Array.from(new Set(targets.map((t) => t.account_id))).filter(Boolean);
+    const accountLabel = accounts.length > 0 ? accounts.join(', ') : (intent.account_id || 'unknown');
+    info.innerHTML = `<div>${escapeHtml(intent.tool)} · ${uidCount} message${uidCount !== 1 ? 's' : ''} (${escapeHtml(accountLabel)})</div>
       <div class="audit-time">${new Date(intent.created_at).toLocaleString()}</div>`;
 
     const undoBtn = document.createElement('button');

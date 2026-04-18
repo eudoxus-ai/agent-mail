@@ -22,13 +22,25 @@ export function wrapToolHandler(
 }> {
   return async (params: Record<string, unknown>) => {
     try {
-      // Resolve account
-      const accountId = params.account_id as string | undefined;
+      // Resolve principal account for the intent record. Migrated tools no
+      // longer take `account_id` directly — derive a principal from targets[0]
+      // or account_ids[0] when present, otherwise fall back to the default.
+      const targets = params.targets as
+        | Array<{ account_id: string }>
+        | undefined;
+      const accountIds = params.account_ids as string[] | undefined;
+      const explicitAccountId = params.account_id as string | undefined;
       let resolvedAccountId: string;
 
-      if (accountId) {
-        getAccount(deps.accounts, accountId); // validates existence
-        resolvedAccountId = accountId;
+      if (explicitAccountId) {
+        getAccount(deps.accounts, explicitAccountId);
+        resolvedAccountId = explicitAccountId;
+      } else if (targets && targets.length > 0) {
+        getAccount(deps.accounts, targets[0].account_id);
+        resolvedAccountId = targets[0].account_id;
+      } else if (accountIds && accountIds.length > 0) {
+        getAccount(deps.accounts, accountIds[0]);
+        resolvedAccountId = accountIds[0];
       } else {
         resolvedAccountId = getDefaultAccount(deps.accounts).id;
       }
@@ -36,14 +48,35 @@ export function wrapToolHandler(
       // Evaluate policy
       const policyContext: { threadHasReplies?: boolean } = {};
 
-      // For quarantine_thread, inspect actual thread context before applying policy.
-      if (toolDef.name === 'quarantine_thread' && params.uids) {
-        const uids = params.uids as number[];
-        policyContext.threadHasReplies = await deps.executor.threadHasReplies(
-          resolvedAccountId,
-          (params.mailbox as string) ?? 'INBOX',
-          uids
-        );
+      // For quarantine_thread, inspect actual thread context before applying
+      // policy. Targets group by (account_id, mailbox); if any group has a
+      // reply, the whole call is treated as having replies.
+      if (toolDef.name === 'quarantine_thread' && Array.isArray(targets)) {
+        const grouped = new Map<string, number[]>();
+        for (const t of targets as Array<{
+          account_id: string;
+          uid: number;
+          mailbox?: string;
+        }>) {
+          const mailbox = t.mailbox ?? 'INBOX';
+          const key = `${t.account_id}\u0000${mailbox}`;
+          const list = grouped.get(key) ?? [];
+          list.push(t.uid);
+          grouped.set(key, list);
+        }
+        for (const [key, uids] of grouped) {
+          const [accountId, mailbox] = key.split('\u0000');
+          // eslint-disable-next-line no-await-in-loop
+          const has = await deps.executor.threadHasReplies(
+            accountId,
+            mailbox,
+            uids
+          );
+          if (has) {
+            policyContext.threadHasReplies = true;
+            break;
+          }
+        }
       }
 
       const policyResult = evaluatePolicy(deps.policy, toolDef.name, policyContext);

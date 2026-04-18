@@ -239,12 +239,15 @@ export class Executor {
     try {
       await this.performAction(intent);
 
-      const undoToken = generateUndoToken(intent.tool, intent.params);
-      const undoExpiry = getUndoExpiry(intent.tool);
+      const isDryRun = intent.params.dry_run === true;
+      const undoToken = isDryRun
+        ? null
+        : generateUndoToken(intent.tool, intent.params);
+      const undoExpiry = isDryRun ? null : getUndoExpiry(intent.tool);
 
       updateIntentStatus(this.db, intentId, 'executed', {
         resolved_by: 'user',
-        undo_token: undoToken,
+        undo_token: undoToken ?? undefined,
         undo_expires_at: undoExpiry ?? undefined,
       });
       logAudit(this.db, {
