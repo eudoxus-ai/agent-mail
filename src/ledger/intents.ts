@@ -129,14 +129,16 @@ export function withImmediateTransaction<T>(
 
 export function getPendingIntents(
   db: Database,
-  accountId?: string
+  accountIds?: string[]
 ): Intent[] {
-  const query = accountId
-    ? `SELECT * FROM intents WHERE status = 'pending' AND account_id = ? ORDER BY created_at ASC`
-    : `SELECT * FROM intents WHERE status = 'pending' ORDER BY created_at ASC`;
-  const rows = accountId
-    ? (db.prepare(query).all(accountId) as Array<Record<string, unknown>>)
-    : (db.prepare(query).all() as Array<Record<string, unknown>>);
+  if (accountIds && accountIds.length > 0) {
+    const placeholders = accountIds.map(() => '?').join(', ');
+    const query = `SELECT * FROM intents WHERE status = 'pending' AND account_id IN (${placeholders}) ORDER BY created_at ASC`;
+    const rows = db.prepare(query).all(...accountIds) as Array<Record<string, unknown>>;
+    return rows.map(rowToIntent);
+  }
+  const query = `SELECT * FROM intents WHERE status = 'pending' ORDER BY created_at ASC`;
+  const rows = db.prepare(query).all() as Array<Record<string, unknown>>;
   return rows.map(rowToIntent);
 }
 

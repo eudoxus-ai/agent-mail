@@ -145,7 +145,7 @@ describe('getPendingIntents', () => {
     createIntent(db, { account_id: 'gmail', tool: 'queue_send', params: {}, risk: 'high' });
     createIntent(db, { account_id: 'icloud', tool: 'queue_send', params: {}, risk: 'high' });
 
-    const gmailPending = getPendingIntents(db, 'gmail');
+    const gmailPending = getPendingIntents(db, ['gmail']);
     expect(gmailPending).toHaveLength(1);
     expect(gmailPending[0].account_id).toBe('gmail');
   });

@@ -18,13 +18,14 @@ export function createRouter(deps: RouterDeps): Router {
 
   router.get('/pending', (req, res) => {
     const accountId = req.query.account_id as string | undefined;
-    const pending = getPendingIntents(deps.db, accountId);
+    const pending = getPendingIntents(deps.db, accountId ? [accountId] : undefined);
     res.json(pending);
   });
 
   router.get('/audit', (req, res) => {
+    const accountId = req.query.account_id as string | undefined;
     const entries = getAuditLog(deps.db, {
-      account_id: req.query.account_id as string | undefined,
+      account_ids: accountId ? [accountId] : undefined,
       limit: parseInt(req.query.limit as string, 10) || 50,
       offset: parseInt(req.query.offset as string, 10) || 0,
     });
@@ -89,10 +90,14 @@ export function createRouter(deps: RouterDeps): Router {
   });
 
   router.get('/quarantine', (_req, res) => {
+    // Exclude dry-run previews — they have status 'executed' but moved no
+    // mail and intentionally have no undo token, so showing them in the
+    // quarantine tab would offer a broken Undo action.
     const quarantined = deps.db.prepare(`
       SELECT * FROM intents
       WHERE tool = 'quarantine_thread'
         AND status = 'executed'
+        AND COALESCE(json_extract(params, '$.dry_run'), 0) = 0
         AND id NOT IN (
           SELECT intent_id FROM audit_log WHERE action = 'undone'
         )

@@ -31,11 +31,24 @@ describe('buildAuditSummary', () => {
 
   it('summarizes quarantine_thread execution', () => {
     const detail = buildAuditSummary('quarantine_thread', 'executed', {
-      uids: [1, 2, 3],
-      mailbox: 'INBOX',
+      targets: [
+        { account_id: 'a@x.com', uid: 1 },
+        { account_id: 'a@x.com', uid: 2 },
+        { account_id: 'b@y.com', uid: 3 },
+      ],
     });
-    expect(detail.summary).toBe('Quarantined 3 messages from INBOX');
+    expect(detail.summary).toBe('Quarantined 3 messages');
     expect(detail.count).toBe(3);
+    expect(detail.dry_run).toBe(false);
+  });
+
+  it('summarizes quarantine_thread dry-run', () => {
+    const detail = buildAuditSummary('quarantine_thread', 'executed', {
+      targets: [{ account_id: 'a@x.com', uid: 1 }],
+      dry_run: true,
+    });
+    expect(detail.summary).toBe('Previewed quarantine of 1 message');
+    expect(detail.dry_run).toBe(true);
   });
 
   it('summarizes label_thread execution', () => {
@@ -61,8 +74,10 @@ describe('buildAuditSummary', () => {
 
   it('summarizes executing action with prefix', () => {
     const detail = buildAuditSummary('quarantine_thread', 'executing', {
-      uids: [1, 2],
-      mailbox: 'INBOX',
+      targets: [
+        { account_id: 'a@x.com', uid: 1 },
+        { account_id: 'a@x.com', uid: 2 },
+      ],
     });
     expect(detail.summary).toBe('Executing: Quarantine 2 messages');
   });

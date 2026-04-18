@@ -1,5 +1,11 @@
 import type { AuditAction } from '../types.js';
 
+interface Target {
+  account_id: string;
+  uid: number;
+  mailbox?: string;
+}
+
 export function buildAuditSummary(
   tool: string,
   action: AuditAction,
@@ -8,9 +14,9 @@ export function buildAuditSummary(
 ): Record<string, unknown> {
   const to = params.to as string | undefined;
   const subject = params.subject as string | undefined;
-  const uids = params.uids as number[] | undefined;
-  const mailbox = params.mailbox as string | undefined;
+  const targets = params.targets as Target[] | undefined;
   const label = params.label as string | undefined;
+  const dryRun = params.dry_run === true;
 
   if (action === 'failed') {
     const base = describeIntent(tool, params);
@@ -55,19 +61,23 @@ export function buildAuditSummary(
       };
 
     case 'quarantine_thread': {
-      const count = uids?.length ?? 0;
+      const count = targets?.length ?? 0;
+      const verb = dryRun ? 'Previewed quarantine of' : 'Quarantined';
       return {
-        summary: `Quarantined ${count} message${count !== 1 ? 's' : ''} from ${mailbox ?? 'INBOX'}`,
+        summary: `${verb} ${count} message${count !== 1 ? 's' : ''}`,
         count,
-        mailbox: mailbox ?? 'INBOX',
+        dry_run: dryRun,
       };
     }
 
-    case 'label_thread':
+    case 'label_thread': {
+      const count = targets?.length ?? 0;
       return {
-        summary: `Labeled thread: ${label ?? 'unknown'}`,
+        summary: `Labeled ${count} message${count !== 1 ? 's' : ''}: ${label ?? 'unknown'}`,
         label,
+        count,
       };
+    }
 
     default:
       return {
@@ -84,12 +94,17 @@ export function describeIntent(tool: string, params: Record<string, unknown>): s
     case 'queue_send':
       return `Send email to ${to ?? 'unknown'}: ${subject ?? '(no subject)'}`;
     case 'quarantine_thread': {
-      const uids = params.uids as number[] | undefined;
-      const count = uids?.length ?? 0;
-      return `Quarantine ${count} message${count !== 1 ? 's' : ''}`;
+      const targets = params.targets as Target[] | undefined;
+      const count = targets?.length ?? 0;
+      const dryRun = params.dry_run === true;
+      const verb = dryRun ? 'Preview quarantine of' : 'Quarantine';
+      return `${verb} ${count} message${count !== 1 ? 's' : ''}`;
     }
-    case 'label_thread':
-      return `Label thread: ${params.label ?? 'unknown'}`;
+    case 'label_thread': {
+      const targets = params.targets as Target[] | undefined;
+      const count = targets?.length ?? 0;
+      return `Label ${count} message${count !== 1 ? 's' : ''}: ${params.label ?? 'unknown'}`;
+    }
     default:
       return tool;
   }

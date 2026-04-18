@@ -3,7 +3,6 @@ import type { AccountConfig, Intent, RiskLevel } from '../types.js';
 import { isAutomatedSender } from '../attention/signals.js';
 import type { Logger } from '../logger.js';
 import type { ImapConnectionPool } from '../provider/imap-pool.js';
-import type { ImapProvider } from '../provider/imap.js';
 import {
   createIntent,
   getIntent,
@@ -25,6 +24,30 @@ import {
   createTimedAbortSignal,
 } from '../provider/url-safety.js';
 import { generateUndoToken, getUndoExpiry, parseUndoToken } from './undo.js';
+import { fanOut } from './fan-out.js';
+import { parseTargets, type Target } from '../tools/target.js';
+
+interface SearchThreadResult {
+  account_id: string;
+  mailbox: string;
+  uid: number;
+  envelope: {
+    message_id: string;
+    subject: string;
+    from: { address: string; name: string | null };
+    date: string;
+  };
+  snippet: string;
+  flags: string[];
+  is_automated: boolean;
+}
+
+interface SearchThreadsMultiPayload {
+  accounts_searched: string[];
+  accounts_available: string[];
+  per_account_errors?: Record<string, string>;
+  results: SearchThreadResult[];
+}
 
 export interface ExecutorDeps {
   db: Database;
@@ -88,12 +111,16 @@ export class Executor {
     try {
       const result = await this.performAction(intent);
 
-      const undoToken = generateUndoToken(params.tool, params.toolParams);
-      const undoExpiry = getUndoExpiry(params.tool);
+      const isDryRun = params.toolParams.dry_run === true;
+
+      const undoToken = isDryRun
+        ? null
+        : generateUndoToken(params.tool, params.toolParams);
+      const undoExpiry = isDryRun ? null : getUndoExpiry(params.tool);
 
       updateIntentStatus(this.db, intent.id, 'executed', {
         resolved_by: 'policy',
-        undo_token: undoToken,
+        undo_token: undoToken ?? undefined,
         undo_expires_at: undoExpiry ?? undefined,
       });
 
@@ -212,12 +239,15 @@ export class Executor {
     try {
       await this.performAction(intent);
 
-      const undoToken = generateUndoToken(intent.tool, intent.params);
-      const undoExpiry = getUndoExpiry(intent.tool);
+      const isDryRun = intent.params.dry_run === true;
+      const undoToken = isDryRun
+        ? null
+        : generateUndoToken(intent.tool, intent.params);
+      const undoExpiry = isDryRun ? null : getUndoExpiry(intent.tool);
 
       updateIntentStatus(this.db, intentId, 'executed', {
         resolved_by: 'user',
-        undo_token: undoToken,
+        undo_token: undoToken ?? undefined,
         undo_expires_at: undoExpiry ?? undefined,
       });
       logAudit(this.db, {
@@ -435,21 +465,16 @@ export class Executor {
     };
   }
 
-  private async searchThreads(
-    intent: Intent,
-    imap: ImapProvider
-  ): Promise<Array<{
-    uid: number;
-    envelope: {
-      message_id: string;
-      subject: string;
-      from: { address: string; name: string | null };
-      date: string;
-    };
-    snippet: string;
-    flags: string[];
-    is_automated: boolean;
-  }>> {
+  private async searchThreadsMulti(intent: Intent): Promise<SearchThreadsMultiPayload> {
+    const requestedIds = (intent.params.account_ids as string[] | undefined) ?? null;
+    const allIds = this.accounts.map((a) => a.id);
+    const targetIds = requestedIds ?? allIds;
+
+    const unknown = targetIds.filter((id) => !allIds.includes(id));
+    if (unknown.length > 0) {
+      throw new Error(`Unknown account_ids: ${unknown.join(', ')}`);
+    }
+
     const mailbox = (intent.params.mailbox as string) ?? 'INBOX';
     const baseCriteria = {
       from: intent.params.from as string | undefined,
@@ -461,30 +486,50 @@ export class Executor {
     };
     const limit = (intent.params.limit as number) ?? 20;
     const query = intent.params.query as string | undefined;
-    const resultSets = query
-      ? await Promise.all([
-          imap.search(mailbox, { ...baseCriteria, subject: query }, limit),
-          imap.search(mailbox, { ...baseCriteria, body: query }, limit),
-        ])
-      : [await imap.search(mailbox, baseCriteria, limit)];
 
-    const merged = new Map<number, Awaited<(typeof resultSets)[number][number]>>();
-    for (const set of resultSets) {
-      for (const result of set) {
-        merged.set(result.uid, result);
-      }
-    }
+    const fanResult = await fanOut({
+      pool: this.pool,
+      accountIds: targetIds,
+      fn: async (accountId, imap) => {
+        const resultSets = query
+          ? await Promise.all([
+              imap.search(mailbox, { ...baseCriteria, subject: query }, limit),
+              imap.search(mailbox, { ...baseCriteria, body: query }, limit),
+            ])
+          : [await imap.search(mailbox, baseCriteria, limit)];
 
-    return Array.from(merged.values())
+        const merged = new Map<number, Awaited<(typeof resultSets)[number][number]>>();
+        for (const set of resultSets) {
+          for (const result of set) {
+            merged.set(result.uid, result);
+          }
+        }
+        return Array.from(merged.values()).map((r) => ({
+          account_id: accountId,
+          mailbox,
+          ...r,
+          is_automated: isAutomatedSender(r.envelope.from.address),
+        }));
+      },
+    });
+
+    const allResults = Object.values(fanResult.per_account)
+      .flat()
       .sort(
         (a, b) =>
           new Date(b.envelope.date).getTime() - new Date(a.envelope.date).getTime()
       )
-      .slice(0, limit)
-      .map((result) => ({
-        ...result,
-        is_automated: isAutomatedSender(result.envelope.from.address),
-      }));
+      .slice(0, limit);
+
+    const payload: SearchThreadsMultiPayload = {
+      accounts_searched: fanResult.accounts_searched,
+      accounts_available: allIds,
+      results: allResults,
+    };
+    if (Object.keys(fanResult.errors).length > 0) {
+      payload.per_account_errors = fanResult.errors;
+    }
+    return payload;
   }
 
   private async performAction(
@@ -511,21 +556,154 @@ export class Executor {
       ];
     }
 
-    // All other tools use IMAP via the pool
+    // Multi-account read tools: fan out before borrowing a single connection
+    if (intent.tool === 'search_threads') {
+      const payload = await this.searchThreadsMulti(intent);
+      return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
+    }
+
+    // Multi-account label: group targets by account, fan out per-account
+    if (intent.tool === 'label_thread') {
+      const targets = intent.params.targets as Target[];
+      const action = intent.params.action as 'add' | 'remove';
+      const label = intent.params.label as string;
+      const grouped = parseTargets(targets);
+      const accountIds = Object.keys(grouped);
+      const allIds = this.accounts.map((a) => a.id);
+      const unknown = accountIds.filter((id) => !allIds.includes(id));
+      if (unknown.length > 0) {
+        throw new Error(`Unknown account_ids in targets: ${unknown.join(', ')}`);
+      }
+
+      const fanResult = await fanOut({
+        pool: this.pool,
+        accountIds,
+        fn: async (accountId, imap) => {
+          const byMailbox = new Map<string, number[]>();
+          for (const t of grouped[accountId]) {
+            const list = byMailbox.get(t.mailbox) ?? [];
+            list.push(t.uid);
+            byMailbox.set(t.mailbox, list);
+          }
+          for (const [mailbox, uids] of byMailbox) {
+            if (action === 'add') {
+              await imap.setFlags(uids, [label], mailbox);
+            } else {
+              await imap.removeFlags(uids, [label], mailbox);
+            }
+          }
+          return { uids: grouped[accountId].map((t) => t.uid) };
+        },
+      });
+
+      const payload: {
+        accounts_searched: string[];
+        accounts_available: string[];
+        per_account_errors?: Record<string, string>;
+        action: 'add' | 'remove';
+        label: string;
+      } = {
+        accounts_searched: fanResult.accounts_searched,
+        accounts_available: allIds,
+        action,
+        label,
+      };
+      if (Object.keys(fanResult.errors).length > 0) {
+        payload.per_account_errors = fanResult.errors;
+      }
+      return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
+    }
+
+    // Multi-account quarantine: group targets by account+mailbox, fan out, support dry_run
+    if (intent.tool === 'quarantine_thread') {
+      const targets = intent.params.targets as Target[];
+      const dryRun = (intent.params.dry_run as boolean | undefined) ?? false;
+      const grouped = parseTargets(targets);
+      const accountIds = Object.keys(grouped);
+      const allIds = this.accounts.map((a) => a.id);
+      const unknown = accountIds.filter((id) => !allIds.includes(id));
+      if (unknown.length > 0) {
+        throw new Error(`Unknown account_ids in targets: ${unknown.join(', ')}`);
+      }
+
+      const fanResult = await fanOut({
+        pool: this.pool,
+        accountIds,
+        fn: async (accountId, imap) => {
+          const byMailbox = new Map<string, number[]>();
+          for (const t of grouped[accountId]) {
+            const list = byMailbox.get(t.mailbox) ?? [];
+            list.push(t.uid);
+            byMailbox.set(t.mailbox, list);
+          }
+
+          const perMailbox: Array<{
+            mailbox: string;
+            message_count: number;
+            uids: number[];
+          }> = [];
+
+          const quarantine = await imap.getMailboxPath('quarantine');
+
+          for (const [mailbox, uids] of byMailbox) {
+            if (!dryRun) {
+              await imap.moveMessages(uids, mailbox, quarantine);
+            }
+            perMailbox.push({ mailbox, message_count: uids.length, uids });
+          }
+
+          return {
+            account_id: accountId,
+            per_mailbox: perMailbox,
+            message_count: perMailbox.reduce((n, m) => n + m.message_count, 0),
+          };
+        },
+      });
+
+      const perAccount = Object.values(fanResult.per_account);
+      const totalMessages = perAccount.reduce((n, a) => n + a.message_count, 0);
+
+      const payload: {
+        accounts_searched: string[];
+        accounts_available: string[];
+        per_account_errors?: Record<string, string>;
+        dry_run: boolean;
+        total_messages: number;
+        per_account: typeof perAccount;
+      } = {
+        accounts_searched: fanResult.accounts_searched,
+        accounts_available: allIds,
+        dry_run: dryRun,
+        total_messages: totalMessages,
+        per_account: perAccount,
+      };
+      if (Object.keys(fanResult.errors).length > 0) {
+        payload.per_account_errors = fanResult.errors;
+      }
+      return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
+    }
+
+    // Account-qualified read: route by target.account_id, not intent.account_id
+    if (intent.tool === 'read_thread') {
+      const target = intent.params.target as {
+        account_id: string;
+        uid: number;
+        mailbox?: string;
+      };
+      const allIds = this.accounts.map((a) => a.id);
+      if (!allIds.includes(target.account_id)) {
+        throw new Error(`Unknown account_id in target: ${target.account_id}`);
+      }
+      const mailbox = target.mailbox ?? 'INBOX';
+      return this.pool.withConnection(target.account_id, async (imap) => {
+        const msg = await imap.fetchMessage(mailbox, target.uid);
+        return [{ type: 'text', text: JSON.stringify(msg, null, 2) }];
+      });
+    }
+
+    // All other tools use IMAP via the pool (single-account principal)
     return this.pool.withConnection(intent.account_id, async (imap) => {
       switch (intent.tool) {
-        case 'search_threads': {
-          const results = await this.searchThreads(intent, imap);
-          return [{ type: 'text', text: JSON.stringify(results, null, 2) }];
-        }
-
-        case 'read_thread': {
-          const uid = intent.params.uid as number;
-          const mailbox = (intent.params.mailbox as string) ?? 'INBOX';
-          const msg = await imap.fetchMessage(mailbox, uid);
-          return [{ type: 'text', text: JSON.stringify(msg, null, 2) }];
-        }
-
         case 'draft_reply': {
           const raw = buildDraftMessage({
             from: account.email,
@@ -543,38 +721,6 @@ export class Executor {
                 draft_id: result.uid,
                 message: 'Draft created',
               }),
-            },
-          ];
-        }
-
-        case 'label_thread': {
-          const uids = intent.params.uids as number[];
-          const mailbox = (intent.params.mailbox as string) ?? 'INBOX';
-          const action = intent.params.action as 'add' | 'remove';
-          const label = intent.params.label as string;
-
-          if (action === 'add') {
-            await imap.setFlags(uids, [label], mailbox);
-          } else {
-            await imap.removeFlags(uids, [label], mailbox);
-          }
-          return [
-            {
-              type: 'text',
-              text: `Label "${label}" ${action === 'add' ? 'applied' : 'removed'}`,
-            },
-          ];
-        }
-
-        case 'quarantine_thread': {
-          const uids = intent.params.uids as number[];
-          const mailbox = (intent.params.mailbox as string) ?? 'INBOX';
-          const quarantine = await imap.getMailboxPath('quarantine');
-          await imap.moveMessages(uids, mailbox, quarantine);
-          return [
-            {
-              type: 'text',
-              text: `Moved ${uids.length} message(s) to quarantine`,
             },
           ];
         }
@@ -607,33 +753,49 @@ export class Executor {
     intent: Intent,
     undoOp: { reverseAction: string; params: Record<string, unknown> }
   ): Promise<void> {
-    await this.pool.withConnection(intent.account_id, async (imap) => {
-      switch (undoOp.reverseAction) {
-        case 'move_back_to_inbox': {
-          const uids = intent.params.uids as number[];
+    // Multi-account undo: group targets by account and apply per-account
+    if (undoOp.reverseAction === 'reverse_label') {
+      const targets = intent.params.targets as Target[];
+      const action = intent.params.action as 'add' | 'remove';
+      const label = intent.params.label as string;
+      const grouped = parseTargets(targets);
+
+      for (const [accountId, list] of Object.entries(grouped)) {
+        await this.pool.withConnection(accountId, async (imap) => {
+          const byMailbox = new Map<string, number[]>();
+          for (const t of list) {
+            const arr = byMailbox.get(t.mailbox) ?? [];
+            arr.push(t.uid);
+            byMailbox.set(t.mailbox, arr);
+          }
+          for (const [mailbox, uids] of byMailbox) {
+            if (action === 'add') {
+              await imap.removeFlags(uids, [label], mailbox);
+            } else {
+              await imap.setFlags(uids, [label], mailbox);
+            }
+          }
+        });
+      }
+      return;
+    }
+
+    // Multi-account quarantine undo: group targets by account, restore to inbox
+    if (undoOp.reverseAction === 'move_back_to_inbox') {
+      const targets = intent.params.targets as Target[];
+      const grouped = parseTargets(targets);
+
+      for (const [accountId, list] of Object.entries(grouped)) {
+        await this.pool.withConnection(accountId, async (imap) => {
           const quarantine = await imap.getMailboxPath('quarantine');
           const inbox = await imap.getMailboxPath('inbox');
+          const uids = list.map((t) => t.uid);
           await imap.moveMessages(uids, quarantine, inbox);
-          break;
-        }
-
-        case 'reverse_label': {
-          const uids = intent.params.uids as number[];
-          const mailbox = (intent.params.mailbox as string) ?? 'INBOX';
-          const action = intent.params.action as 'add' | 'remove';
-          const label = intent.params.label as string;
-
-          if (action === 'add') {
-            await imap.removeFlags(uids, [label], mailbox);
-          } else {
-            await imap.setFlags(uids, [label], mailbox);
-          }
-          break;
-        }
-
-        default:
-          throw new Error(`Unknown undo action: ${undoOp.reverseAction}`);
+        });
       }
-    });
+      return;
+    }
+
+    throw new Error(`Unknown undo action: ${undoOp.reverseAction}`);
   }
 }

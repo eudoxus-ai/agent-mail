@@ -12,9 +12,13 @@ type Category = (typeof SUPPORTED_CATEGORIES)[number];
 export const getOverviewTool: ToolDefinition = {
   name: 'get_overview',
   description:
-    'Returns a rich, attention-tagged snapshot of recent mail across all configured accounts. Use this when the user asks general questions like "what do I need to be aware of this week" — one call replaces many search_threads calls.',
+    'Returns a rich, attention-tagged snapshot of recent mail across all configured accounts. Use this when the user asks general questions like "what do I need to be aware of this week" — one call replaces many search_threads calls. The result follows the standard multi-account envelope: top-level `accounts_searched`, `accounts_available`, and (if any account failed) `per_account_errors` describe the fan-out, alongside the per-account `accounts` bundles and the aggregate `summary`.',
   inputSchema: z.object({
-    accounts: z.array(z.string()).optional().describe('Account IDs to include. Omit for all.'),
+    account_ids: z
+      .array(z.string().min(1))
+      .min(1)
+      .optional()
+      .describe('Account IDs to include. Omit for all.'),
     since: z
       .string()
       .optional()
@@ -41,7 +45,7 @@ export const getOverviewTool: ToolDefinition = {
 // ─── Types ─────────────────────────────────────────────────────────────
 
 export interface OverviewInput {
-  accounts?: string[];
+  account_ids?: string[];
   since?: string;
   mailboxes?: string[];
   include?: Category[];
@@ -81,6 +85,9 @@ export interface OverviewAccountBundle {
 }
 
 export interface OverviewResult {
+  accounts_searched: string[];
+  accounts_available: string[];
+  per_account_errors?: Record<string, string>;
   generated_at: string;
   window: { since: string; until: string };
   accounts: OverviewAccountBundle[];
@@ -108,7 +115,14 @@ export async function runGetOverview(deps: RunDeps): Promise<OverviewResult> {
   const categories: Category[] = deps.input.include ?? [...SUPPORTED_CATEGORIES];
   const limitPerCategory = deps.input.limit_per_category ?? DEFAULT_LIMIT_PER_CATEGORY;
 
-  const requestedIds = deps.input.accounts ?? deps.accounts.map((a) => a.id);
+  const allIds = deps.accounts.map((a) => a.id);
+  const requestedIds = deps.input.account_ids ?? allIds;
+
+  const unknown = requestedIds.filter((id) => !allIds.includes(id));
+  if (unknown.length > 0) {
+    throw new Error(`Unknown account_ids: ${unknown.join(', ')}`);
+  }
+
   const requested = deps.accounts.filter((a) => requestedIds.includes(a.id));
 
   const settled = await Promise.allSettled(
@@ -150,12 +164,23 @@ export async function runGetOverview(deps: RunDeps): Promise<OverviewResult> {
     }
   }
 
-  return {
+  const per_account_errors: Record<string, string> = {};
+  for (const b of bundles) {
+    if (b.error !== null) per_account_errors[b.account_id] = b.error;
+  }
+
+  const result: OverviewResult = {
+    accounts_searched: requested.map((a) => a.id),
+    accounts_available: allIds,
     generated_at: now.toISOString(),
     window: { since: since.toISOString(), until: now.toISOString() },
     accounts: bundles,
     summary: { total_threads: total, by_category, by_account },
   };
+  if (Object.keys(per_account_errors).length > 0) {
+    result.per_account_errors = per_account_errors;
+  }
+  return result;
 }
 
 interface CollectDeps {
