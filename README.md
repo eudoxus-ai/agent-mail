@@ -235,17 +235,51 @@ Notifications are posted with `osascript` instead of `node-notifier`/`terminal-n
 
 | Tool | What it does | Risk | Gate |
 |------|-------------|------|------|
-| `search_threads` | Search emails across accounts | None | Immediate |
-| `read_thread` | Read a message by UID | None | Immediate |
-| `get_overview` | Get a cross-account summary of recent mail that needs attention | None | Immediate |
+| `search_threads` | Search emails across all accounts (or scoped via `account_ids`) | None | Immediate |
+| `read_thread` | Read a single message identified by `target: {account_id, uid}` | None | Immediate |
+| `get_overview` | Cross-account summary of recent mail that needs attention | None | Immediate |
 | `draft_reply` | Create a draft (saved to Drafts, not sent) | Low | Immediate |
-| `label_thread` | Add/remove IMAP flags or move to folders | Low | Immediate |
+| `label_thread` | Add/remove IMAP flags on `targets: [{account_id, uid}]` | Low | Immediate |
 | `unsubscribe_sender` | HTTP List-Unsubscribe (RFC 2369) | Low | Immediate |
-| `get_pending_actions` | Check the approval queue | None | Immediate |
-| `get_audit_log` | View action history | None | Immediate |
+| `get_pending_actions` | Check the approval queue (cross-account) | None | Immediate |
+| `get_audit_log` | View action history (cross-account) | None | Immediate |
 | `queue_send` | Queue an email for sending | High | **Always requires approval** |
-| `quarantine_thread` | Move to quarantine (reversible delete) | Medium | Configurable |
+| `quarantine_thread` | Move targets to quarantine; supports `dry_run: true` to preview | Medium | Configurable |
 | `undo_intent` | Reverse a previous action | Low | Immediate |
+
+### Multi-account by default
+
+Read tools (`search_threads`, `get_overview`, `get_audit_log`, `get_pending_actions`) fan out to every configured account unless you pass `account_ids: [...]` to scope them. Every response includes an envelope so the agent can see what was actually queried:
+
+```json
+{
+  "accounts_searched": ["cameron@example.com", "cameron@me.com"],
+  "accounts_available": ["cameron@example.com", "cameron@me.com"],
+  "per_account_errors": { "cameron@me.com": "auth failed" },
+  "results": [ ... ]
+}
+```
+
+`per_account_errors` is only present when at least one account failed — the rest of the call still succeeds with partial results.
+
+### Account-qualified targets
+
+Tools that act on specific messages (`read_thread`, `label_thread`, `quarantine_thread`) take account-qualified `Target` references:
+
+```json
+{
+  "targets": [
+    { "account_id": "cameron@example.com", "uid": 1234 },
+    { "account_id": "cameron@me.com", "uid": 5678, "mailbox": "Archive" }
+  ]
+}
+```
+
+`mailbox` defaults to `INBOX` per target. A single call can act across accounts; the executor groups by account internally.
+
+### Dry-run quarantine
+
+`quarantine_thread` accepts `dry_run: true` to preview what would happen without moving anything. The response shape is identical to a real run — same `total_messages`, same per-account/per-mailbox breakdown — so you can see the blast radius before committing. Dry-runs are recorded in the audit log (flagged with `dry_run: true`) but don't enter the undo ledger.
 
 ## Policy
 
