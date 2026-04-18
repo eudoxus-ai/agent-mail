@@ -4,7 +4,7 @@ import type { ToolDefinition } from '../types.js';
 export const listSendersTool: ToolDefinition = {
   name: 'list_senders',
   description:
-    'Aggregate inbox messages by sender across one or more accounts. Returns rows of {account_id, from, count, sample_uids, has_unsubscribe, is_automated_ratio, latest_date} ordered by count descending. Use for bulk triage: 20 sender decisions beat 200 UID decisions. Respects the same time/scope params as search_threads.',
+    'Aggregate inbox messages by sender across one or more accounts. Returns rows of {account_id, from, count, sample_uids, has_unsubscribe, is_automated_ratio, latest_date} ordered by count descending. Use for bulk triage: 20 sender decisions beat 200 UID decisions. Scopes by `since` / `before` (ISO8601), `account_ids`, and `mailbox` only — does NOT filter on query/from/to/subject.',
   inputSchema: z.object({
     since: z.string().optional().describe('ISO8601 — only count messages on or after'),
     before: z.string().optional().describe('ISO8601 — only count messages strictly before'),

@@ -64,7 +64,12 @@ export class ImapProvider {
       if (criteria.subject) searchQuery.subject = criteria.subject;
       if (criteria.body) searchQuery.body = criteria.body;
       if (criteria.since) searchQuery.since = criteria.since;
-      if (criteria.before) searchQuery.before = criteria.before;
+      // IMAP BEFORE operates at calendar-date granularity; pad by one day so
+      // the server returns everything on the cursor day, then post-filter by
+      // the exact timestamp after we have envelope dates.
+      if (criteria.before) {
+        searchQuery.before = new Date(criteria.before.getTime() + 24 * 60 * 60 * 1000);
+      }
       if (criteria.flagged !== undefined) searchQuery.flagged = criteria.flagged;
       if (criteria.seen !== undefined) searchQuery.seen = criteria.seen;
 
@@ -95,11 +100,12 @@ export class ImapProvider {
           envelope: true,
           flags: true,
           source: { start: 0, maxLength: 2048 },
+          headers: ['list-id', 'list-unsubscribe'],
         },
         { uid: true }
       )) {
-        const sourceStr = msg.source?.toString('utf-8') ?? '';
-        const { listId, listUnsubscribe } = extractListHeadersFromSource(sourceStr);
+        const headersStr = msg.headers?.toString('utf-8') ?? '';
+        const { listId, listUnsubscribe } = extractListHeadersFromSource(headersStr);
         results.push({
           uid: msg.uid,
           envelope: {
@@ -115,13 +121,21 @@ export class ImapProvider {
         });
       }
 
+      // Post-filter by exact `before` timestamp. IMAP BEFORE operates at
+      // day granularity so we widened the query by one day above; trim
+      // same-day results here to honor the advertised exclusive cursor.
+      const beforeMs = criteria.before?.getTime();
+      const filtered = beforeMs !== undefined
+        ? results.filter((r) => new Date(r.envelope.date).getTime() < beforeMs)
+        : results;
+
       // Sort descending by date (newest first). IMAP UIDs are usually chronological
       // but not guaranteed, so sort on the envelope date we already have.
-      results.sort(
+      filtered.sort(
         (a, b) => new Date(b.envelope.date).getTime() - new Date(a.envelope.date).getTime()
       );
 
-      return results;
+      return filtered;
     } finally {
       lock.release();
     }
