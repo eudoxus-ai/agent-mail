@@ -293,6 +293,23 @@ export class ImapProvider {
     }
   }
 
+  async listMailboxes(): Promise<Array<{
+    path: string;
+    name: string;
+    specialUse: string | null;
+    delimiter: string;
+    flags: string[];
+  }>> {
+    const raw = await this.client.list();
+    return raw.map((mb: any) => ({
+      path: mb.path,
+      name: mb.name,
+      specialUse: mb.specialUse ?? null,
+      delimiter: mb.delimiter ?? '/',
+      flags: Array.from(mb.flags ?? []),
+    }));
+  }
+
   async fetchMessage(mailbox: string, uid: number): Promise<EmailMessage> {
     const lock = await this.client.getMailboxLock(mailbox);
     try {

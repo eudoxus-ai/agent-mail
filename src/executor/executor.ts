@@ -628,6 +628,35 @@ export class Executor {
     return payload;
   }
 
+  private async listMailboxesMulti(intent: Intent) {
+    const requested = (intent.params.account_ids as string[] | undefined) ?? null;
+    const allIds = this.accounts.map((a) => a.id);
+    const targetIds = requested ?? allIds;
+    const unknown = targetIds.filter((id) => !allIds.includes(id));
+    if (unknown.length > 0) throw new Error(`Unknown account_ids: ${unknown.join(', ')}`);
+
+    const fanResult = await fanOut({
+      pool: this.pool,
+      accountIds: targetIds,
+      fn: async (_accountId, imap) => ({ mailboxes: await imap.listMailboxes() }),
+    });
+
+    const payload: {
+      accounts_searched: string[];
+      accounts_available: string[];
+      per_account_errors?: Record<string, string>;
+      per_account: typeof fanResult.per_account;
+    } = {
+      accounts_searched: fanResult.accounts_searched,
+      accounts_available: allIds,
+      per_account: fanResult.per_account,
+    };
+    if (Object.keys(fanResult.errors).length > 0) {
+      payload.per_account_errors = fanResult.errors;
+    }
+    return payload;
+  }
+
   private async performAction(
     intent: Intent
   ): Promise<Array<{ type: 'text'; text: string }>> {
@@ -660,6 +689,11 @@ export class Executor {
 
     if (intent.tool === 'list_senders') {
       const payload = await this.listSendersMulti(intent);
+      return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
+    }
+
+    if (intent.tool === 'list_mailboxes') {
+      const payload = await this.listMailboxesMulti(intent);
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
 

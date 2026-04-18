@@ -9,6 +9,7 @@ export const DEFAULT_POLICY_YAML = `# agent-mail policy configuration
 tools:
   search_threads:      { risk: none, gate: ungated, reversible: false }
   list_senders:        { risk: none, gate: ungated, reversible: false }
+  list_mailboxes:      { risk: none, gate: ungated, reversible: false }
   read_thread:         { risk: none, gate: ungated, reversible: false }
   get_overview:        { risk: none, gate: ungated, reversible: false }
   draft_reply:         { risk: low, gate: ungated, reversible: false }
