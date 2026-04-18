@@ -20,7 +20,7 @@ describe('hold_messages', () => {
       withConnection: vi.fn(async (accountId: string, fn: any) =>
         fn({
           getMailboxPath: async () => 'agent-mail-holding',
-          moveMessages: async () => { moveCalls.push(accountId); },
+          moveMessages: async (uids: number[]) => { moveCalls.push(accountId); return { uidMap: new Map(uids.map((u) => [u, u])) }; },
           fetchEnvelopes: async () => [],
         })
       ),
@@ -46,7 +46,7 @@ describe('hold_messages', () => {
       withConnection: vi.fn(async (accountId: string, fn: any) =>
         fn({
           getMailboxPath: async () => 'agent-mail-holding',
-          moveMessages: async (uids: number[]) => { moveCalls.push({ accountId, uids }); },
+          moveMessages: async (uids: number[]) => { moveCalls.push({ accountId, uids }); return { uidMap: new Map(uids.map((u) => [u, u])) }; },
           fetchEnvelopes: async () => [],
         })
       ),
@@ -68,7 +68,7 @@ describe('hold_messages', () => {
       withConnection: vi.fn(async (_: string, fn: any) =>
         fn({
           getMailboxPath: async () => 'agent-mail-holding',
-          moveMessages: async () => {},
+          moveMessages: async (uids: number[]) => ({ uidMap: new Map(uids.map((u) => [u, u])) }),
           fetchEnvelopes: async () => [],
         })
       ),
@@ -91,7 +91,7 @@ describe('hold_messages', () => {
       withConnection: vi.fn(async (_: string, fn: any) =>
         fn({
           getMailboxPath: async () => 'agent-mail-holding',
-          moveMessages: async () => {},
+          moveMessages: async (uids: number[]) => ({ uidMap: new Map(uids.map((u) => [u, u])) }),
           fetchEnvelopes: async () => [],
         })
       ),

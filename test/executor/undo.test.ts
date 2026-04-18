@@ -55,6 +55,7 @@ describe('undo restore_messages (rehold_messages)', () => {
           getMailboxPath: async () => 'agent-mail-holding',
           moveMessages: async (uids: number[], from: string, to: string) => {
             moves.push({ uids, from, to });
+            return { uidMap: new Map(uids.map((u) => [u, u])) };
           },
         })
       ),

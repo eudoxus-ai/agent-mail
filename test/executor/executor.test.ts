@@ -40,7 +40,7 @@ vi.mock('../../src/provider/imap.js', () => ({
       mailbox: 'INBOX',
     }),
     createDraft: vi.fn().mockResolvedValue({ uid: 99 }),
-    moveMessages: vi.fn().mockResolvedValue(undefined),
+    moveMessages: vi.fn().mockResolvedValue({ uidMap: new Map() }),
     setFlags: vi.fn().mockResolvedValue(undefined),
     removeFlags: vi.fn().mockResolvedValue(undefined),
     getMailboxPath: vi.fn().mockResolvedValue('agent-mail-quarantine'),

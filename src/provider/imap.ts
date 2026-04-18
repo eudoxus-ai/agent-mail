@@ -403,10 +403,14 @@ export class ImapProvider {
     uids: number[],
     fromMailbox: string,
     toMailbox: string
-  ): Promise<void> {
+  ): Promise<{ uidMap: Map<number, number> }> {
     const lock = await this.client.getMailboxLock(fromMailbox);
     try {
-      await this.client.messageMove(uids.join(','), toMailbox, { uid: true });
+      const result = await this.client.messageMove(uids.join(','), toMailbox, { uid: true });
+      const uidMap: Map<number, number> = (result as any)?.uidMap instanceof Map
+        ? (result as any).uidMap
+        : new Map(uids.map((u) => [u, u]));
+      return { uidMap };
     } finally {
       lock.release();
     }

@@ -54,4 +54,24 @@ describe('intent_targets', () => {
     const rows = getIntentTargets(db, 'i2');
     expect(rows[0].envelope_snapshot).toBeNull();
   });
+
+  it('round-trips destination_uid', () => {
+    const db = openDatabase(':memory:');
+    db.prepare(
+      `INSERT INTO intents (id, account_id, tool, params, risk, status)
+       VALUES ('i3', 'a@x.com', 'hold_messages', '{}', 'medium', 'executed')`
+    ).run();
+    insertIntentTargets(db, 'i3', [
+      { account_id: 'a@x.com', uid: 10, mailbox: 'agent-mail-holding', destination_uid: 500 },
+      { account_id: 'a@x.com', uid: 11, mailbox: 'agent-mail-holding' },
+    ]);
+    const rows = getIntentTargets(db, 'i3');
+    expect(rows).toHaveLength(2);
+    // Row with explicit destination_uid
+    expect(rows[0].uid).toBe(10);
+    expect(rows[0].destination_uid).toBe(500);
+    // Row without destination_uid should be null
+    expect(rows[1].uid).toBe(11);
+    expect(rows[1].destination_uid).toBeNull();
+  });
 });

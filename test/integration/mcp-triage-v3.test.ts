@@ -7,9 +7,15 @@ const logger = createLogger('cli', { minLevel: 'error' });
 
 // ---------------------------------------------------------------------------
 // Fake IMAP: records every moveMessages call so we can assert IMAP side effects.
+// UIDs are remapped on move: destination UID = source UID + 1000, simulating
+// how real IMAP servers assign new UIDs in the destination mailbox.
 // ---------------------------------------------------------------------------
 
 const moveLog: Array<{ uids: number[]; from: string; to: string }> = [];
+
+// Tracks the "current" UID for each original message (remaps on each move)
+// key: original uid, value: current uid in its current mailbox
+const uidMapping = new Map<number, number>();
 
 function makeFakePool(messages: Array<{
   uid: number;
@@ -26,6 +32,9 @@ function makeFakePool(messages: Array<{
         },
         moveMessages: async (uids: number[], from: string, to: string) => {
           moveLog.push({ uids, from, to });
+          // Remap: new UID = old UID + 1000
+          const uidMap = new Map(uids.map((u) => [u, u + 1000]));
+          return { uidMap };
         },
         fetchEnvelopes: async (_mailbox: string, uids: number[]) =>
           messages
@@ -53,9 +62,10 @@ const MESSAGES = [
 ];
 
 describe('MCP triage v3: hold → get_intent → partial restore', () => {
-  it('holds 3 messages, inspects intent, restores 1, checks reversal links', async () => {
+  it('holds 3 messages, inspects intent, restores 1, checks reversal links (with UID remapping)', async () => {
     // Fresh in-memory DB + fake IMAP pool per test
     moveLog.length = 0;
+    uidMapping.clear();
     const db = openDatabase(':memory:');
     const pool = makeFakePool(MESSAGES);
 
@@ -160,23 +170,27 @@ describe('MCP triage v3: hold → get_intent → partial restore', () => {
     expect(holdAfterPayload.reversed_by_intent_id).toBe(restoreIntentId);
 
     // -----------------------------------------------------------------------
-    // Step 8: fake IMAP recorded 3 moves to holding, then 1 move out
+    // Step 8: fake IMAP recorded 3 moves to holding, then 1 move out.
+    // With UID remapping: hold moves source UIDs [101,102,103]; restore must
+    // move the destination_uid (101 + 1000 = 1101) back to INBOX.
     // -----------------------------------------------------------------------
     const movesToHolding = moveLog.filter((m) => m.to === 'agent-mail-holding');
     const movesFromHolding = moveLog.filter((m) => m.from === 'agent-mail-holding');
 
-    // The hold call moves each UID individually (one per mailbox group), or all at once —
-    // what matters is that all 3 UIDs appear in moves to holding, in order.
+    // The hold call moves each source UID to holding
     const heldUids = movesToHolding.flatMap((m) => m.uids);
     expect(heldUids.sort()).toEqual([101, 102, 103]);
 
-    // The restore call moves exactly 1 UID out of holding
+    // The restore call must use the remapped UID (1101) to find the message in holding
     const restoredUids = movesFromHolding.flatMap((m) => m.uids);
-    expect(restoredUids).toEqual([101]);
+    expect(restoredUids).toEqual([1101]);
 
-    // Total move operations: hold(3) then restore(1) — holding moves came first
+    // Total move operations: hold moves came first
     const holdMoveIndex = moveLog.findIndex((m) => m.to === 'agent-mail-holding');
     const restoreMoveIndex = moveLog.findIndex((m) => m.from === 'agent-mail-holding');
     expect(holdMoveIndex).toBeLessThan(restoreMoveIndex);
+
+    // Agent-facing payload still shows source UID 101 (not the remapped UID)
+    expect(restorePayload.moved[0].uid).toBe(101);
   });
 });

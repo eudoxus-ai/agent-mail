@@ -815,6 +815,9 @@ export class Executor {
 
           const holding = await imap.getMailboxPath('holding');
 
+          // uidMap accumulates source→destination UID mappings for all mailboxes
+          const combinedUidMap = new Map<number, number>();
+
           for (const [mailbox, uids] of byMailbox) {
             if (includeSummary || !dryRun) {
               const envs = await imap.fetchEnvelopes(mailbox, uids);
@@ -829,7 +832,10 @@ export class Executor {
               }
             }
             if (!dryRun) {
-              await imap.moveMessages(uids, mailbox, holding);
+              const { uidMap } = await imap.moveMessages(uids, mailbox, holding);
+              for (const [src, dst] of uidMap) {
+                combinedUidMap.set(src, dst);
+              }
             }
             perMailbox.push({ mailbox, message_count: uids.length, uids });
           }
@@ -838,6 +844,7 @@ export class Executor {
             account_id: accountId,
             per_mailbox: perMailbox,
             envelopes: envelopeSnapshots,
+            uidMap: combinedUidMap,
             message_count: perMailbox.reduce((n, m) => n + m.message_count, 0),
           };
         },
@@ -848,18 +855,31 @@ export class Executor {
       // Aggregate envelopes from all accounts (internal scaffolding — not exposed)
       const allEnvelopes = perAccountRaw.flatMap((a: any) => a.envelopes ?? []);
 
-      // Persist targets to ledger on real (non-dry) runs
-      if (!dryRun && allEnvelopes.length > 0) {
-        insertIntentTargets(this.db, intent.id, allEnvelopes.map((e: any) => ({
-          account_id: e.account_id,
-          uid: e.uid,
-          mailbox: e.mailbox,
-          envelope_snapshot: { subject: e.subject, from: e.from, original_mailbox: e.mailbox },
-        })));
+      // Aggregate uidMaps from all per-account results
+      const allUidMaps: Map<string, Map<number, number>> = new Map();
+      for (const a of perAccountRaw as any[]) {
+        if (a.account_id && a.uidMap instanceof Map) {
+          allUidMaps.set(a.account_id, a.uidMap);
+        }
       }
 
-      // Strip internal `envelopes` field before building the public payload
-      const perAccount = perAccountRaw.map(({ envelopes: _envs, ...rest }: any) => rest);
+      // Persist targets to ledger on real (non-dry) runs
+      if (!dryRun && allEnvelopes.length > 0) {
+        insertIntentTargets(this.db, intent.id, allEnvelopes.map((e: any) => {
+          const acctUidMap = allUidMaps.get(e.account_id);
+          const destinationUid = acctUidMap?.get(e.uid) ?? null;
+          return {
+            account_id: e.account_id,
+            uid: e.uid,
+            mailbox: e.mailbox,
+            envelope_snapshot: { subject: e.subject, from: e.from, original_mailbox: e.mailbox },
+            destination_uid: destinationUid ?? undefined,
+          };
+        }));
+      }
+
+      // Strip internal `envelopes` and `uidMap` fields before building the public payload
+      const perAccount = perAccountRaw.map(({ envelopes: _envs, uidMap: _um, ...rest }: any) => rest);
       const totalMessages = perAccount.reduce((n: number, a: any) => n + a.message_count, 0);
 
       const payload: {
@@ -908,40 +928,55 @@ export class Executor {
       const unknown = accountIds.filter((id) => !allIds.includes(id));
       if (unknown.length > 0) throw new Error(`Unknown account_ids in targets: ${unknown.join(', ')}`);
 
-      // Index ledger snapshots by (account_id, uid) → original_mailbox + source intent.
+      // Index ledger snapshots by (account_id, uid) → original_mailbox + destination_uid + source intent.
       const rows = this.db
         .prepare(
-          `SELECT it.intent_id, it.account_id, it.uid, it.envelope_snapshot
+          `SELECT it.intent_id, it.account_id, it.uid, it.envelope_snapshot, it.destination_uid
            FROM intent_targets it
            JOIN intents i ON i.id = it.intent_id
            WHERE i.tool = 'hold_messages' AND i.status = 'executed'`
         )
-        .all() as Array<{ intent_id: string; account_id: string; uid: number; envelope_snapshot: string | null }>;
-      const byKey = new Map<string, { intent_id: string; original_mailbox: string }>();
+        .all() as Array<{ intent_id: string; account_id: string; uid: number; envelope_snapshot: string | null; destination_uid: number | null }>;
+      const byKey = new Map<string, { intent_id: string; original_mailbox: string; destination_uid: number | null }>();
       for (const r of rows) {
         const snap = r.envelope_snapshot ? JSON.parse(r.envelope_snapshot) : null;
         if (snap?.original_mailbox) {
-          byKey.set(`${r.account_id}:${r.uid}`, { intent_id: r.intent_id, original_mailbox: snap.original_mailbox });
+          byKey.set(`${r.account_id}:${r.uid}`, {
+            intent_id: r.intent_id,
+            original_mailbox: snap.original_mailbox,
+            destination_uid: r.destination_uid ?? null,
+          });
         }
       }
 
       const moved: Array<{ uid: number; account_id: string; destination_mailbox: string }> = [];
       const errors: Array<{ uid: number; account_id: string; reason: string }> = [];
       const reverses = new Set<string>();
+      // Track uidMaps per account for restore intent target persistence
+      const restoreUidMaps = new Map<string, Map<number, number>>();
 
       for (const [accountId, list] of Object.entries(grouped)) {
         await this.pool.withConnection(accountId, async (imap) => {
           const holding = await imap.getMailboxPath('holding');
+          const acctUidMap = new Map<number, number>();
           for (const t of list) {
             const entry = byKey.get(`${accountId}:${t.uid}`);
             if (!entry) {
               errors.push({ uid: t.uid, account_id: accountId, reason: 'original_mailbox unknown (not in ledger)' });
               continue;
             }
-            if (!dryRun) await imap.moveMessages([t.uid], holding, entry.original_mailbox);
+            // Use destination_uid (actual UID in holding) if available; fall back to uid for back-compat
+            const holdingUid = entry.destination_uid ?? t.uid;
+            if (!dryRun) {
+              const { uidMap } = await imap.moveMessages([holdingUid], holding, entry.original_mailbox);
+              // Map the restored-to UID back under the source uid key for persistence
+              const restoredUid = uidMap.get(holdingUid) ?? holdingUid;
+              acctUidMap.set(t.uid, restoredUid);
+            }
             moved.push({ uid: t.uid, account_id: accountId, destination_mailbox: entry.original_mailbox });
             reverses.add(entry.intent_id);
           }
+          if (!dryRun) restoreUidMaps.set(accountId, acctUidMap);
         });
       }
 
@@ -949,14 +984,21 @@ export class Executor {
         linkReversal(this.db, { restoreIntentId: intent.id, reverses: [...reverses] });
       }
 
-      // Persist targets so the rehold_messages undo knows where messages landed
+      // Persist targets so the rehold_messages undo knows where messages landed.
+      // destination_uid records the UID of the message after moving back to original_mailbox,
+      // so a subsequent re-hold can find the message even if the IMAP server remapped UIDs.
       if (!dryRun && moved.length > 0) {
-        insertIntentTargets(this.db, intent.id, moved.map((m) => ({
-          account_id: m.account_id,
-          uid: m.uid,
-          mailbox: m.destination_mailbox,
-          envelope_snapshot: { subject: '', from: '', original_mailbox: m.destination_mailbox },
-        })));
+        insertIntentTargets(this.db, intent.id, moved.map((m) => {
+          const acctUidMap = restoreUidMaps.get(m.account_id);
+          const destinationUid = acctUidMap?.get(m.uid) ?? null;
+          return {
+            account_id: m.account_id,
+            uid: m.uid,
+            mailbox: m.destination_mailbox,
+            envelope_snapshot: { subject: '', from: '', original_mailbox: m.destination_mailbox },
+            destination_uid: destinationUid ?? undefined,
+          };
+        }));
       }
 
       const payload: {
@@ -1104,29 +1146,45 @@ export class Executor {
     }
 
     // Multi-account hold undo: group targets by account, restore to inbox
+    // Use destination_uid from ledger so we find the correct UID in holding.
     if (undoOp.reverseAction === 'move_back_to_inbox') {
       const targets = intent.params.targets as Target[];
       const grouped = parseTargets(targets);
+      const ledgerTargets = getIntentTargets(this.db, intent.id);
+      const ledgerByKey = new Map<string, number | null>();
+      for (const lt of ledgerTargets) {
+        ledgerByKey.set(`${lt.account_id}:${lt.uid}`, lt.destination_uid);
+      }
 
       for (const [accountId, list] of Object.entries(grouped)) {
         await this.pool.withConnection(accountId, async (imap) => {
           const holding = await imap.getMailboxPath('holding');
           const inbox = await imap.getMailboxPath('inbox');
-          const uids = list.map((t) => t.uid);
-          await imap.moveMessages(uids, holding, inbox);
+          // Build list of actual UIDs in holding (using destination_uid if available)
+          const holdingUids = list.map((t) => {
+            const destUid = ledgerByKey.get(`${accountId}:${t.uid}`);
+            return destUid ?? t.uid;
+          });
+          await imap.moveMessages(holdingUids, holding, inbox);
         });
       }
       return;
     }
 
-    // restore_messages undo: re-hold each UID back to the holding folder
-    // Each target row has envelope_snapshot.original_mailbox = where the message lives now (its destination after restore).
+    // restore_messages undo: re-hold each UID back to the holding folder.
+    // Each target row has:
+    //   - uid: the agent-facing (source) UID
+    //   - destination_uid: the actual UID after restore moved the message to original_mailbox
+    //     (may differ from uid if IMAP server remapped on move)
+    //   - envelope_snapshot.original_mailbox / mailbox: the mailbox where the message now lives
     if (undoOp.reverseAction === 'rehold_messages') {
       const targets = getIntentTargets(this.db, intent.id);
       const byAccount = new Map<string, Array<{ uid: number; currentMailbox: string }>>();
       for (const t of targets) {
         const list = byAccount.get(t.account_id) ?? [];
-        list.push({ uid: t.uid, currentMailbox: t.envelope_snapshot?.original_mailbox ?? t.mailbox });
+        // Use destination_uid (actual UID in original_mailbox) if available; fall back to uid
+        const actualUid = t.destination_uid ?? t.uid;
+        list.push({ uid: actualUid, currentMailbox: t.envelope_snapshot?.original_mailbox ?? t.mailbox });
         byAccount.set(t.account_id, list);
       }
       for (const [accountId, list] of byAccount) {

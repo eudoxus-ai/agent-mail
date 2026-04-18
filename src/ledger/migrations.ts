@@ -31,4 +31,11 @@ export function runMigrations(db: Database): void {
     SET tool = 'hold_messages'
     WHERE tool IN ('quarantine_thread', 'quarantine_messages')
   `);
+
+  // Migration 4: add destination_uid column to intent_targets
+  const targetCols = db.prepare(`PRAGMA table_info(intent_targets)`).all() as Array<{ name: string }>;
+  const targetColNames = targetCols.map((c) => c.name);
+  if (!targetColNames.includes('destination_uid')) {
+    db.exec(`ALTER TABLE intent_targets ADD COLUMN destination_uid INTEGER`);
+  }
 }

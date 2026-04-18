@@ -3,7 +3,7 @@ export interface MigrationImap {
   renameMailbox(from: string, to: string): Promise<void>;
   ensureMailbox(name: string): Promise<void>;
   listMessageUids(mailbox: string): Promise<number[]>;
-  moveMessages(uids: number[], from: string, to: string): Promise<void>;
+  moveMessages(uids: number[], from: string, to: string): Promise<unknown>;
   deleteMailbox(name: string): Promise<void>;
 }
 

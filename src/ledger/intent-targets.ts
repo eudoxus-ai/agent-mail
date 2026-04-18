@@ -11,6 +11,7 @@ export interface IntentTargetInsert {
   uid: number;
   mailbox: string;
   envelope_snapshot?: EnvelopeSnapshot;
+  destination_uid?: number;
 }
 
 export interface IntentTargetRow {
@@ -19,6 +20,7 @@ export interface IntentTargetRow {
   uid: number;
   mailbox: string;
   envelope_snapshot: EnvelopeSnapshot | null;
+  destination_uid: number | null;
 }
 
 export function insertIntentTargets(
@@ -27,8 +29,8 @@ export function insertIntentTargets(
   targets: IntentTargetInsert[]
 ): void {
   const stmt = db.prepare(
-    `INSERT INTO intent_targets (intent_id, account_id, uid, mailbox, envelope_snapshot)
-     VALUES (?, ?, ?, ?, ?)`
+    `INSERT INTO intent_targets (intent_id, account_id, uid, mailbox, envelope_snapshot, destination_uid)
+     VALUES (?, ?, ?, ?, ?, ?)`
   );
   for (const t of targets) {
     stmt.run(
@@ -36,7 +38,8 @@ export function insertIntentTargets(
       t.account_id,
       t.uid,
       t.mailbox,
-      t.envelope_snapshot ? JSON.stringify(t.envelope_snapshot) : null
+      t.envelope_snapshot ? JSON.stringify(t.envelope_snapshot) : null,
+      t.destination_uid ?? null
     );
   }
 }
@@ -44,7 +47,7 @@ export function insertIntentTargets(
 export function getIntentTargets(db: Database, intentId: string): IntentTargetRow[] {
   const rows = db
     .prepare(
-      `SELECT intent_id, account_id, uid, mailbox, envelope_snapshot
+      `SELECT intent_id, account_id, uid, mailbox, envelope_snapshot, destination_uid
        FROM intent_targets WHERE intent_id = ? ORDER BY account_id, uid`
     )
     .all(intentId) as Array<Record<string, unknown>>;
@@ -56,5 +59,6 @@ export function getIntentTargets(db: Database, intentId: string): IntentTargetRo
     envelope_snapshot: r.envelope_snapshot
       ? (JSON.parse(r.envelope_snapshot as string) as EnvelopeSnapshot)
       : null,
+    destination_uid: r.destination_uid != null ? Number(r.destination_uid) : null,
   }));
 }
