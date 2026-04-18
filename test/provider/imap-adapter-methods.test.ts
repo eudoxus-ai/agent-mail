@@ -79,6 +79,74 @@ describe('ImapProvider.deleteMailbox', () => {
   });
 });
 
+describe('ImapProvider.fetchSnippet', () => {
+  it('calls download and pipes result through extractSnippetFromPart', async () => {
+    const provider = makeProvider();
+    const lock = { release: vi.fn() };
+
+    // Simulate a Node.js Readable stream containing plain text
+    const { Readable } = await import('stream');
+    const contentStream = Readable.from(['Hello world, this is the snippet content.']);
+
+    (provider as any).client = {
+      async getMailboxLock() { return lock; },
+      async fetchOne(_uid: string, _query: object, _opts: object) {
+        return {
+          uid: 1,
+          bodyStructure: {
+            type: 'text/plain',
+            part: '1',
+            childNodes: undefined,
+          },
+        };
+      },
+      async download(_uid: string, _part: string, _opts: object) {
+        return {
+          meta: { contentType: 'text/plain', charset: 'utf-8' },
+          content: contentStream,
+        };
+      },
+    };
+
+    const snippet = await provider.fetchSnippet('INBOX', 1);
+    expect(snippet).toBe('Hello world, this is the snippet content.');
+    expect(lock.release).toHaveBeenCalled();
+  });
+
+  it('returns empty string when fetchOne returns null', async () => {
+    const provider = makeProvider();
+    const lock = { release: vi.fn() };
+    (provider as any).client = {
+      async getMailboxLock() { return lock; },
+      async fetchOne() { return null; },
+    };
+    const snippet = await provider.fetchSnippet('INBOX', 99);
+    expect(snippet).toBe('');
+    expect(lock.release).toHaveBeenCalled();
+  });
+
+  it('strips HTML tags when downloading a text/html part', async () => {
+    const provider = makeProvider();
+    const lock = { release: vi.fn() };
+    const { Readable } = await import('stream');
+    const contentStream = Readable.from(['<p>Hello <b>world</b></p>']);
+    (provider as any).client = {
+      async getMailboxLock() { return lock; },
+      async fetchOne() {
+        return {
+          uid: 2,
+          bodyStructure: { type: 'text/html', part: '1', childNodes: undefined },
+        };
+      },
+      async download() {
+        return { meta: { contentType: 'text/html' }, content: contentStream };
+      },
+    };
+    const snippet = await provider.fetchSnippet('INBOX', 2);
+    expect(snippet).toBe('Hello world');
+  });
+});
+
 describe('ImapProvider.fetchEnvelopes (slim fields)', () => {
   it('returns uid, subject, and from.address for each UID', async () => {
     const provider = makeProvider();

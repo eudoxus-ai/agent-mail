@@ -27,6 +27,7 @@ function makeRow(uid: number, date: string) {
 function fakeImap(searchResults: any[]) {
   return {
     search: vi.fn(async () => searchResults),
+    fetchSnippet: vi.fn(async () => ''),
   };
 }
 

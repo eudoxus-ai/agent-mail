@@ -2,7 +2,8 @@ import { ImapFlow } from 'imapflow';
 import type { ResolvedAccount, EmailMessage, SearchCriteria, Participant } from '../types.js';
 import { parseListUnsubscribe } from '../lib/list-unsubscribe.js';
 import { pickNewestUids } from './search-ordering.js';
-import { extractSnippet } from './mime.js';
+import { extractSnippet, extractSnippetFromPart } from './mime.js';
+import type { SnippetSource } from './mime.js';
 
 function toParticipant(addr: { name?: string | null; address?: string | null } | undefined): Participant {
   return {
@@ -478,6 +479,42 @@ export class ImapProvider {
     }
   }
 
+  /**
+   * Fetch a short text preview of a message body.
+   *
+   * Walks the bodyStructure to find the first text/plain part (falling back to
+   * text/html), downloads up to 4 KiB of it, and passes the result through
+   * extractSnippetFromPart to produce a ≤500-char string. Returns '' on any error.
+   */
+  async fetchSnippet(mailbox: string, uid: number): Promise<string> {
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      const msg = await this.client.fetchOne(
+        String(uid),
+        { bodyStructure: true },
+        { uid: true }
+      );
+      if (!msg || !msg.bodyStructure) return '';
+
+      const part = findTextPart(msg.bodyStructure);
+      if (!part) return '';
+
+      const downloaded = await this.client.download(
+        String(uid),
+        part.partId || '1',
+        { uid: true, maxBytes: 4096 }
+      );
+      if (!downloaded || !downloaded.content) return '';
+
+      const content = await streamToString(downloaded.content);
+      return extractSnippetFromPart({ type: part.type as SnippetSource['type'], content });
+    } catch {
+      return '';
+    } finally {
+      lock.release();
+    }
+  }
+
   async getMailboxPath(
     name: 'inbox' | 'drafts' | 'sent' | 'trash' | 'holding'
   ): Promise<string> {
@@ -520,6 +557,75 @@ export function extractListHeadersFromSource(source: string): {
     listId: extractHeader(source, 'List-Id'),
     listUnsubscribe: extractHeader(source, 'List-Unsubscribe'),
   };
+}
+
+/**
+ * Walk an ImapFlow bodyStructure tree to find the first text/plain part.
+ * Falls back to text/html if no plain part is found.
+ * Returns null if no text part is found at all.
+ */
+function findTextPart(
+  node: { type?: string; part?: string; childNodes?: unknown[] } | null | undefined
+): { type: 'text/plain' | 'text/html'; partId: string } | null {
+  if (!node) return null;
+  const t = (node.type ?? '').toLowerCase();
+
+  if (t === 'text/plain' && node.part) {
+    return { type: 'text/plain', partId: node.part };
+  }
+  if (t === 'text/html' && node.part) {
+    // keep searching for plain, but save this as fallback
+    // handled below via two-pass approach
+  }
+
+  if (node.childNodes && Array.isArray(node.childNodes)) {
+    // First pass: look for plain
+    for (const child of node.childNodes) {
+      const found = findTextPart(child as any);
+      if (found?.type === 'text/plain') return found;
+    }
+    // Second pass: accept html
+    for (const child of node.childNodes) {
+      const found = findTextPart(child as any);
+      if (found) return found;
+    }
+  }
+
+  // This node is html (no plain found in children)
+  if (t === 'text/html' && node.part) {
+    return { type: 'text/html', partId: node.part };
+  }
+
+  return null;
+}
+
+/** Consume a ReadableStream to a UTF-8 string. */
+async function streamToString(stream: NodeJS.ReadableStream | ReadableStream): Promise<string> {
+  // Node.js Readable stream
+  if (typeof (stream as any).read === 'function' || typeof (stream as any).on === 'function') {
+    const nodeStream = stream as NodeJS.ReadableStream;
+    return new Promise<string>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      nodeStream.on('data', (chunk: Buffer | string) => {
+        chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+      });
+      nodeStream.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+      nodeStream.on('error', reject);
+    });
+  }
+  // WHATWG ReadableStream
+  const reader = (stream as ReadableStream).getReader();
+  const chunks: Uint8Array[] = [];
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) chunks.push(value);
+  }
+  const total = chunks.reduce((n, c) => n + c.length, 0);
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) { merged.set(c, offset); offset += c.length; }
+  return new TextDecoder().decode(merged);
 }
 
 function extractBodyText(source: string): string {

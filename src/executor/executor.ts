@@ -12,6 +12,7 @@ import {
   updateIntentStatusIfCurrent,
   withImmediateTransaction,
 } from '../ledger/intents.js';
+import { extractSnippetFromPart } from '../provider/mime.js';
 import { logAudit } from '../ledger/audit.js';
 import { buildAuditSummary } from '../ledger/audit-summary.js';
 import { getAccount } from '../provider/accounts.js';
@@ -516,7 +517,7 @@ export class Executor {
             merged.set(result.uid, result);
           }
         }
-        return Array.from(merged.values()).map((r) => ({
+        const baseResults = Array.from(merged.values()).map((r) => ({
           account_id: accountId,
           mailbox,
           ...r,
@@ -526,6 +527,19 @@ export class Executor {
           is_list_mail: isListMail(r.list_unsubscribe, r.list_id),
           target: { account_id: accountId, uid: r.uid, mailbox },
         }));
+
+        // Populate snippet for threads that don't already have one.
+        // Done in parallel per-thread. Each call adds one extra IMAP round-trip,
+        // so search_threads now issues N+1 IMAP calls per page (1 search + N snippet fetches).
+        await Promise.all(
+          baseResults.map(async (r) => {
+            if (!r.snippet) {
+              r.snippet = await imap.fetchSnippet(mailbox, r.uid);
+            }
+          })
+        );
+
+        return baseResults;
       },
     });
 
@@ -993,7 +1007,11 @@ export class Executor {
       const mailbox = target.mailbox ?? 'INBOX';
       return this.pool.withConnection(target.account_id, async (imap) => {
         const msg = await imap.fetchMessage(mailbox, target.uid);
-        return [{ type: 'text', text: JSON.stringify(msg, null, 2) }];
+        // Attach a snippet derived from the already-fetched body — no extra IMAP call.
+        const bodyContent = msg.bodyText ?? '';
+        const snippet = extractSnippetFromPart({ type: 'text/plain', content: bodyContent });
+        const payload = { ...msg, snippet };
+        return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
       });
     }
 

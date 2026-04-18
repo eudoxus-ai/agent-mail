@@ -23,6 +23,7 @@ describe('search_threads preassembled target', () => {
             list_id: null,
             list_unsubscribe: null,
           }],
+          fetchSnippet: async () => '',
         })
       ),
     };
