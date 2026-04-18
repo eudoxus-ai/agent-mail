@@ -543,6 +543,91 @@ export class Executor {
     return payload;
   }
 
+  private async listSendersMulti(intent: Intent): Promise<{
+    accounts_searched: string[];
+    accounts_available: string[];
+    per_account_errors?: Record<string, string>;
+    senders: Array<{
+      account_id: string;
+      from: string;
+      count: number;
+      sample_uids: number[];
+      has_unsubscribe: boolean;
+      is_automated_ratio: number;
+      latest_date: string;
+    }>;
+  }> {
+    const requested = (intent.params.account_ids as string[] | undefined) ?? null;
+    const allIds = this.accounts.map((a) => a.id);
+    const targetIds = requested ?? allIds;
+    const unknown = targetIds.filter((id) => !allIds.includes(id));
+    if (unknown.length > 0) throw new Error(`Unknown account_ids: ${unknown.join(', ')}`);
+
+    const mailbox = (intent.params.mailbox as string) ?? 'INBOX';
+    const minCount = (intent.params.min_count as number) ?? 1;
+    const sampleSize = (intent.params.sample_size as number) ?? 5;
+    const scanLimit = (intent.params.scan_limit as number) ?? 500;
+    const criteria = {
+      since: intent.params.since ? new Date(intent.params.since as string) : undefined,
+      before: intent.params.before ? new Date(intent.params.before as string) : undefined,
+    };
+
+    const fanResult = await fanOut({
+      pool: this.pool,
+      accountIds: targetIds,
+      fn: async (accountId, imap) => {
+        const raw = await imap.search(mailbox, criteria, scanLimit);
+        const groups = new Map<string, {
+          from: string;
+          uids: number[];
+          withUnsub: number;
+          automated: number;
+          latest: string;
+        }>();
+        for (const r of raw) {
+          const addr = r.envelope.from.address;
+          if (!addr) continue;
+          const g = groups.get(addr) ?? { from: addr, uids: [], withUnsub: 0, automated: 0, latest: '' };
+          g.uids.push(r.uid);
+          if (r.list_unsubscribe) g.withUnsub += 1;
+          if (isAutomatedSender(addr)) g.automated += 1;
+          if (r.envelope.date > g.latest) g.latest = r.envelope.date;
+          groups.set(addr, g);
+        }
+        return Array.from(groups.values())
+          .filter((g) => g.uids.length >= minCount)
+          .map((g) => ({
+            account_id: accountId,
+            from: g.from,
+            count: g.uids.length,
+            sample_uids: g.uids.slice(0, sampleSize),
+            has_unsubscribe: g.withUnsub > 0,
+            is_automated_ratio: g.automated / g.uids.length,
+            latest_date: g.latest,
+          }));
+      },
+    });
+
+    const senders = Object.values(fanResult.per_account)
+      .flat()
+      .sort((a, b) => b.count - a.count);
+
+    const payload: {
+      accounts_searched: string[];
+      accounts_available: string[];
+      per_account_errors?: Record<string, string>;
+      senders: typeof senders;
+    } = {
+      accounts_searched: fanResult.accounts_searched,
+      accounts_available: allIds,
+      senders,
+    };
+    if (Object.keys(fanResult.errors).length > 0) {
+      payload.per_account_errors = fanResult.errors;
+    }
+    return payload;
+  }
+
   private async performAction(
     intent: Intent
   ): Promise<Array<{ type: 'text'; text: string }>> {
@@ -570,6 +655,11 @@ export class Executor {
     // Multi-account read tools: fan out before borrowing a single connection
     if (intent.tool === 'search_threads') {
       const payload = await this.searchThreadsMulti(intent);
+      return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
+    }
+
+    if (intent.tool === 'list_senders') {
+      const payload = await this.listSendersMulti(intent);
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
 

@@ -22,6 +22,7 @@ import { queueSendTool } from '../tools/queue-send.js';
 import { quarantineThreadTool } from '../tools/quarantine-thread.js';
 import { undoIntentTool } from '../tools/undo-intent.js';
 import { getOverviewTool, runGetOverview } from '../tools/get-overview.js';
+import { listSendersTool } from '../tools/list-senders.js';
 
 import type { ToolDefinition } from '../types.js';
 
@@ -37,6 +38,7 @@ const ALL_TOOLS: ToolDefinition[] = [
   quarantineThreadTool,
   undoIntentTool,
   getOverviewTool,
+  listSendersTool,
 ];
 
 export interface McpServerBundle {
