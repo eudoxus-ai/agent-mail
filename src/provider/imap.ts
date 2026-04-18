@@ -1,5 +1,6 @@
 import { ImapFlow } from 'imapflow';
 import type { ResolvedAccount, EmailMessage, SearchCriteria, Participant } from '../types.js';
+import { parseListUnsubscribe } from '../lib/list-unsubscribe.js';
 import { pickNewestUids } from './search-ordering.js';
 import { extractSnippet } from './mime.js';
 
@@ -200,7 +201,8 @@ export class ImapProvider {
         const inReplyTo = extractHeader(source, 'In-Reply-To');
         const references =
           extractHeader(source, 'References')?.split(/\s+/).filter(Boolean) ?? [];
-        const listUnsubscribe = extractHeader(source, 'List-Unsubscribe');
+        const rawListUnsubscribe = extractHeader(source, 'List-Unsubscribe');
+        const listUnsubscribePost = extractHeader(source, 'List-Unsubscribe-Post');
 
         results.push({
           uid: msg.uid,
@@ -214,7 +216,9 @@ export class ImapProvider {
           inReplyTo: inReplyTo ?? undefined,
           references,
           flags: Array.from(msg.flags ?? []),
-          listUnsubscribe: listUnsubscribe ?? undefined,
+          listUnsubscribe: rawListUnsubscribe != null
+            ? parseListUnsubscribe(rawListUnsubscribe, listUnsubscribePost ?? undefined)
+            : undefined,
           mailbox,
           snippet: extractSnippet(msg.source ?? Buffer.alloc(0)),
         });
@@ -355,7 +359,8 @@ export class ImapProvider {
       const references = extractHeader(source, 'References')
         ?.split(/\s+/)
         .filter(Boolean) ?? [];
-      const listUnsubscribe = extractHeader(source, 'List-Unsubscribe');
+      const rawListUnsubscribe = extractHeader(source, 'List-Unsubscribe');
+      const listUnsubscribePost = extractHeader(source, 'List-Unsubscribe-Post');
 
       // Extract body text (simplified - real implementation would parse MIME)
       const bodyText = extractBodyText(source);
@@ -372,7 +377,9 @@ export class ImapProvider {
         inReplyTo: inReplyTo ?? undefined,
         references,
         flags: Array.from(msg.flags ?? []),
-        listUnsubscribe: listUnsubscribe ?? undefined,
+        listUnsubscribe: rawListUnsubscribe != null
+          ? parseListUnsubscribe(rawListUnsubscribe, listUnsubscribePost ?? undefined)
+          : undefined,
         mailbox,
       };
     } finally {

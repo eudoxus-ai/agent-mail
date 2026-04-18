@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { computeSignals } from '../../src/attention/signals.js';
 import type { EmailMessage, Participant } from '../../src/types.js';
+import { parseListUnsubscribe } from '../../src/lib/list-unsubscribe.js';
 
 const me = 'you@example.com';
 const p = (address: string, name: string | null = null): Participant => ({
@@ -68,7 +69,7 @@ describe('computeSignals — recipient signals', () => {
 
 describe('computeSignals — sender signals', () => {
   it('flags list mail by List-Unsubscribe presence', () => {
-    const msg = makeMessage({ listUnsubscribe: '<https://x/u>' });
+    const msg = makeMessage({ listUnsubscribe: parseListUnsubscribe('<https://x/u>') });
     const s = computeSignals(msg, { accountEmail: me, threadMessages: [] });
     expect(s.is_list_mail).toBe(true);
   });
@@ -161,7 +162,7 @@ describe('computeSignals — thread state', () => {
 
   it('overrides to "new" when the message is list mail', () => {
     const msg = makeMessage({
-      listUnsubscribe: '<https://x/u>',
+      listUnsubscribe: parseListUnsubscribe('<https://x/u>'),
       from: p('list@example.com'),
     });
     const s = computeSignals(msg, {

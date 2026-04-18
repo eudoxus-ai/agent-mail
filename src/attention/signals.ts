@@ -1,4 +1,4 @@
-import type { EmailMessage, Participant } from '../types.js';
+import type { EmailMessage, Participant, ParsedUnsubscribe } from '../types.js';
 
 export interface MessageSignals {
   // ─── Recipient signals ───
@@ -123,7 +123,7 @@ export function isAutomatedSender(address: string): boolean {
 }
 
 export function isListMail(
-  listUnsubscribe: string | null | undefined,
+  listUnsubscribe: ParsedUnsubscribe | string | null | undefined,
   listId: string | null | undefined
 ): boolean {
   return Boolean(listUnsubscribe) || Boolean(listId);
