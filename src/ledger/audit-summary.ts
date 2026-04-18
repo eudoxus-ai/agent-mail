@@ -60,13 +60,30 @@ export function buildAuditSummary(
         subject,
       };
 
-    case 'quarantine_thread': {
+    case 'hold_messages': {
       const count = targets?.length ?? 0;
-      const verb = dryRun ? 'Previewed quarantine of' : 'Quarantined';
+      const verb = dryRun ? 'Previewed hold of' : 'Held';
       return {
         summary: `${verb} ${count} message${count !== 1 ? 's' : ''}`,
         count,
         dry_run: dryRun,
+      };
+    }
+
+    case 'restore_messages': {
+      const count = targets?.length ?? 0;
+      const verb = dryRun ? 'Previewed restore of' : 'Restored';
+      return {
+        summary: `${verb} ${count} message${count !== 1 ? 's' : ''}`,
+        count,
+        dry_run: dryRun,
+      };
+    }
+
+    case 'get_intent': {
+      const id = params.id as string | undefined;
+      return {
+        summary: `Read intent ${id ?? 'unknown'}`,
       };
     }
 
@@ -93,12 +110,23 @@ export function describeIntent(tool: string, params: Record<string, unknown>): s
   switch (tool) {
     case 'queue_send':
       return `Send email to ${to ?? 'unknown'}: ${subject ?? '(no subject)'}`;
-    case 'quarantine_thread': {
+    case 'hold_messages': {
       const targets = params.targets as Target[] | undefined;
       const count = targets?.length ?? 0;
       const dryRun = params.dry_run === true;
-      const verb = dryRun ? 'Preview quarantine of' : 'Quarantine';
+      const verb = dryRun ? 'Preview hold of' : 'Hold';
       return `${verb} ${count} message${count !== 1 ? 's' : ''}`;
+    }
+    case 'restore_messages': {
+      const targets = params.targets as Target[] | undefined;
+      const count = targets?.length ?? 0;
+      const dryRun = params.dry_run === true;
+      const verb = dryRun ? 'Preview restore of' : 'Restore';
+      return `${verb} ${count} message${count !== 1 ? 's' : ''}`;
+    }
+    case 'get_intent': {
+      const id = params.id as string | undefined;
+      return `Read intent ${id ?? 'unknown'}`;
     }
     case 'label_thread': {
       const targets = params.targets as Target[] | undefined;
