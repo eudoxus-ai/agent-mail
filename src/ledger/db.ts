@@ -1,6 +1,7 @@
 import { DatabaseSync, type Database } from './sqlite.js';
 import { LEDGER_DB_PATH } from '../config.js';
 import type { Intent } from '../types.js';
+import { runMigrations } from './migrations.js';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS intents (
@@ -37,6 +38,7 @@ export function openDatabase(dbPath: string = LEDGER_DB_PATH): Database {
   db.exec('PRAGMA busy_timeout = 5000');
   db.exec('PRAGMA wal_autocheckpoint = 1000');
   db.exec(SCHEMA);
+  runMigrations(db);
   return db;
 }
 
