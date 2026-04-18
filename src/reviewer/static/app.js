@@ -63,11 +63,11 @@ function formatIntentTitle(intent) {
   switch (intent.tool) {
     case 'queue_send':
       return `Send email to ${p.to || 'unknown'}`;
-    case 'quarantine_thread': {
+    case 'hold_messages': {
       const count = Array.isArray(p.targets)
         ? p.targets.length
         : Array.isArray(p.uids) ? p.uids.length : 0;
-      const prefix = p.dry_run ? 'Preview quarantine of' : 'Quarantine';
+      const prefix = p.dry_run ? 'Preview held' : 'Held';
       return `${prefix} ${count} message${count !== 1 ? 's' : ''}`;
     }
     case 'permanent_delete': {
