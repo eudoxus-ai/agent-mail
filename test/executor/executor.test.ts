@@ -256,7 +256,12 @@ describe('Executor.undoIntent', () => {
   it('undoes a quarantine action', async () => {
     const { intent } = await executor.executeImmediate({
       tool: 'quarantine_thread',
-      toolParams: { uids: [1, 2], mailbox: 'INBOX' },
+      toolParams: {
+        targets: [
+          { account_id: 'test', uid: 1 },
+          { account_id: 'test', uid: 2 },
+        ],
+      },
       accountId: 'test',
       agentId: 'claude',
       risk: 'medium',
@@ -287,7 +292,12 @@ describe('Executor.undoIntent', () => {
   it('prevents concurrent undo calls from executing the side effect twice', async () => {
     const { intent } = await executor.executeImmediate({
       tool: 'quarantine_thread',
-      toolParams: { uids: [1, 2], mailbox: 'INBOX' },
+      toolParams: {
+        targets: [
+          { account_id: 'test', uid: 1 },
+          { account_id: 'test', uid: 2 },
+        ],
+      },
       accountId: 'test',
       agentId: 'claude',
       risk: 'medium',

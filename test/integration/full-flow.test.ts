@@ -155,7 +155,7 @@ describe('Full E2E flow: triage, draft, queue, approve', () => {
     // Quarantine (ungated when no replies)
     const quarantine = await executor.executeImmediate({
       tool: 'quarantine_thread',
-      toolParams: { uids: [2], mailbox: 'INBOX' },
+      toolParams: { targets: [{ account_id: 'gmail', uid: 2 }] },
       accountId: 'gmail',
       agentId: 'claude',
       risk: 'medium',

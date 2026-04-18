@@ -111,12 +111,18 @@ export class Executor {
     try {
       const result = await this.performAction(intent);
 
-      const undoToken = generateUndoToken(params.tool, params.toolParams);
-      const undoExpiry = getUndoExpiry(params.tool);
+      const isDryRun =
+        params.tool === 'quarantine_thread' &&
+        (params.toolParams.dry_run as boolean | undefined) === true;
+
+      const undoToken = isDryRun
+        ? null
+        : generateUndoToken(params.tool, params.toolParams);
+      const undoExpiry = isDryRun ? null : getUndoExpiry(params.tool);
 
       updateIntentStatus(this.db, intent.id, 'executed', {
         resolved_by: 'policy',
-        undo_token: undoToken,
+        undo_token: undoToken ?? undefined,
         undo_expires_at: undoExpiry ?? undefined,
       });
 
@@ -607,6 +613,75 @@ export class Executor {
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
 
+    // Multi-account quarantine: group targets by account+mailbox, fan out, support dry_run
+    if (intent.tool === 'quarantine_thread') {
+      const targets = intent.params.targets as Target[];
+      const dryRun = (intent.params.dry_run as boolean | undefined) ?? false;
+      const grouped = parseTargets(targets);
+      const accountIds = Object.keys(grouped);
+      const allIds = this.accounts.map((a) => a.id);
+      const unknown = accountIds.filter((id) => !allIds.includes(id));
+      if (unknown.length > 0) {
+        throw new Error(`Unknown account_ids in targets: ${unknown.join(', ')}`);
+      }
+
+      const fanResult = await fanOut({
+        pool: this.pool,
+        accountIds,
+        fn: async (accountId, imap) => {
+          const byMailbox = new Map<string, number[]>();
+          for (const t of grouped[accountId]) {
+            const list = byMailbox.get(t.mailbox) ?? [];
+            list.push(t.uid);
+            byMailbox.set(t.mailbox, list);
+          }
+
+          const perMailbox: Array<{
+            mailbox: string;
+            message_count: number;
+            uids: number[];
+          }> = [];
+
+          const quarantine = await imap.getMailboxPath('quarantine');
+
+          for (const [mailbox, uids] of byMailbox) {
+            if (!dryRun) {
+              await imap.moveMessages(uids, mailbox, quarantine);
+            }
+            perMailbox.push({ mailbox, message_count: uids.length, uids });
+          }
+
+          return {
+            account_id: accountId,
+            per_mailbox: perMailbox,
+            message_count: perMailbox.reduce((n, m) => n + m.message_count, 0),
+          };
+        },
+      });
+
+      const perAccount = Object.values(fanResult.per_account);
+      const totalMessages = perAccount.reduce((n, a) => n + a.message_count, 0);
+
+      const payload: {
+        accounts_searched: string[];
+        accounts_available: string[];
+        per_account_errors?: Record<string, string>;
+        dry_run: boolean;
+        total_messages: number;
+        per_account: typeof perAccount;
+      } = {
+        accounts_searched: fanResult.accounts_searched,
+        accounts_available: allIds,
+        dry_run: dryRun,
+        total_messages: totalMessages,
+        per_account: perAccount,
+      };
+      if (Object.keys(fanResult.errors).length > 0) {
+        payload.per_account_errors = fanResult.errors;
+      }
+      return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
+    }
+
     // Account-qualified read: route by target.account_id, not intent.account_id
     if (intent.tool === 'read_thread') {
       const target = intent.params.target as {
@@ -645,19 +720,6 @@ export class Executor {
                 draft_id: result.uid,
                 message: 'Draft created',
               }),
-            },
-          ];
-        }
-
-        case 'quarantine_thread': {
-          const uids = intent.params.uids as number[];
-          const mailbox = (intent.params.mailbox as string) ?? 'INBOX';
-          const quarantine = await imap.getMailboxPath('quarantine');
-          await imap.moveMessages(uids, mailbox, quarantine);
-          return [
-            {
-              type: 'text',
-              text: `Moved ${uids.length} message(s) to quarantine`,
             },
           ];
         }
@@ -717,19 +779,22 @@ export class Executor {
       return;
     }
 
-    await this.pool.withConnection(intent.account_id, async (imap) => {
-      switch (undoOp.reverseAction) {
-        case 'move_back_to_inbox': {
-          const uids = intent.params.uids as number[];
+    // Multi-account quarantine undo: group targets by account, restore to inbox
+    if (undoOp.reverseAction === 'move_back_to_inbox') {
+      const targets = intent.params.targets as Target[];
+      const grouped = parseTargets(targets);
+
+      for (const [accountId, list] of Object.entries(grouped)) {
+        await this.pool.withConnection(accountId, async (imap) => {
           const quarantine = await imap.getMailboxPath('quarantine');
           const inbox = await imap.getMailboxPath('inbox');
+          const uids = list.map((t) => t.uid);
           await imap.moveMessages(uids, quarantine, inbox);
-          break;
-        }
-
-        default:
-          throw new Error(`Unknown undo action: ${undoOp.reverseAction}`);
+        });
       }
-    });
+      return;
+    }
+
+    throw new Error(`Unknown undo action: ${undoOp.reverseAction}`);
   }
 }
