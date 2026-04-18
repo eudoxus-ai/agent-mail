@@ -1,15 +1,18 @@
 import type { Database } from '../ledger/sqlite.js';
 import type { AccountConfig, Intent, RiskLevel } from '../types.js';
-import { isAutomatedSender, isListMail } from '../attention/signals.js';
+import { isListMail } from '../attention/signals.js';
 import type { Logger } from '../logger.js';
 import type { ImapConnectionPool } from '../provider/imap-pool.js';
 import {
   createIntent,
   getIntent,
+  getReversalLinks,
+  linkReversal,
   updateIntentStatus,
   updateIntentStatusIfCurrent,
   withImmediateTransaction,
 } from '../ledger/intents.js';
+import { extractSnippetFromPart } from '../provider/mime.js';
 import { logAudit } from '../ledger/audit.js';
 import { buildAuditSummary } from '../ledger/audit-summary.js';
 import { getAccount } from '../provider/accounts.js';
@@ -24,8 +27,10 @@ import {
   createTimedAbortSignal,
 } from '../provider/url-safety.js';
 import { generateUndoToken, getUndoExpiry, parseUndoToken } from './undo.js';
+import { buildUndoHint } from '../lib/undo-hint.js';
 import { fanOut } from './fan-out.js';
 import { parseTargets, type Target } from '../tools/target.js';
+import { insertIntentTargets, getIntentTargets } from '../ledger/intent-targets.js';
 
 interface SearchThreadResult {
   account_id: string;
@@ -41,7 +46,6 @@ interface SearchThreadResult {
   flags: string[];
   list_id: string | null;
   list_unsubscribe: string | null;
-  is_automated: boolean;
   is_list_mail: boolean;
   target: { account_id: string; uid: number; mailbox: string };
 }
@@ -50,6 +54,7 @@ interface SearchThreadsMultiPayload {
   accounts_searched: string[];
   accounts_available: string[];
   per_account_errors?: Record<string, string>;
+  per_account_counts?: Record<string, number>;
   results: SearchThreadResult[];
 }
 
@@ -511,16 +516,30 @@ export class Executor {
             merged.set(result.uid, result);
           }
         }
-        return Array.from(merged.values()).map((r) => ({
+        const baseResults = Array.from(merged.values()).map((r) => ({
           account_id: accountId,
           mailbox,
           ...r,
           list_id: r.list_id ?? null,
           list_unsubscribe: r.list_unsubscribe ?? null,
-          is_automated: isAutomatedSender(r.envelope.from.address),
           is_list_mail: isListMail(r.list_unsubscribe, r.list_id),
           target: { account_id: accountId, uid: r.uid, mailbox },
         }));
+
+        // Populate snippet for threads that don't already have one.
+        // Only runs when include_snippets: true — each call adds one extra IMAP round-trip
+        // (N+1 calls per page). Default is off to keep searches fast.
+        if (intent.params.include_snippets === true) {
+          await Promise.all(
+            baseResults.map(async (r) => {
+              if (!r.snippet) {
+                r.snippet = await imap.fetchSnippet(mailbox, r.uid);
+              }
+            })
+          );
+        }
+
+        return baseResults;
       },
     });
 
@@ -532,9 +551,15 @@ export class Executor {
       )
       .slice(0, limit);
 
+    const per_account_counts: Record<string, number> = {};
+    for (const [accountId, rows] of Object.entries(fanResult.per_account)) {
+      per_account_counts[accountId] = (rows as any[]).length;
+    }
+
     const payload: SearchThreadsMultiPayload = {
       accounts_searched: fanResult.accounts_searched,
       accounts_available: allIds,
+      per_account_counts,
       results: allResults,
     };
     if (Object.keys(fanResult.errors).length > 0) {
@@ -553,7 +578,7 @@ export class Executor {
       count: number;
       sample_uids: number[];
       has_unsubscribe: boolean;
-      is_automated_ratio: number;
+      is_list_mail_ratio: number;
       latest_date: string;
     }>;
   }> {
@@ -581,16 +606,16 @@ export class Executor {
           from: string;
           uids: number[];
           withUnsub: number;
-          automated: number;
+          listMail: number;
           latest: string;
         }>();
         for (const r of raw) {
           const addr = r.envelope.from.address;
           if (!addr) continue;
-          const g = groups.get(addr) ?? { from: addr, uids: [], withUnsub: 0, automated: 0, latest: '' };
+          const g = groups.get(addr) ?? { from: addr, uids: [], withUnsub: 0, listMail: 0, latest: '' };
           g.uids.push(r.uid);
           if (r.list_unsubscribe) g.withUnsub += 1;
-          if (isAutomatedSender(addr)) g.automated += 1;
+          if (r.list_unsubscribe) g.listMail += 1;
           if (!g.latest || new Date(r.envelope.date).getTime() > new Date(g.latest).getTime()) {
             g.latest = r.envelope.date;
           }
@@ -604,7 +629,7 @@ export class Executor {
             count: g.uids.length,
             sample_uids: g.uids.slice(0, sampleSize),
             has_unsubscribe: g.withUnsub > 0,
-            is_automated_ratio: g.automated / g.uids.length,
+            is_list_mail_ratio: g.listMail / g.uids.length,
             latest_date: g.latest,
           }));
       },
@@ -672,15 +697,10 @@ export class Executor {
       const message = await this.resolveQueuedSend(intent, account);
       const transport = createSmtpTransport(resolved);
       const result = await sendMail(transport, message);
-      return [
-        {
-          type: 'text',
-          text: JSON.stringify({
-            sent: true,
-            messageId: result.messageId,
-          }),
-        },
-      ];
+      const payload: Record<string, unknown> = { sent: true, messageId: result.messageId };
+      const sendHint = buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at });
+      if (sendHint) Object.assign(payload, sendHint);
+      return [{ type: 'text', text: JSON.stringify(payload) }];
     }
 
     // Multi-account read tools: fan out before borrowing a single connection
@@ -739,6 +759,8 @@ export class Executor {
         per_account_errors?: Record<string, string>;
         action: 'add' | 'remove';
         label: string;
+        reversible?: true;
+        undo_hint?: { intent_id: string; method: string; window_expires_at: string };
       } = {
         accounts_searched: fanResult.accounts_searched,
         accounts_available: allIds,
@@ -748,13 +770,16 @@ export class Executor {
       if (Object.keys(fanResult.errors).length > 0) {
         payload.per_account_errors = fanResult.errors;
       }
+      const labelHint = buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at });
+      if (labelHint) Object.assign(payload, labelHint);
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
 
-    // Multi-account quarantine: group targets by account+mailbox, fan out, support dry_run
-    if (intent.tool === 'quarantine_thread') {
+    // Multi-account hold: group targets by account+mailbox, fan out, support dry_run
+    if (intent.tool === 'hold_messages') {
       const targets = intent.params.targets as Target[];
       const dryRun = (intent.params.dry_run as boolean | undefined) ?? false;
+      const includeSummary = (intent.params.include_summary as boolean | undefined) ?? false;
       const grouped = parseTargets(targets);
       const accountIds = Object.keys(grouped);
       const allIds = this.accounts.map((a) => a.id);
@@ -780,11 +805,37 @@ export class Executor {
             uids: number[];
           }> = [];
 
-          const quarantine = await imap.getMailboxPath('quarantine');
+          const envelopeSnapshots: Array<{
+            account_id: string;
+            uid: number;
+            mailbox: string;
+            subject: string;
+            from: string;
+          }> = [];
+
+          const holding = await imap.getMailboxPath('holding');
+
+          // uidMap accumulates source→destination UID mappings for all mailboxes
+          const combinedUidMap = new Map<number, number>();
 
           for (const [mailbox, uids] of byMailbox) {
+            if (includeSummary || !dryRun) {
+              const envs = await imap.fetchEnvelopes(mailbox, uids);
+              for (const env of envs) {
+                envelopeSnapshots.push({
+                  account_id: accountId,
+                  uid: env.uid,
+                  mailbox,
+                  subject: env.subject,
+                  from: env.from.address,
+                });
+              }
+            }
             if (!dryRun) {
-              await imap.moveMessages(uids, mailbox, quarantine);
+              const { uidMap } = await imap.moveMessages(uids, mailbox, holding);
+              for (const [src, dst] of uidMap) {
+                combinedUidMap.set(src, dst);
+              }
             }
             perMailbox.push({ mailbox, message_count: uids.length, uids });
           }
@@ -792,13 +843,44 @@ export class Executor {
           return {
             account_id: accountId,
             per_mailbox: perMailbox,
+            envelopes: envelopeSnapshots,
+            uidMap: combinedUidMap,
             message_count: perMailbox.reduce((n, m) => n + m.message_count, 0),
           };
         },
       });
 
-      const perAccount = Object.values(fanResult.per_account);
-      const totalMessages = perAccount.reduce((n, a) => n + a.message_count, 0);
+      const perAccountRaw = Object.values(fanResult.per_account);
+
+      // Aggregate envelopes from all accounts (internal scaffolding — not exposed)
+      const allEnvelopes = perAccountRaw.flatMap((a: any) => a.envelopes ?? []);
+
+      // Aggregate uidMaps from all per-account results
+      const allUidMaps: Map<string, Map<number, number>> = new Map();
+      for (const a of perAccountRaw as any[]) {
+        if (a.account_id && a.uidMap instanceof Map) {
+          allUidMaps.set(a.account_id, a.uidMap);
+        }
+      }
+
+      // Persist targets to ledger on real (non-dry) runs
+      if (!dryRun && allEnvelopes.length > 0) {
+        insertIntentTargets(this.db, intent.id, allEnvelopes.map((e: any) => {
+          const acctUidMap = allUidMaps.get(e.account_id);
+          const destinationUid = acctUidMap?.get(e.uid) ?? null;
+          return {
+            account_id: e.account_id,
+            uid: e.uid,
+            mailbox: e.mailbox,
+            envelope_snapshot: { subject: e.subject, from: e.from, original_mailbox: e.mailbox },
+            destination_uid: destinationUid ?? undefined,
+          };
+        }));
+      }
+
+      // Strip internal `envelopes` and `uidMap` fields before building the public payload
+      const perAccount = perAccountRaw.map(({ envelopes: _envs, uidMap: _um, ...rest }: any) => rest);
+      const totalMessages = perAccount.reduce((n: number, a: any) => n + a.message_count, 0);
 
       const payload: {
         accounts_searched: string[];
@@ -807,6 +889,9 @@ export class Executor {
         dry_run: boolean;
         total_messages: number;
         per_account: typeof perAccount;
+        moved?: Array<{ uid: number; account_id: string; subject: string; from: string; original_mailbox: string }>;
+        reversible?: true;
+        undo_hint?: { intent_id: string; method: string; window_expires_at: string };
       } = {
         accounts_searched: fanResult.accounts_searched,
         accounts_available: allIds,
@@ -817,6 +902,148 @@ export class Executor {
       if (Object.keys(fanResult.errors).length > 0) {
         payload.per_account_errors = fanResult.errors;
       }
+      if (includeSummary) {
+        payload.moved = allEnvelopes.map((e: any) => ({
+          uid: e.uid,
+          account_id: e.account_id,
+          subject: e.subject,
+          from: e.from,
+          original_mailbox: e.mailbox,
+        }));
+      }
+      if (!dryRun) {
+        const holdHint = buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at });
+        if (holdHint) Object.assign(payload, holdHint);
+      }
+      return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
+    }
+
+    // Multi-account restore: move messages back to their original mailbox using ledger snapshots
+    if (intent.tool === 'restore_messages') {
+      const targets = intent.params.targets as Target[];
+      const dryRun = (intent.params.dry_run as boolean | undefined) ?? false;
+      const grouped = parseTargets(targets);
+      const accountIds = Object.keys(grouped);
+      const allIds = this.accounts.map((a) => a.id);
+      const unknown = accountIds.filter((id) => !allIds.includes(id));
+      if (unknown.length > 0) throw new Error(`Unknown account_ids in targets: ${unknown.join(', ')}`);
+
+      // Index ledger snapshots by (account_id, uid) → original_mailbox + destination_uid + source intent.
+      const rows = this.db
+        .prepare(
+          `SELECT it.intent_id, it.account_id, it.uid, it.envelope_snapshot, it.destination_uid
+           FROM intent_targets it
+           JOIN intents i ON i.id = it.intent_id
+           WHERE i.tool = 'hold_messages' AND i.status = 'executed'`
+        )
+        .all() as Array<{ intent_id: string; account_id: string; uid: number; envelope_snapshot: string | null; destination_uid: number | null }>;
+      const byKey = new Map<string, { intent_id: string; original_mailbox: string; destination_uid: number | null }>();
+      for (const r of rows) {
+        const snap = r.envelope_snapshot ? JSON.parse(r.envelope_snapshot) : null;
+        if (snap?.original_mailbox) {
+          byKey.set(`${r.account_id}:${r.uid}`, {
+            intent_id: r.intent_id,
+            original_mailbox: snap.original_mailbox,
+            destination_uid: r.destination_uid ?? null,
+          });
+        }
+      }
+
+      const moved: Array<{ uid: number; account_id: string; destination_mailbox: string }> = [];
+      const errors: Array<{ uid: number; account_id: string; reason: string }> = [];
+      const reverses = new Set<string>();
+      // Track uidMaps per account for restore intent target persistence
+      const restoreUidMaps = new Map<string, Map<number, number>>();
+
+      for (const [accountId, list] of Object.entries(grouped)) {
+        await this.pool.withConnection(accountId, async (imap) => {
+          const holding = await imap.getMailboxPath('holding');
+          const acctUidMap = new Map<number, number>();
+          for (const t of list) {
+            const entry = byKey.get(`${accountId}:${t.uid}`);
+            if (!entry) {
+              errors.push({ uid: t.uid, account_id: accountId, reason: 'original_mailbox unknown (not in ledger)' });
+              continue;
+            }
+            // Use destination_uid (actual UID in holding) if available; fall back to uid for back-compat
+            const holdingUid = entry.destination_uid ?? t.uid;
+            if (!dryRun) {
+              const { uidMap } = await imap.moveMessages([holdingUid], holding, entry.original_mailbox);
+              // Map the restored-to UID back under the source uid key for persistence
+              const restoredUid = uidMap.get(holdingUid) ?? holdingUid;
+              acctUidMap.set(t.uid, restoredUid);
+            }
+            moved.push({ uid: t.uid, account_id: accountId, destination_mailbox: entry.original_mailbox });
+            reverses.add(entry.intent_id);
+          }
+          if (!dryRun) restoreUidMaps.set(accountId, acctUidMap);
+        });
+      }
+
+      if (!dryRun && reverses.size > 0) {
+        linkReversal(this.db, { restoreIntentId: intent.id, reverses: [...reverses] });
+      }
+
+      // Persist targets so the rehold_messages undo knows where messages landed.
+      // destination_uid records the UID of the message after moving back to original_mailbox,
+      // so a subsequent re-hold can find the message even if the IMAP server remapped UIDs.
+      if (!dryRun && moved.length > 0) {
+        insertIntentTargets(this.db, intent.id, moved.map((m) => {
+          const acctUidMap = restoreUidMaps.get(m.account_id);
+          const destinationUid = acctUidMap?.get(m.uid) ?? null;
+          return {
+            account_id: m.account_id,
+            uid: m.uid,
+            mailbox: m.destination_mailbox,
+            envelope_snapshot: { subject: '', from: '', original_mailbox: m.destination_mailbox },
+            destination_uid: destinationUid ?? undefined,
+          };
+        }));
+      }
+
+      const payload: {
+        dry_run: boolean;
+        moved: typeof moved;
+        errors: typeof errors;
+        reversible?: true;
+        undo_hint?: { intent_id: string; method: string; window_expires_at: string };
+      } = {
+        dry_run: dryRun,
+        moved,
+        errors,
+      };
+      if (!dryRun) {
+        const restoreHint = buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at });
+        if (restoreHint) Object.assign(payload, restoreHint);
+      }
+      return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
+    }
+
+    // Read-only DB lookup: return full intent record with targets and reversal links
+    if (intent.tool === 'get_intent') {
+      const id = intent.params.intent_id as string;
+      const row = getIntent(this.db, id);
+      if (!row) {
+        return [{ type: 'text', text: JSON.stringify({ error: 'intent not found', intent_id: id }) }];
+      }
+      const targets = getIntentTargets(this.db, id).map((t) => ({
+        uid: t.uid,
+        account_id: t.account_id,
+        mailbox: t.mailbox,
+        subject: t.envelope_snapshot?.subject ?? null,
+        from: t.envelope_snapshot?.from ?? null,
+      }));
+      const links = getReversalLinks(this.db, id);
+      const payload: Record<string, unknown> = {
+        id: row.id,
+        type: row.tool,
+        created_at: row.created_at,
+        account_id: row.account_id,
+        status: row.status,
+        targets,
+      };
+      if (links.reverses.length > 0) payload.reverses_intent_id = links.reverses;
+      if (links.reversed_by) payload.reversed_by_intent_id = links.reversed_by;
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
 
@@ -834,7 +1061,11 @@ export class Executor {
       const mailbox = target.mailbox ?? 'INBOX';
       return this.pool.withConnection(target.account_id, async (imap) => {
         const msg = await imap.fetchMessage(mailbox, target.uid);
-        return [{ type: 'text', text: JSON.stringify(msg, null, 2) }];
+        // Attach a snippet derived from the already-fetched body — no extra IMAP call.
+        const bodyContent = msg.bodyText ?? '';
+        const snippet = extractSnippetFromPart({ type: 'text/plain', content: bodyContent });
+        const payload = { ...msg, snippet };
+        return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
       });
     }
 
@@ -851,15 +1082,14 @@ export class Executor {
             references: intent.params.references as string[] | undefined,
           });
           const result = await imap.createDraft(raw);
-          return [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                draft_id: result.uid,
-                message: 'Draft created',
-              }),
-            },
-          ];
+          // Persist draft_id into intent params so performUndo can read it via intent.params.draft_id
+          intent.params = { ...intent.params, draft_id: result.uid };
+          this.db.prepare('UPDATE intents SET params = ? WHERE id = ?')
+            .run(JSON.stringify(intent.params), intent.id);
+          const draftPayload: Record<string, unknown> = { draft_id: result.uid, message: 'Draft created' };
+          const draftHint = buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at });
+          if (draftHint) Object.assign(draftPayload, draftHint);
+          return [{ type: 'text', text: JSON.stringify(draftPayload) }];
         }
 
         case 'unsubscribe_sender': {
@@ -872,12 +1102,10 @@ export class Executor {
             signal: createTimedAbortSignal(),
             headers,
           });
-          return [
-            {
-              type: 'text',
-              text: `Unsubscribe request sent (HTTP ${response.status})`,
-            },
-          ];
+          const unsubPayload: Record<string, unknown> = { message: `Unsubscribe request sent (HTTP ${response.status})` };
+          const unsubHint = buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at });
+          if (unsubHint) Object.assign(unsubPayload, unsubHint);
+          return [{ type: 'text', text: JSON.stringify(unsubPayload) }];
         }
 
         default:
@@ -917,19 +1145,69 @@ export class Executor {
       return;
     }
 
-    // Multi-account quarantine undo: group targets by account, restore to inbox
+    // Multi-account hold undo: group targets by account, restore to inbox
+    // Use destination_uid from ledger so we find the correct UID in holding.
     if (undoOp.reverseAction === 'move_back_to_inbox') {
       const targets = intent.params.targets as Target[];
       const grouped = parseTargets(targets);
+      const ledgerTargets = getIntentTargets(this.db, intent.id);
+      const ledgerByKey = new Map<string, number | null>();
+      for (const lt of ledgerTargets) {
+        ledgerByKey.set(`${lt.account_id}:${lt.uid}`, lt.destination_uid);
+      }
 
       for (const [accountId, list] of Object.entries(grouped)) {
         await this.pool.withConnection(accountId, async (imap) => {
-          const quarantine = await imap.getMailboxPath('quarantine');
+          const holding = await imap.getMailboxPath('holding');
           const inbox = await imap.getMailboxPath('inbox');
-          const uids = list.map((t) => t.uid);
-          await imap.moveMessages(uids, quarantine, inbox);
+          // Build list of actual UIDs in holding (using destination_uid if available)
+          const holdingUids = list.map((t) => {
+            const destUid = ledgerByKey.get(`${accountId}:${t.uid}`);
+            return destUid ?? t.uid;
+          });
+          await imap.moveMessages(holdingUids, holding, inbox);
         });
       }
+      return;
+    }
+
+    // restore_messages undo: re-hold each UID back to the holding folder.
+    // Each target row has:
+    //   - uid: the agent-facing (source) UID
+    //   - destination_uid: the actual UID after restore moved the message to original_mailbox
+    //     (may differ from uid if IMAP server remapped on move)
+    //   - envelope_snapshot.original_mailbox / mailbox: the mailbox where the message now lives
+    if (undoOp.reverseAction === 'rehold_messages') {
+      const targets = getIntentTargets(this.db, intent.id);
+      const byAccount = new Map<string, Array<{ uid: number; currentMailbox: string }>>();
+      for (const t of targets) {
+        const list = byAccount.get(t.account_id) ?? [];
+        // Use destination_uid (actual UID in original_mailbox) if available; fall back to uid
+        const actualUid = t.destination_uid ?? t.uid;
+        list.push({ uid: actualUid, currentMailbox: t.envelope_snapshot?.original_mailbox ?? t.mailbox });
+        byAccount.set(t.account_id, list);
+      }
+      for (const [accountId, list] of byAccount) {
+        await this.pool.withConnection(accountId, async (imap) => {
+          const holding = await imap.getMailboxPath('holding');
+          for (const { uid, currentMailbox } of list) {
+            await imap.moveMessages([uid], currentMailbox, holding);
+          }
+        });
+      }
+      return;
+    }
+
+    // draft_reply undo: delete the draft from the Drafts folder
+    if (undoOp.reverseAction === 'delete_draft') {
+      const draftId = intent.params.draft_id as number | undefined;
+      if (draftId === undefined) {
+        throw new Error('delete_draft: no draft_id in intent params');
+      }
+      await this.pool.withConnection(intent.account_id, async (imap) => {
+        const draftsMailbox = await imap.getMailboxPath('drafts');
+        await imap.deleteMessage(draftsMailbox, draftId);
+      });
       return;
     }
 

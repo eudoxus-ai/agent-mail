@@ -16,6 +16,7 @@ tools:
   label_thread:        { risk: low, gate: ungated, reversible: true }
   get_pending_actions: { risk: none, gate: ungated, reversible: false }
   get_audit_log:       { risk: none, gate: ungated, reversible: false }
+  get_intent:          { risk: none, gate: ungated, reversible: false }
   undo_intent:         { risk: low, gate: ungated, reversible: false }
 
   unsubscribe_sender:
@@ -24,13 +25,19 @@ tools:
     reversible: false
     note: "HTTP List-Unsubscribe only. Mailto-based unsubscribes route through queue_send."
 
-  quarantine_thread:
+  hold_messages:
     risk: medium
     gate: configurable
     default: ungated
     reversible: true
     override:
       when_thread_has_replies: approval_required
+
+  restore_messages:
+    risk: low
+    gate: configurable
+    default: ungated
+    reversible: true
 
   queue_send:
     risk: high

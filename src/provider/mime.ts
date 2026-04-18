@@ -126,6 +126,37 @@ function stripSignature(text: string): string {
   return text.slice(0, match.index ?? text.length);
 }
 
+// ─── Part-based snippet extraction ───────────────────────────────────────────
+// Used by fetchSnippet to strip and truncate a fetched body part.
+
+export interface SnippetSource { type: 'text/plain' | 'text/html'; content: string }
+
+/**
+ * Extract a ~500-char text preview from a pre-fetched body part.
+ * Strips HTML tags/entities when type is text/html.
+ * Returns '' for null/undefined input. Never throws.
+ */
+export function extractSnippetFromPart(src: SnippetSource | null | undefined): string {
+  if (!src) return '';
+  try {
+    const text = src.type === 'text/html'
+      ? src.content.replace(/<style[\s\S]*?<\/style>/gi, ' ')
+          .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/&nbsp;/gi, ' ')
+          .replace(/&amp;/g, '&')
+          .replace(/&lt;/g, '<')
+          .replace(/&gt;/g, '>')
+          .replace(/&quot;/g, '"')
+          .replace(/\s+/g, ' ')
+          .trim()
+      : src.content.replace(/\s+/g, ' ').trim();
+    return text.slice(0, 500);
+  } catch {
+    return '';
+  }
+}
+
 function htmlToText(html: string): string {
   return html
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')

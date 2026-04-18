@@ -95,7 +95,7 @@ export function createRouter(deps: RouterDeps): Router {
     // quarantine tab would offer a broken Undo action.
     const quarantined = deps.db.prepare(`
       SELECT * FROM intents
-      WHERE tool = 'quarantine_thread'
+      WHERE tool = 'hold_messages'
         AND status = 'executed'
         AND COALESCE(json_extract(params, '$.dry_run'), 0) = 0
         AND id NOT IN (

@@ -24,8 +24,10 @@ export function getUndoExpiry(tool: string): string | null {
   const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 
   switch (tool) {
-    case 'quarantine_thread':
+    case 'hold_messages':
     case 'label_thread':
+    case 'restore_messages':
+    case 'draft_reply':
       return new Date(Date.now() + THIRTY_DAYS_MS).toISOString();
     default:
       return null;
@@ -34,10 +36,14 @@ export function getUndoExpiry(tool: string): string | null {
 
 function getReversAction(tool: string): string {
   switch (tool) {
-    case 'quarantine_thread':
+    case 'hold_messages':
       return 'move_back_to_inbox';
     case 'label_thread':
       return 'reverse_label';
+    case 'restore_messages':
+      return 'rehold_messages';
+    case 'draft_reply':
+      return 'delete_draft';
     case 'unsubscribe_sender':
       return 'not_reversible';
     case 'queue_send':

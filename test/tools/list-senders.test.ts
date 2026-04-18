@@ -47,5 +47,9 @@ describe('list_senders', () => {
     expect(row.sample_uids).toEqual([1, 2]);
     expect(row.has_unsubscribe).toBe(true);
     expect(row.account_id).toBe('a@x.com');
+    expect(typeof row.is_list_mail_ratio).toBe('number');
+    expect(row.is_list_mail_ratio).toBeGreaterThanOrEqual(0);
+    expect(row.is_list_mail_ratio).toBeLessThanOrEqual(1);
+    expect(row.is_automated_ratio).toBeUndefined();
   });
 });

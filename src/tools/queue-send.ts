@@ -13,7 +13,7 @@ const queueSendSchema = z.object({
 
 export const queueSendTool: ToolDefinition = {
   name: 'queue_send',
-  description: 'Queue an email for sending. This ALWAYS requires human approval before the email is actually sent. You can provide a draft_id (from draft_reply) or a raw to/subject/body.',
+  description: 'Queue an email for human review. ALWAYS requires human approval. This server cannot send mail; queued messages require explicit human approval through a separate flow before transmission. You can provide a draft_id (from draft_reply) or a raw to/subject/body.',
   inputSchema: queueSendSchema,
   validate(params) {
     const parsed = queueSendSchema.parse(params);
@@ -37,7 +37,7 @@ export const queueSendTool: ToolDefinition = {
 
     return parsed;
   },
-  annotations: { destructiveHint: true },
+  annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
   async execute() {
     return { type: 'gated' };
   },

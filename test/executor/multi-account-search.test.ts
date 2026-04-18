@@ -24,6 +24,7 @@ function makeAccounts(): AccountConfig[] {
 function fakeImap(searchResults: any[]) {
   return {
     search: vi.fn(async () => searchResults),
+    fetchSnippet: vi.fn(async () => ''),
   };
 }
 
@@ -134,6 +135,128 @@ describe('search_threads multi-account', () => {
     expect(payload.accounts_available.sort()).toEqual(['a@x.com', 'b@y.com']);
     expect(pool.withConnection).toHaveBeenCalledTimes(1);
     expect(pool.withConnection).toHaveBeenCalledWith('a@x.com', expect.any(Function));
+  });
+
+  it('populates snippet via fetchSnippet when include_snippets: true and snippet is empty', async () => {
+    const accounts = makeAccounts();
+    const imapA = {
+      search: vi.fn(async () => [{
+        uid: 5,
+        envelope: {
+          message_id: 'm5',
+          subject: 'Test snippet',
+          from: { address: 'sender@x.com', name: null },
+          date: '2026-04-15T00:00:00Z',
+        },
+        snippet: '',
+        flags: [],
+        list_id: null,
+        list_unsubscribe: null,
+      }]),
+      fetchSnippet: vi.fn(async () => 'This is the body preview text.'),
+    };
+    const pool = makeFakePool({ 'a@x.com': imapA, 'b@y.com': { search: vi.fn(async () => []), fetchSnippet: vi.fn(async () => '') } });
+
+    const executor = new Executor({
+      db: openDatabase(':memory:'),
+      accounts,
+      pool: pool as any,
+      logger,
+    });
+
+    const { result } = await executor.executeImmediate({
+      tool: 'search_threads',
+      toolParams: { account_ids: ['a@x.com'], include_snippets: true },
+      accountId: 'a@x.com',
+      agentId: 'test',
+      risk: 'none',
+    });
+
+    const payload = JSON.parse(result[0].text);
+    expect(payload.results).toHaveLength(1);
+    expect(payload.results[0].snippet).toBe('This is the body preview text.');
+    expect(imapA.fetchSnippet).toHaveBeenCalledWith('INBOX', 5);
+  });
+
+  it('does not call fetchSnippet when include_snippets is omitted (default fast path)', async () => {
+    const accounts = makeAccounts();
+    const imapA = {
+      search: vi.fn(async () => [{
+        uid: 5,
+        envelope: {
+          message_id: 'm5',
+          subject: 'Test snippet omitted',
+          from: { address: 'sender@x.com', name: null },
+          date: '2026-04-15T00:00:00Z',
+        },
+        snippet: '',
+        flags: [],
+        list_id: null,
+        list_unsubscribe: null,
+      }]),
+      fetchSnippet: vi.fn(async () => 'Should not be called'),
+    };
+    const pool = makeFakePool({ 'a@x.com': imapA, 'b@y.com': { search: vi.fn(async () => []), fetchSnippet: vi.fn(async () => '') } });
+
+    const executor = new Executor({
+      db: openDatabase(':memory:'),
+      accounts,
+      pool: pool as any,
+      logger,
+    });
+
+    const { result } = await executor.executeImmediate({
+      tool: 'search_threads',
+      toolParams: { account_ids: ['a@x.com'] },
+      accountId: 'a@x.com',
+      agentId: 'test',
+      risk: 'none',
+    });
+
+    const payload = JSON.parse(result[0].text);
+    expect(payload.results).toHaveLength(1);
+    expect(payload.results[0].snippet).toBe('');
+    expect(imapA.fetchSnippet).not.toHaveBeenCalled();
+  });
+
+  it('does not call fetchSnippet when include_snippets: true but snippet is already non-empty', async () => {
+    const accounts = makeAccounts();
+    const imapA = {
+      search: vi.fn(async () => [{
+        uid: 7,
+        envelope: {
+          message_id: 'm7',
+          subject: 'Already has snippet',
+          from: { address: 'sender@x.com', name: null },
+          date: '2026-04-15T00:00:00Z',
+        },
+        snippet: 'Pre-existing snippet text',
+        flags: [],
+        list_id: null,
+        list_unsubscribe: null,
+      }]),
+      fetchSnippet: vi.fn(async () => 'Should not be called'),
+    };
+    const pool = makeFakePool({ 'a@x.com': imapA, 'b@y.com': { search: vi.fn(async () => []), fetchSnippet: vi.fn(async () => '') } });
+
+    const executor = new Executor({
+      db: openDatabase(':memory:'),
+      accounts,
+      pool: pool as any,
+      logger,
+    });
+
+    const { result } = await executor.executeImmediate({
+      tool: 'search_threads',
+      toolParams: { account_ids: ['a@x.com'], include_snippets: true },
+      accountId: 'a@x.com',
+      agentId: 'test',
+      risk: 'none',
+    });
+
+    const payload = JSON.parse(result[0].text);
+    expect(payload.results[0].snippet).toBe('Pre-existing snippet text');
+    expect(imapA.fetchSnippet).not.toHaveBeenCalled();
   });
 
   it('reports per-account errors without failing the call', async () => {

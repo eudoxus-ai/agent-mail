@@ -7,6 +7,8 @@ import {
   updateIntentStatus,
   getPendingIntents,
   getIntentsByStatus,
+  linkReversal,
+  getReversalLinks,
 } from '../../src/ledger/intents.js';
 
 let db: Database;
@@ -170,5 +172,47 @@ describe('getIntentsByStatus', () => {
     const failed = getIntentsByStatus(db, 'failed');
     expect(failed).toHaveLength(1);
     expect(failed[0].id).toBe(intent.id);
+  });
+});
+
+describe('reversal linking', () => {
+  it('links a restore intent back to one or more hold intents', () => {
+    const db = openDatabase(':memory:');
+    db.prepare(
+      `INSERT INTO intents (id, account_id, tool, params, risk, status)
+       VALUES ('hold-1', 'a@x.com', 'hold_messages', '{}', 'medium', 'executed')`
+    ).run();
+    db.prepare(
+      `INSERT INTO intents (id, account_id, tool, params, risk, status)
+       VALUES ('hold-2', 'a@x.com', 'hold_messages', '{}', 'medium', 'executed')`
+    ).run();
+    db.prepare(
+      `INSERT INTO intents (id, account_id, tool, params, risk, status)
+       VALUES ('restore-1', 'a@x.com', 'restore_messages', '{}', 'medium', 'executed')`
+    ).run();
+
+    linkReversal(db, { restoreIntentId: 'restore-1', reverses: ['hold-1', 'hold-2'] });
+
+    const restoreLinks = getReversalLinks(db, 'restore-1');
+    expect(restoreLinks.reverses).toEqual(['hold-1', 'hold-2']);
+    expect(restoreLinks.reversed_by).toBeNull();
+
+    const holdLinks = getReversalLinks(db, 'hold-1');
+    expect(holdLinks.reverses).toEqual([]);
+    expect(holdLinks.reversed_by).toBe('restore-1');
+  });
+
+  it('returns empty links for intents with no reversal relationship', () => {
+    const db = openDatabase(':memory:');
+    db.prepare(
+      `INSERT INTO intents (id, account_id, tool, params, risk, status)
+       VALUES ('i1', 'a@x.com', 'hold_messages', '{}', 'medium', 'executed')`
+    ).run();
+    expect(getReversalLinks(db, 'i1')).toEqual({ reverses: [], reversed_by: null });
+  });
+
+  it('returns empty links for unknown intent id', () => {
+    const db = openDatabase(':memory:');
+    expect(getReversalLinks(db, 'missing')).toEqual({ reverses: [], reversed_by: null });
   });
 });

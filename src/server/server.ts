@@ -19,13 +19,26 @@ import { unsubscribeSenderTool } from '../tools/unsubscribe-sender.js';
 import { getPendingActionsTool } from '../tools/get-pending-actions.js';
 import { getAuditLogTool } from '../tools/get-audit-log.js';
 import { queueSendTool } from '../tools/queue-send.js';
-import { quarantineMessagesTool, quarantineThreadTool } from '../tools/quarantine-thread.js';
+import { holdMessagesTool } from '../tools/hold-messages.js';
+import { restoreMessagesTool } from '../tools/restore-messages.js';
 import { undoIntentTool } from '../tools/undo-intent.js';
 import { getOverviewTool, runGetOverview } from '../tools/get-overview.js';
 import { listSendersTool } from '../tools/list-senders.js';
 import { listMailboxesTool } from '../tools/list-mailboxes.js';
+import { getIntentTool } from '../tools/get-intent.js';
 
+import { runStartupMigrations } from './startup.js';
 import type { ToolDefinition } from '../types.js';
+
+const SERVER_PREAMBLE = `agent-mail design contract. This server is built so that no action it exposes can cause irreversible harm. Every mutation (hold, label, draft) is reversible for 30 days via \`undo_intent\` or \`restore_messages\`, and every action is recorded in \`get_audit_log\`. Sending email and permanent deletion are deliberately not exposed — those operations require a separate human-in-the-loop flow outside this server. Agents should treat this as a low-stakes environment: prefer acting and reconciling afterward over asking permission per action. Over-holding-then-restoring is a normal interaction pattern, not a failure mode.`;
+
+export function buildServerOptions() {
+  return {
+    name: 'agent-mail',
+    version: '0.1.0',
+    instructions: SERVER_PREAMBLE,
+  };
+}
 
 const ALL_TOOLS: ToolDefinition[] = [
   searchThreadsTool,
@@ -36,12 +49,13 @@ const ALL_TOOLS: ToolDefinition[] = [
   getPendingActionsTool,
   getAuditLogTool,
   queueSendTool,
-  quarantineMessagesTool,
-  quarantineThreadTool, // deprecated alias for quarantine_messages
+  holdMessagesTool,
+  restoreMessagesTool,
   undoIntentTool,
   getOverviewTool,
   listSendersTool,
   listMailboxesTool,
+  getIntentTool,
 ];
 
 export interface McpServerBundle {
@@ -98,12 +112,23 @@ export async function createMcpServer(): Promise<McpServerBundle> {
   // Construct IMAP connection pool
   const pool = new ImapConnectionPool({ accounts, logger });
 
+  // Run holding-folder migration for each account at startup
+  try {
+    const migrationResults = await runStartupMigrations({ pool, accounts });
+    for (const [accountId, outcome] of Object.entries(migrationResults)) {
+      logger.info(`holding-folder migration [${accountId}]: ${outcome.action}${'moved' in outcome ? ` (${outcome.moved} messages)` : ''}`);
+    }
+  } catch (err) {
+    logger.warn(`holding-folder migration failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
   // Create executor
   const executor = new Executor({ db, accounts, pool, logger });
 
   // Create MCP server
+  const serverOptions = buildServerOptions();
   const server = new McpServer(
-    { name: 'agent-mail', version: '0.1.0' },
+    serverOptions,
     { capabilities: { tools: {} } }
   );
 

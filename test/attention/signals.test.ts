@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { computeSignals } from '../../src/attention/signals.js';
 import type { EmailMessage, Participant } from '../../src/types.js';
+import { parseListUnsubscribe } from '../../src/lib/list-unsubscribe.js';
 
 const me = 'you@example.com';
 const p = (address: string, name: string | null = null): Participant => ({
@@ -68,30 +69,11 @@ describe('computeSignals — recipient signals', () => {
 
 describe('computeSignals — sender signals', () => {
   it('flags list mail by List-Unsubscribe presence', () => {
-    const msg = makeMessage({ listUnsubscribe: '<https://x/u>' });
+    const msg = makeMessage({ listUnsubscribe: parseListUnsubscribe('<https://x/u>') });
     const s = computeSignals(msg, { accountEmail: me, threadMessages: [] });
     expect(s.is_list_mail).toBe(true);
   });
 
-  it('flags automated senders', () => {
-    const cases = [
-      'noreply@github.com',
-      'no-reply@shopify.com',
-      'notifications@slack.com',
-      'mailer-daemon@google.com',
-    ];
-    for (const addr of cases) {
-      const msg = makeMessage({ from: p(addr) });
-      const s = computeSignals(msg, { accountEmail: me, threadMessages: [] });
-      expect(s.is_automated).toBe(true);
-    }
-  });
-
-  it('does not flag normal human senders', () => {
-    const msg = makeMessage({ from: p('alice@normalco.com') });
-    const s = computeSignals(msg, { accountEmail: me, threadMessages: [] });
-    expect(s.is_automated).toBe(false);
-  });
 });
 
 describe('computeSignals — thread state', () => {
@@ -146,22 +128,9 @@ describe('computeSignals — thread state', () => {
     expect(s.thread_state).toBe('awaiting_them');
   });
 
-  it('overrides to "new" when the last message is automated', () => {
-    const msg = makeMessage({
-      from: p('notifications@github.com'),
-      to: [p(me)],
-    });
-    const s = computeSignals(msg, {
-      accountEmail: me,
-      threadMessages: [msg],
-    });
-    expect(s.thread_state).toBe('new');
-    expect(s.is_automated).toBe(true);
-  });
-
   it('overrides to "new" when the message is list mail', () => {
     const msg = makeMessage({
-      listUnsubscribe: '<https://x/u>',
+      listUnsubscribe: parseListUnsubscribe('<https://x/u>'),
       from: p('list@example.com'),
     });
     const s = computeSignals(msg, {

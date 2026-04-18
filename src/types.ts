@@ -3,6 +3,8 @@ import type { Database } from './ledger/sqlite.js';
 import type { ImapFlow } from 'imapflow';
 import type { Transporter } from 'nodemailer';
 import type { Logger } from './logger.js';
+import type { ParsedUnsubscribe } from './lib/list-unsubscribe.js';
+export type { ParsedUnsubscribe };
 
 // === Account ===
 
@@ -148,7 +150,7 @@ export interface EmailMessage {
   inReplyTo?: string;
   references: string[];
   flags: string[];
-  listUnsubscribe?: string;
+  listUnsubscribe?: ParsedUnsubscribe;
   mailbox: string;
 }
 

@@ -9,7 +9,7 @@ export const readThreadTool: ToolDefinition = {
   inputSchema: z.object({
     target: TargetSchema.describe('Account-qualified message reference'),
   }),
-  annotations: { readOnlyHint: true },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   async execute() {
     return { type: 'immediate', content: [] };
   },

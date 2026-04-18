@@ -323,7 +323,7 @@ describe('runGetOverview — all categories', () => {
           uids.map((uid) => ({
             uid,
             messageId: `<m${uid}@x.com>`,
-            from: { address: 'notifications@github.com', name: null },
+            from: { address: 'list@newsletter.com', name: null },
             to: [{ address: 'you@example.com', name: null }],
             cc: [],
             date: '2026-04-12T10:00:00Z',
@@ -332,8 +332,8 @@ describe('runGetOverview — all categories', () => {
             references: [],
             flags: [],
             mailbox: 'INBOX',
-            snippet: 'pr notification',
-            listUnsubscribe: undefined,
+            snippet: 'newsletter',
+            listUnsubscribe: '<https://newsletter.com/unsub>',
           }))
         ),
         fetchThreadContext: vi.fn(async () => []),
@@ -346,8 +346,122 @@ describe('runGetOverview — all categories', () => {
       input: { include: ['awaiting_you'] },
     });
 
-    // Automated notifications should NOT be awaiting_you even though UNANSWERED
+    // List mail should NOT be awaiting_you even though UNANSWERED
     expect(result.accounts[0].threads).toHaveLength(0);
+  });
+});
+
+describe('runGetOverview — recommendations', () => {
+  it('sets recommendations when >30 distinct senders each have >=4 threads', async () => {
+    const pool = new ImapConnectionPool({
+      accounts: [personal],
+      logger: createLogger('cli', { minLevel: 'error' }),
+    });
+
+    // 31 distinct senders, each appearing as the from address on 4 UIDs
+    const SENDER_COUNT = 31;
+    const MSGS_PER_SENDER = 4;
+    const allUids: number[] = [];
+    const uidToSender: Record<number, string> = {};
+    let uid = 1;
+    for (let s = 0; s < SENDER_COUNT; s++) {
+      for (let m = 0; m < MSGS_PER_SENDER; m++) {
+        uidToSender[uid] = `sender${s}@example.com`;
+        allUids.push(uid);
+        uid++;
+      }
+    }
+
+    accountImapBehavior.personal = {
+      imap: {
+        searchUids: vi.fn(async (_m: string, criteria: any) => {
+          if (criteria.unseen) return allUids;
+          return [];
+        }),
+        fetchEnvelopes: vi.fn(async (_m: string, uids: number[]) =>
+          uids.map((u) => ({
+            uid: u,
+            messageId: `<msg-${u}@example.com>`,
+            from: { address: uidToSender[u], name: null },
+            to: [{ address: 'you@example.com', name: null }],
+            cc: [],
+            date: '2026-04-12T10:00:00Z',
+            subject: `Subject ${u}`,
+            bodyText: '',
+            references: [],
+            flags: [],
+            mailbox: 'INBOX',
+            snippet: `snippet ${u}`,
+            listUnsubscribe: undefined,
+          }))
+        ),
+        fetchThreadContext: vi.fn(async () => []),
+      },
+    };
+
+    const result = await runGetOverview({
+      pool,
+      accounts: [personal],
+      input: { include: ['unread'], limit_per_category: SENDER_COUNT * MSGS_PER_SENDER },
+    });
+
+    expect(result.recommendations).toBeDefined();
+    expect(result.recommendations).toHaveLength(1);
+    expect(result.recommendations![0]).toContain('list_senders');
+  });
+
+  it('omits recommendations when senders are below threshold', async () => {
+    const pool = new ImapConnectionPool({
+      accounts: [personal],
+      logger: createLogger('cli', { minLevel: 'error' }),
+    });
+
+    // Only 5 distinct senders, each with 4 messages — well under 30
+    const allUids: number[] = [];
+    const uidToSender: Record<number, string> = {};
+    let uid = 1;
+    for (let s = 0; s < 5; s++) {
+      for (let m = 0; m < 4; m++) {
+        uidToSender[uid] = `sender${s}@example.com`;
+        allUids.push(uid);
+        uid++;
+      }
+    }
+
+    accountImapBehavior.personal = {
+      imap: {
+        searchUids: vi.fn(async (_m: string, criteria: any) => {
+          if (criteria.unseen) return allUids;
+          return [];
+        }),
+        fetchEnvelopes: vi.fn(async (_m: string, uids: number[]) =>
+          uids.map((u) => ({
+            uid: u,
+            messageId: `<msg-${u}@example.com>`,
+            from: { address: uidToSender[u], name: null },
+            to: [{ address: 'you@example.com', name: null }],
+            cc: [],
+            date: '2026-04-12T10:00:00Z',
+            subject: `Subject ${u}`,
+            bodyText: '',
+            references: [],
+            flags: [],
+            mailbox: 'INBOX',
+            snippet: `snippet ${u}`,
+            listUnsubscribe: undefined,
+          }))
+        ),
+        fetchThreadContext: vi.fn(async () => []),
+      },
+    };
+
+    const result = await runGetOverview({
+      pool,
+      accounts: [personal],
+      input: { include: ['unread'] },
+    });
+
+    expect(result.recommendations).toBeUndefined();
   });
 });
 

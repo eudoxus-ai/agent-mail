@@ -8,7 +8,7 @@ export const listMailboxesTool: ToolDefinition = {
   inputSchema: z.object({
     account_ids: z.array(z.string().min(1)).min(1).optional(),
   }),
-  annotations: { readOnlyHint: true },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   async execute() {
     return { type: 'immediate', content: [] };
   },
