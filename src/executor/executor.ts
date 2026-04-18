@@ -554,16 +554,27 @@ export class Executor {
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
 
+    // Account-qualified read: route by target.account_id, not intent.account_id
+    if (intent.tool === 'read_thread') {
+      const target = intent.params.target as {
+        account_id: string;
+        uid: number;
+        mailbox?: string;
+      };
+      const allIds = this.accounts.map((a) => a.id);
+      if (!allIds.includes(target.account_id)) {
+        throw new Error(`Unknown account_id in target: ${target.account_id}`);
+      }
+      const mailbox = target.mailbox ?? 'INBOX';
+      return this.pool.withConnection(target.account_id, async (imap) => {
+        const msg = await imap.fetchMessage(mailbox, target.uid);
+        return [{ type: 'text', text: JSON.stringify(msg, null, 2) }];
+      });
+    }
+
     // All other tools use IMAP via the pool (single-account principal)
     return this.pool.withConnection(intent.account_id, async (imap) => {
       switch (intent.tool) {
-        case 'read_thread': {
-          const uid = intent.params.uid as number;
-          const mailbox = (intent.params.mailbox as string) ?? 'INBOX';
-          const msg = await imap.fetchMessage(mailbox, uid);
-          return [{ type: 'text', text: JSON.stringify(msg, null, 2) }];
-        }
-
         case 'draft_reply': {
           const raw = buildDraftMessage({
             from: account.email,
