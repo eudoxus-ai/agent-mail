@@ -34,7 +34,14 @@ export async function startDaemon(port: number = 4242): Promise<void> {
     pollingIntervalMs: 3000,
     onNewIntent: (intent) => {
       logger.info(`New pending intent: ${intent.id} (${intent.tool})`);
-      notifyIntent(intent, port);
+      // Only notify for tools that actually require user approval.
+      // Other tools transition through 'pending' only momentarily before the
+      // executor marks them 'executing' — notifying on those is noise.
+      // Per src/policy/defaults.ts: queue_send is always gated; hold_messages
+      // gates when the target thread has prior replies.
+      if (intent.tool === 'queue_send' || intent.tool === 'hold_messages') {
+        notifyIntent(intent, port);
+      }
     },
   });
   watcher.start();
