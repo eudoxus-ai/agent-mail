@@ -43,7 +43,7 @@ describe('getAuditLog', () => {
     logAudit(db, { intent_id: i1.id, account_id: 'gmail', action: 'created', actor: 'claude' });
     logAudit(db, { intent_id: i2.id, account_id: 'icloud', action: 'created', actor: 'claude' });
 
-    const gmail = getAuditLog(db, { account_id: 'gmail' });
+    const gmail = getAuditLog(db, { account_ids: ['gmail'] });
     expect(gmail).toHaveLength(1);
     expect(gmail[0].account_id).toBe('gmail');
   });

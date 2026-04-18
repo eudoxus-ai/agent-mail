@@ -18,13 +18,14 @@ export function createRouter(deps: RouterDeps): Router {
 
   router.get('/pending', (req, res) => {
     const accountId = req.query.account_id as string | undefined;
-    const pending = getPendingIntents(deps.db, accountId);
+    const pending = getPendingIntents(deps.db, accountId ? [accountId] : undefined);
     res.json(pending);
   });
 
   router.get('/audit', (req, res) => {
+    const accountId = req.query.account_id as string | undefined;
     const entries = getAuditLog(deps.db, {
-      account_id: req.query.account_id as string | undefined,
+      account_ids: accountId ? [accountId] : undefined,
       limit: parseInt(req.query.limit as string, 10) || 50,
       offset: parseInt(req.query.offset as string, 10) || 0,
     });

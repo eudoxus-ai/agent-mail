@@ -24,7 +24,7 @@ export function logAudit(db: Database, p: LogAuditParams): void {
 
 export interface AuditFilters {
   intent_id?: string;
-  account_id?: string;
+  account_ids?: string[];
   tool?: string;
   limit?: number;
   offset?: number;
@@ -41,9 +41,10 @@ export function getAuditLog(
     conditions.push('a.intent_id = ?');
     params.push(filters.intent_id);
   }
-  if (filters?.account_id) {
-    conditions.push('a.account_id = ?');
-    params.push(filters.account_id);
+  if (filters?.account_ids && filters.account_ids.length > 0) {
+    const placeholders = filters.account_ids.map(() => '?').join(', ');
+    conditions.push(`a.account_id IN (${placeholders})`);
+    params.push(...filters.account_ids);
   }
   if (filters?.tool) {
     conditions.push('i.tool = ?');
