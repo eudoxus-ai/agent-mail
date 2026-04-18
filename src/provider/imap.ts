@@ -48,7 +48,14 @@ export class ImapProvider {
     mailbox: string,
     criteria: SearchCriteria,
     limit: number = 20
-  ): Promise<Array<{ uid: number; envelope: { message_id: string; subject: string; from: Participant; date: string }; snippet: string; flags: string[] }>> {
+  ): Promise<Array<{
+    uid: number;
+    envelope: { message_id: string; subject: string; from: Participant; date: string };
+    snippet: string;
+    flags: string[];
+    list_id: string | null;
+    list_unsubscribe: string | null;
+  }>> {
     const lock = await this.client.getMailboxLock(mailbox);
     try {
       const searchQuery: Record<string, unknown> = {};
@@ -77,6 +84,8 @@ export class ImapProvider {
         envelope: { message_id: string; subject: string; from: Participant; date: string };
         snippet: string;
         flags: string[];
+        list_id: string | null;
+        list_unsubscribe: string | null;
       }> = [];
 
       for await (const msg of this.client.fetch(
@@ -89,6 +98,8 @@ export class ImapProvider {
         },
         { uid: true }
       )) {
+        const sourceStr = msg.source?.toString('utf-8') ?? '';
+        const { listId, listUnsubscribe } = extractListHeadersFromSource(sourceStr);
         results.push({
           uid: msg.uid,
           envelope: {
@@ -99,6 +110,8 @@ export class ImapProvider {
           },
           snippet: extractSnippet(msg.source ?? Buffer.alloc(0)),
           flags: Array.from(msg.flags ?? []),
+          list_id: listId,
+          list_unsubscribe: listUnsubscribe,
         });
       }
 
@@ -436,6 +449,16 @@ function extractHeader(source: string, name: string): string | null {
   const regex = new RegExp(`^${name}:\\s*(.+?)(?:\\r?\\n(?!\\s)|$)`, 'im');
   const match = source.match(regex);
   return match ? match[1].trim() : null;
+}
+
+export function extractListHeadersFromSource(source: string): {
+  listId: string | null;
+  listUnsubscribe: string | null;
+} {
+  return {
+    listId: extractHeader(source, 'List-Id'),
+    listUnsubscribe: extractHeader(source, 'List-Unsubscribe'),
+  };
 }
 
 function extractBodyText(source: string): string {
