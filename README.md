@@ -6,7 +6,7 @@ An MCP server that gives AI agents guardrailed access to your email on macOS. Wo
 
 Every other email MCP server gives agents raw access to your inbox. agent-mail reshapes the API surface so dangerous actions don't exist:
 
-- **"Delete" becomes quarantine.** Messages move to a review folder. Reversible for 30 days.
+- **"Delete" becomes a hold.** Messages move to `agent-mail-holding`. Fully reversible for 30 days via `restore_messages` or `undo_intent`.
 - **"Send" requires approval.** Every outbound email goes through a human review queue.
 - **"Unsubscribe" just works.** Low-risk actions run immediately, no friction.
 - **Everything is logged.** Full audit trail of every action, by every agent, across every account.
@@ -189,7 +189,7 @@ Or if you prefer npx (after `npm link`):
 }
 ```
 
-Restart Claude Desktop. You should see agent-mail's 11 tools in the tool list.
+Restart Claude Desktop. You should see agent-mail's 13 tools in the tool list.
 
 ### Launch the reviewer UI once
 
@@ -244,7 +244,9 @@ Notifications are posted with `osascript` instead of `node-notifier`/`terminal-n
 | `get_pending_actions` | Check the approval queue (cross-account) | None | Immediate |
 | `get_audit_log` | View action history (cross-account) | None | Immediate |
 | `queue_send` | Queue an email for sending | High | **Always requires approval** |
-| `quarantine_thread` | Move targets to quarantine; supports `dry_run: true` to preview | Medium | Configurable |
+| `hold_messages` | Move targets to `agent-mail-holding`; reversible for 30 days; supports `dry_run: true` and `include_summary: true` | Medium | Configurable |
+| `restore_messages` | Move held messages back to their original mailbox using the ledger snapshot captured at hold time | Low | Immediate |
+| `get_intent` | Return the full record of a past intent: targets with captured subject/from, status, and reversal links; useful for partial-restore workflows | None | Immediate |
 | `undo_intent` | Reverse a previous action | Low | Immediate |
 
 ### Multi-account by default
@@ -264,7 +266,7 @@ Read tools (`search_threads`, `get_overview`, `get_audit_log`, `get_pending_acti
 
 ### Account-qualified targets
 
-Tools that act on specific messages (`read_thread`, `label_thread`, `quarantine_thread`) take account-qualified `Target` references:
+Tools that act on specific messages (`read_thread`, `label_thread`, `hold_messages`, `restore_messages`) take account-qualified `Target` references:
 
 ```json
 {
@@ -277,22 +279,34 @@ Tools that act on specific messages (`read_thread`, `label_thread`, `quarantine_
 
 `mailbox` defaults to `INBOX` per target. A single call can act across accounts; the executor groups by account internally.
 
-### Dry-run quarantine
+### Dry-run hold
 
-`quarantine_thread` accepts `dry_run: true` to preview what would happen without moving anything. The response shape is identical to a real run — same `total_messages`, same per-account/per-mailbox breakdown — so you can see the blast radius before committing. Dry-runs are recorded in the audit log (flagged with `dry_run: true`) but don't enter the undo ledger.
+`hold_messages` accepts `dry_run: true` to preview what would happen without moving anything. The response shape is identical to a real run — same `total_messages`, same per-account/per-mailbox breakdown — so you can see the blast radius before committing. Dry-runs are recorded in the audit log (flagged with `dry_run: true`) but don't enter the undo ledger.
+
+Pass `include_summary: true` (with or without `dry_run`) to receive a `moved` array with each message's `uid`, `account_id`, `subject`, `from`, and `original_mailbox` in the response.
+
+### Partial restore with `get_intent`
+
+After a `hold_messages` call you can restore just a subset of the held messages without undoing the whole batch:
+
+1. Call `get_intent` with the hold's `intent_id`. The response lists every target with its captured `subject` and `from`.
+2. Pick the UIDs you want to restore back to the inbox.
+3. Call `restore_messages` with only those targets. The response includes `reversible: true` and `undo_hint.method === 'undo_intent'`.
+
+`get_intent` also surfaces `reversed_by_intent_id` once a restore intent links back to the hold, so you can track the full reversal chain.
 
 ## Policy
 
 Edit `~/.agent-mail/policy.yaml` to customize which actions need approval. The default policy:
 
-- **Ungated:** search, read, overview, draft, label, unsubscribe, pending-actions, audit-log, undo
+- **Ungated:** search, read, overview, draft, label, unsubscribe, pending-actions, audit-log, get-intent, restore, undo
 - **Always gated:** send (every outbound email needs your approval)
-- **Configurable:** quarantine (ungated by default, gated when the thread has replies)
+- **Configurable:** hold (ungated by default, gated when the thread has replies)
 
-Example: to require approval for all quarantine actions:
+Example: to require approval for all hold actions:
 
 ```yaml
-quarantine_thread:
+hold_messages:
   risk: medium
   gate: always_gated
 ```
