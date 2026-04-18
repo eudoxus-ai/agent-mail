@@ -323,7 +323,7 @@ describe('runGetOverview — all categories', () => {
           uids.map((uid) => ({
             uid,
             messageId: `<m${uid}@x.com>`,
-            from: { address: 'notifications@github.com', name: null },
+            from: { address: 'list@newsletter.com', name: null },
             to: [{ address: 'you@example.com', name: null }],
             cc: [],
             date: '2026-04-12T10:00:00Z',
@@ -332,8 +332,8 @@ describe('runGetOverview — all categories', () => {
             references: [],
             flags: [],
             mailbox: 'INBOX',
-            snippet: 'pr notification',
-            listUnsubscribe: undefined,
+            snippet: 'newsletter',
+            listUnsubscribe: '<https://newsletter.com/unsub>',
           }))
         ),
         fetchThreadContext: vi.fn(async () => []),
@@ -346,7 +346,7 @@ describe('runGetOverview — all categories', () => {
       input: { include: ['awaiting_you'] },
     });
 
-    // Automated notifications should NOT be awaiting_you even though UNANSWERED
+    // List mail should NOT be awaiting_you even though UNANSWERED
     expect(result.accounts[0].threads).toHaveLength(0);
   });
 });

@@ -8,7 +8,6 @@ export interface MessageSignals {
 
   // ─── Sender signals ───
   is_list_mail: boolean;
-  is_automated: boolean;
 
   // ─── Thread signals ───
   thread_state: 'new' | 'awaiting_you' | 'awaiting_them' | 'resolved';
@@ -34,17 +33,6 @@ export interface SignalContext {
   threadMessages: EmailMessage[];
 }
 
-const AUTOMATED_LOCAL_PARTS = [
-  /^no-?reply$/i,
-  /^noreply[-._]/i,
-  /^notifications?$/i,
-  /^mailer-daemon$/i,
-  /^postmaster$/i,
-  /^bounce/i,
-  /^auto-?reply/i,
-  /^donotreply/i,
-];
-
 const SMALL_GROUP_THRESHOLD = 4;
 const BROADCAST_THRESHOLD = 10;
 
@@ -58,7 +46,6 @@ export function computeSignals(
   const isBulk = !directTo && !ccTo;
 
   const isListMail = Boolean(msg.listUnsubscribe);
-  const isAutomated = isAutomatedSender(msg.from.address);
 
   const threadMsgs = context.threadMessages;
   const threadParticipants = collectParticipants(threadMsgs);
@@ -73,8 +60,8 @@ export function computeSignals(
     const last = threadMsgs[threadMsgs.length - 1];
     threadState = last.from.address === me ? 'awaiting_them' : 'awaiting_you';
   }
-  // Override: notifications / list mail are never "awaiting you"
-  if (isListMail || isAutomated) {
+  // Override: list mail is never "awaiting you"
+  if (isListMail) {
     threadState = 'new';
   }
 
@@ -102,7 +89,6 @@ export function computeSignals(
     cc_to_me: ccTo,
     is_bulk: isBulk,
     is_list_mail: isListMail,
-    is_automated: isAutomated,
     thread_state: threadState,
     in_reply_to_your_message: inReplyToYourMessage,
     is_reply_in_thread_you_started: isReplyInThreadYouStarted,
@@ -115,11 +101,6 @@ export function computeSignals(
     mentions_you_by_name: null,
     urgency_score: null,
   };
-}
-
-export function isAutomatedSender(address: string): boolean {
-  const localPart = address.toLowerCase().split('@')[0] ?? '';
-  return AUTOMATED_LOCAL_PARTS.some((re) => re.test(localPart));
 }
 
 export function isListMail(

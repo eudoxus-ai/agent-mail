@@ -74,25 +74,6 @@ describe('computeSignals — sender signals', () => {
     expect(s.is_list_mail).toBe(true);
   });
 
-  it('flags automated senders', () => {
-    const cases = [
-      'noreply@github.com',
-      'no-reply@shopify.com',
-      'notifications@slack.com',
-      'mailer-daemon@google.com',
-    ];
-    for (const addr of cases) {
-      const msg = makeMessage({ from: p(addr) });
-      const s = computeSignals(msg, { accountEmail: me, threadMessages: [] });
-      expect(s.is_automated).toBe(true);
-    }
-  });
-
-  it('does not flag normal human senders', () => {
-    const msg = makeMessage({ from: p('alice@normalco.com') });
-    const s = computeSignals(msg, { accountEmail: me, threadMessages: [] });
-    expect(s.is_automated).toBe(false);
-  });
 });
 
 describe('computeSignals — thread state', () => {
@@ -145,19 +126,6 @@ describe('computeSignals — thread state', () => {
       threadMessages: [earlier, latest],
     });
     expect(s.thread_state).toBe('awaiting_them');
-  });
-
-  it('overrides to "new" when the last message is automated', () => {
-    const msg = makeMessage({
-      from: p('notifications@github.com'),
-      to: [p(me)],
-    });
-    const s = computeSignals(msg, {
-      accountEmail: me,
-      threadMessages: [msg],
-    });
-    expect(s.thread_state).toBe('new');
-    expect(s.is_automated).toBe(true);
   });
 
   it('overrides to "new" when the message is list mail', () => {

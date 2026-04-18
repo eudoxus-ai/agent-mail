@@ -232,7 +232,7 @@ describe('Executor.executeImmediate', () => {
     expect(audit.some((a) => a.action === 'executed')).toBe(true);
   });
 
-  it('decorates search_threads results with is_automated', async () => {
+  it('decorates search_threads results with is_list_mail', async () => {
     const { result } = await executor.executeImmediate({
       tool: 'search_threads',
       toolParams: { query: 'hello' },
@@ -244,9 +244,9 @@ describe('Executor.executeImmediate', () => {
     const parsed = JSON.parse(result[0].text);
     expect(parsed.results).toHaveLength(1);
     expect(parsed.results[0].uid).toBe(42);
-    expect(parsed.results[0].is_automated).toBe(true);
     expect(parsed.results[0].account_id).toBe('test');
     // Negative assertion — the stripped fields must NOT be present
+    expect(parsed.results[0].is_automated).toBeUndefined();
     expect(parsed.results[0].signals).toBeUndefined();
     expect(parsed.results[0].direct_to_me).toBeUndefined();
   });

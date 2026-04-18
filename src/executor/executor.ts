@@ -1,6 +1,6 @@
 import type { Database } from '../ledger/sqlite.js';
 import type { AccountConfig, Intent, RiskLevel } from '../types.js';
-import { isAutomatedSender, isListMail } from '../attention/signals.js';
+import { isListMail } from '../attention/signals.js';
 import type { Logger } from '../logger.js';
 import type { ImapConnectionPool } from '../provider/imap-pool.js';
 import {
@@ -46,7 +46,6 @@ interface SearchThreadResult {
   flags: string[];
   list_id: string | null;
   list_unsubscribe: string | null;
-  is_automated: boolean;
   is_list_mail: boolean;
   target: { account_id: string; uid: number; mailbox: string };
 }
@@ -523,7 +522,6 @@ export class Executor {
           ...r,
           list_id: r.list_id ?? null,
           list_unsubscribe: r.list_unsubscribe ?? null,
-          is_automated: isAutomatedSender(r.envelope.from.address),
           is_list_mail: isListMail(r.list_unsubscribe, r.list_id),
           target: { account_id: accountId, uid: r.uid, mailbox },
         }));
@@ -578,7 +576,7 @@ export class Executor {
       count: number;
       sample_uids: number[];
       has_unsubscribe: boolean;
-      is_automated_ratio: number;
+      is_list_mail_ratio: number;
       latest_date: string;
     }>;
   }> {
@@ -606,16 +604,16 @@ export class Executor {
           from: string;
           uids: number[];
           withUnsub: number;
-          automated: number;
+          listMail: number;
           latest: string;
         }>();
         for (const r of raw) {
           const addr = r.envelope.from.address;
           if (!addr) continue;
-          const g = groups.get(addr) ?? { from: addr, uids: [], withUnsub: 0, automated: 0, latest: '' };
+          const g = groups.get(addr) ?? { from: addr, uids: [], withUnsub: 0, listMail: 0, latest: '' };
           g.uids.push(r.uid);
           if (r.list_unsubscribe) g.withUnsub += 1;
-          if (isAutomatedSender(addr)) g.automated += 1;
+          if (r.list_unsubscribe) g.listMail += 1;
           if (!g.latest || new Date(r.envelope.date).getTime() > new Date(g.latest).getTime()) {
             g.latest = r.envelope.date;
           }
@@ -629,7 +627,7 @@ export class Executor {
             count: g.uids.length,
             sample_uids: g.uids.slice(0, sampleSize),
             has_unsubscribe: g.withUnsub > 0,
-            is_automated_ratio: g.automated / g.uids.length,
+            is_list_mail_ratio: g.listMail / g.uids.length,
             latest_date: g.latest,
           }));
       },

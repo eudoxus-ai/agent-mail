@@ -236,7 +236,7 @@ async function collectAccountBundle(deps: CollectDeps): Promise<OverviewAccountB
               accountEmail: deps.account.email,
               threadMessages: [env],
             });
-            if (signals.is_automated || signals.is_list_mail) continue;
+            if (signals.is_list_mail) continue;
           }
 
           const key = `${mailbox}:${uid}`;
