@@ -111,9 +111,7 @@ export class Executor {
     try {
       const result = await this.performAction(intent);
 
-      const isDryRun =
-        params.tool === 'quarantine_thread' &&
-        (params.toolParams.dry_run as boolean | undefined) === true;
+      const isDryRun = params.toolParams.dry_run === true;
 
       const undoToken = isDryRun
         ? null
