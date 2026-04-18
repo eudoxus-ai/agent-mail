@@ -2,8 +2,8 @@
  * Extract a short, readable snippet from a (possibly partial) message source.
  *
  * Handles text/plain root, multipart with text/plain first part, quoted-printable,
- * and strips quoted-reply tails and signatures. Returns empty string on any failure
- * (including HTML-only messages — that is a documented MVP limitation).
+ * and strips quoted-reply tails and signatures. Falls back to text/html parts
+ * when no text/plain alternative is available. Returns empty string on any failure.
  *
  * Never throws.
  */
@@ -17,25 +17,35 @@ export function extractSnippet(source: Buffer | string, maxLength = 200): string
     const contentType = getHeader(headers, 'content-type') ?? 'text/plain';
 
     let rawBody: string;
+    let isHtml = false;
     if (/^multipart\//i.test(contentType)) {
       const boundary = extractBoundary(contentType);
       if (!boundary) return '';
-      const plainPart = findTextPlainPart(body, boundary);
-      if (!plainPart) return '';
-      rawBody = plainPart;
+      const plain = findTextPart(body, boundary, /^text\/plain/i);
+      if (plain) {
+        rawBody = plain;
+      } else {
+        const html = findTextPart(body, boundary, /^text\/html/i);
+        if (!html) return '';
+        rawBody = html;
+        isHtml = true;
+      }
     } else if (/^text\/plain/i.test(contentType)) {
       const encoding = getHeader(headers, 'content-transfer-encoding') ?? '7bit';
       rawBody = decodeEncoding(body, encoding);
+    } else if (/^text\/html/i.test(contentType)) {
+      const encoding = getHeader(headers, 'content-transfer-encoding') ?? '7bit';
+      rawBody = decodeEncoding(body, encoding);
+      isHtml = true;
     } else {
-      // HTML-only or unknown — documented Y limitation
       return '';
     }
 
+    if (isHtml) rawBody = htmlToText(rawBody);
+
     const cleaned = stripQuotedReply(stripSignature(rawBody)).trim();
     if (!cleaned) return '';
-    return cleaned.length > maxLength
-      ? cleaned.slice(0, maxLength)
-      : cleaned;
+    return cleaned.length > maxLength ? cleaned.slice(0, maxLength) : cleaned;
   } catch {
     return '';
   }
@@ -62,8 +72,8 @@ function extractBoundary(contentType: string): string | null {
   return match ? match[1] : null;
 }
 
-/** Given a multipart body and its boundary, return the raw text of the first text/plain part. */
-function findTextPlainPart(body: string, boundary: string): string | null {
+/** Given a multipart body, its boundary, and a content-type regex, return the decoded text of the first matching part. */
+function findTextPart(body: string, boundary: string, ctRegex: RegExp): string | null {
   const delimiter = `--${boundary}`;
   const parts = body.split(delimiter).slice(1); // drop preamble
   for (const part of parts) {
@@ -71,7 +81,7 @@ function findTextPlainPart(body: string, boundary: string): string | null {
     const trimmed = part.replace(/^\r?\n/, '');
     const { headers, body: partBody } = splitHeadersBody(trimmed);
     const partCt = getHeader(headers, 'content-type') ?? '';
-    if (/^text\/plain/i.test(partCt)) {
+    if (ctRegex.test(partCt)) {
       const enc = getHeader(headers, 'content-transfer-encoding') ?? '7bit';
       return decodeEncoding(partBody, enc);
     }
@@ -114,4 +124,23 @@ function stripSignature(text: string): string {
   const match = text.match(/^-- \s*$/m);
   if (!match) return text;
   return text.slice(0, match.index ?? text.length);
+}
+
+function htmlToText(html: string): string {
+  return html
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|li|h[1-6]|tr)>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(parseInt(d, 10)))
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n');
 }
