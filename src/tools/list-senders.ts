@@ -14,7 +14,7 @@ export const listSendersTool: ToolDefinition = {
     sample_size: z.number().int().positive().max(20).optional().describe('UIDs to include per sender (default 5)'),
     scan_limit: z.number().int().positive().max(1000).optional().describe('Max messages per account to scan (default 500)'),
   }),
-  annotations: { readOnlyHint: true },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   async execute() {
     return { type: 'immediate', content: [] };
   },

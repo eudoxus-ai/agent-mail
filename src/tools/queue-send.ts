@@ -37,7 +37,7 @@ export const queueSendTool: ToolDefinition = {
 
     return parsed;
   },
-  annotations: { destructiveHint: true },
+  annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
   async execute() {
     return { type: 'gated' };
   },

@@ -8,6 +8,7 @@ export const unsubscribeSenderTool: ToolDefinition = {
     unsubscribe_url: z.string().url().describe('The List-Unsubscribe HTTP URL'),
     account_id: z.string().min(1).optional().describe('Account ID'),
   }),
+  annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
   async execute() {
     return { type: 'immediate', content: [] };
   },

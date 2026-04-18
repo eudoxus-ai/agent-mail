@@ -15,7 +15,7 @@ export const getAuditLogTool: ToolDefinition = {
     limit: z.number().int().nonnegative().max(200).optional().describe('Max entries (default: 50)'),
     offset: z.number().int().nonnegative().optional().describe('Pagination offset'),
   }),
-  annotations: { readOnlyHint: true },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   async execute(params, context) {
     const allIds = context.accounts.map((a) => a.id);
     const requestedIds = params.account_ids as string[] | undefined;

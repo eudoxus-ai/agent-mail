@@ -13,7 +13,7 @@ export const getPendingActionsTool: ToolDefinition = {
       .optional()
       .describe('Filter by account ids. Omit for all configured accounts.'),
   }),
-  annotations: { readOnlyHint: true },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   async execute(params, context) {
     const allIds = context.accounts.map((a) => a.id);
     const requestedIds = params.account_ids as string[] | undefined;

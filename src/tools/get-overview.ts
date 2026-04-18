@@ -36,7 +36,7 @@ export const getOverviewTool: ToolDefinition = {
       .optional()
       .describe('Max threads per category per account. Default 25.'),
   }),
-  annotations: { readOnlyHint: true },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   async execute() {
     return { type: 'immediate', content: [] };
   },

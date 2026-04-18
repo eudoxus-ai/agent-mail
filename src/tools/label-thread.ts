@@ -11,6 +11,7 @@ export const labelThreadTool: ToolDefinition = {
     action: z.enum(['add', 'remove']).describe('Whether to add or remove the label'),
     label: z.string().min(1).describe('Label/flag name (e.g. \\\\Flagged, \\\\Seen, or custom)'),
   }),
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
   async execute() {
     return { type: 'immediate', content: [] };
   },

@@ -7,6 +7,7 @@ export const undoIntentTool: ToolDefinition = {
   inputSchema: z.object({
     intent_id: z.string().uuid().describe('The intent ID to undo'),
   }),
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
   async execute() {
     return { type: 'immediate', content: [] };
   },

@@ -32,7 +32,7 @@ export const searchThreadsTool: ToolDefinition = {
       .optional()
       .describe('Max results per account (default: 20)'),
   }),
-  annotations: { readOnlyHint: true },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   async execute() {
     return { type: 'immediate', content: [] };
   },

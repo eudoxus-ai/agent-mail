@@ -12,6 +12,7 @@ export const draftReplyTool: ToolDefinition = {
     references: z.array(z.string().min(1)).min(1).optional().describe('Message-IDs in the thread chain'),
     account_id: z.string().min(1).optional().describe('Account to draft from'),
   }),
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
   async execute() {
     return { type: 'immediate', content: [] };
   },
