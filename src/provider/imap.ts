@@ -440,6 +440,29 @@ export class ImapProvider {
     return { uid: (result as any)?.uid ?? 0 };
   }
 
+  async mailboxExists(name: string): Promise<boolean> {
+    const mailboxes = await this.client.list();
+    return mailboxes.some((mb: any) => mb.path === name);
+  }
+
+  async renameMailbox(from: string, to: string): Promise<void> {
+    await this.client.mailboxRename(from, to);
+  }
+
+  async listMessageUids(mailbox: string): Promise<number[]> {
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      const result = await this.client.search({ all: true }, { uid: true });
+      return Array.isArray(result) ? result : [];
+    } finally {
+      lock.release();
+    }
+  }
+
+  async deleteMailbox(name: string): Promise<void> {
+    await this.client.mailboxDelete(name);
+  }
+
   async ensureMailbox(name: string): Promise<void> {
     try {
       await this.client.mailboxCreate(name);

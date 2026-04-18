@@ -25,6 +25,7 @@ import { getOverviewTool, runGetOverview } from '../tools/get-overview.js';
 import { listSendersTool } from '../tools/list-senders.js';
 import { listMailboxesTool } from '../tools/list-mailboxes.js';
 
+import { runStartupMigrations } from './startup.js';
 import type { ToolDefinition } from '../types.js';
 
 const ALL_TOOLS: ToolDefinition[] = [
@@ -97,6 +98,16 @@ export async function createMcpServer(): Promise<McpServerBundle> {
 
   // Construct IMAP connection pool
   const pool = new ImapConnectionPool({ accounts, logger });
+
+  // Run holding-folder migration for each account at startup
+  try {
+    const migrationResults = await runStartupMigrations({ pool, accounts });
+    for (const [accountId, outcome] of Object.entries(migrationResults)) {
+      logger.info(`holding-folder migration [${accountId}]: ${outcome.action}${'moved' in outcome ? ` (${outcome.moved} messages)` : ''}`);
+    }
+  } catch (err) {
+    logger.warn(`holding-folder migration failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   // Create executor
   const executor = new Executor({ db, accounts, pool, logger });
