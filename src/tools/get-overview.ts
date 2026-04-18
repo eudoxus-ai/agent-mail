@@ -96,6 +96,21 @@ export interface OverviewResult {
     by_category: Record<string, number>;
     by_account: Record<string, number>;
   };
+  recommendations?: string[];
+}
+
+// ─── Recommendations ───────────────────────────────────────────────────
+
+export function buildOverviewRecommendations(
+  senderCounts: Array<{ from: string; count: number }>
+): string[] {
+  const heavy = senderCounts.filter((s) => s.count >= 4);
+  if (heavy.length > 30) {
+    return [
+      `You have ${heavy.length} senders with 4+ messages — \`list_senders\` will let you make sender-level decisions instead of per-UID.`,
+    ];
+  }
+  return [];
 }
 
 // ─── Orchestration ────────────────────────────────────────────────────
@@ -169,6 +184,17 @@ export async function runGetOverview(deps: RunDeps): Promise<OverviewResult> {
     if (b.error !== null) per_account_errors[b.account_id] = b.error;
   }
 
+  // Tally sender counts across all account bundles for recommendations
+  const senderTally = new Map<string, number>();
+  for (const b of bundles) {
+    for (const t of b.threads) {
+      const addr = t.latest_message.from.address.toLowerCase();
+      senderTally.set(addr, (senderTally.get(addr) ?? 0) + 1);
+    }
+  }
+  const senderCounts = Array.from(senderTally.entries()).map(([from, count]) => ({ from, count }));
+  const recommendations = buildOverviewRecommendations(senderCounts);
+
   const result: OverviewResult = {
     accounts_searched: requested.map((a) => a.id),
     accounts_available: allIds,
@@ -179,6 +205,9 @@ export async function runGetOverview(deps: RunDeps): Promise<OverviewResult> {
   };
   if (Object.keys(per_account_errors).length > 0) {
     result.per_account_errors = per_account_errors;
+  }
+  if (recommendations.length > 0) {
+    result.recommendations = recommendations;
   }
   return result;
 }
