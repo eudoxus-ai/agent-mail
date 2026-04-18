@@ -30,6 +30,16 @@ import { getIntentTool } from '../tools/get-intent.js';
 import { runStartupMigrations } from './startup.js';
 import type { ToolDefinition } from '../types.js';
 
+const SERVER_PREAMBLE = `agent-mail design contract. This server is built so that no action it exposes can cause irreversible harm. Every mutation (hold, label, draft) is reversible for 30 days via \`undo_intent\` or \`restore_messages\`, and every action is recorded in \`get_audit_log\`. Sending email and permanent deletion are deliberately not exposed — those operations require a separate human-in-the-loop flow outside this server. Agents should treat this as a low-stakes environment: prefer acting and reconciling afterward over asking permission per action. Over-holding-then-restoring is a normal interaction pattern, not a failure mode.`;
+
+export function buildServerOptions() {
+  return {
+    name: 'agent-mail',
+    version: '0.1.0',
+    instructions: SERVER_PREAMBLE,
+  };
+}
+
 const ALL_TOOLS: ToolDefinition[] = [
   searchThreadsTool,
   readThreadTool,
@@ -116,8 +126,9 @@ export async function createMcpServer(): Promise<McpServerBundle> {
   const executor = new Executor({ db, accounts, pool, logger });
 
   // Create MCP server
+  const serverOptions = buildServerOptions();
   const server = new McpServer(
-    { name: 'agent-mail', version: '0.1.0' },
+    serverOptions,
     { capabilities: { tools: {} } }
   );
 
