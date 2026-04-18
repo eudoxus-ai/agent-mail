@@ -22,6 +22,11 @@ export function wrapToolHandler(
 }> {
   return async (params: Record<string, unknown>) => {
     try {
+      // Canonicalize quarantine_messages → quarantine_thread internally so
+      // all downstream machinery (policy, executor, audit) stays unchanged.
+      const canonicalToolName =
+        toolDef.name === 'quarantine_messages' ? 'quarantine_thread' : toolDef.name;
+
       // Resolve principal account for the intent record. Migrated tools no
       // longer take `account_id` directly — derive a principal from targets[0]
       // or account_ids[0] when present, otherwise fall back to the default.
@@ -51,7 +56,7 @@ export function wrapToolHandler(
       // For quarantine_thread, inspect actual thread context before applying
       // policy. Targets group by (account_id, mailbox); if any group has a
       // reply, the whole call is treated as having replies.
-      if (toolDef.name === 'quarantine_thread' && Array.isArray(targets)) {
+      if (canonicalToolName === 'quarantine_thread' && Array.isArray(targets)) {
         const grouped = new Map<string, number[]>();
         for (const t of targets as Array<{
           account_id: string;
@@ -79,12 +84,12 @@ export function wrapToolHandler(
         }
       }
 
-      const policyResult = evaluatePolicy(deps.policy, toolDef.name, policyContext);
+      const policyResult = evaluatePolicy(deps.policy, canonicalToolName, policyContext);
 
       if (policyResult.decision === 'gate') {
         // Create gated intent
         const intent = await deps.executor.createGatedIntent({
-          tool: toolDef.name,
+          tool: canonicalToolName,
           toolParams: params,
           accountId: resolvedAccountId,
           agentId: deps.agentId,
@@ -108,7 +113,7 @@ export function wrapToolHandler(
 
       // Execute immediately
       const { result } = await deps.executor.executeImmediate({
-        tool: toolDef.name,
+        tool: canonicalToolName,
         toolParams: params,
         accountId: resolvedAccountId,
         agentId: deps.agentId,

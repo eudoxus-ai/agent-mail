@@ -58,12 +58,12 @@ describe('extractSnippet', () => {
     expect(extractSnippet(source)).toBe('Plain text version of the message.');
   });
 
-  it('returns empty string for HTML-only messages (documented Y limitation)', () => {
+  it('extracts text from HTML-only messages via htmlToText fallback', () => {
     const source = msg(
       'Content-Type: text/html; charset=utf-8',
       '<p>Hello</p>'
     );
-    expect(extractSnippet(source)).toBe('');
+    expect(extractSnippet(source)).toContain('Hello');
   });
 
   it('returns empty string on malformed input instead of throwing', () => {

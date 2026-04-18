@@ -48,7 +48,14 @@ export class ImapProvider {
     mailbox: string,
     criteria: SearchCriteria,
     limit: number = 20
-  ): Promise<Array<{ uid: number; envelope: { message_id: string; subject: string; from: Participant; date: string }; snippet: string; flags: string[] }>> {
+  ): Promise<Array<{
+    uid: number;
+    envelope: { message_id: string; subject: string; from: Participant; date: string };
+    snippet: string;
+    flags: string[];
+    list_id: string | null;
+    list_unsubscribe: string | null;
+  }>> {
     const lock = await this.client.getMailboxLock(mailbox);
     try {
       const searchQuery: Record<string, unknown> = {};
@@ -57,7 +64,12 @@ export class ImapProvider {
       if (criteria.subject) searchQuery.subject = criteria.subject;
       if (criteria.body) searchQuery.body = criteria.body;
       if (criteria.since) searchQuery.since = criteria.since;
-      if (criteria.before) searchQuery.before = criteria.before;
+      // IMAP BEFORE operates at calendar-date granularity; pad by one day so
+      // the server returns everything on the cursor day, then post-filter by
+      // the exact timestamp after we have envelope dates.
+      if (criteria.before) {
+        searchQuery.before = new Date(criteria.before.getTime() + 24 * 60 * 60 * 1000);
+      }
       if (criteria.flagged !== undefined) searchQuery.flagged = criteria.flagged;
       if (criteria.seen !== undefined) searchQuery.seen = criteria.seen;
 
@@ -77,6 +89,8 @@ export class ImapProvider {
         envelope: { message_id: string; subject: string; from: Participant; date: string };
         snippet: string;
         flags: string[];
+        list_id: string | null;
+        list_unsubscribe: string | null;
       }> = [];
 
       for await (const msg of this.client.fetch(
@@ -86,9 +100,12 @@ export class ImapProvider {
           envelope: true,
           flags: true,
           source: { start: 0, maxLength: 2048 },
+          headers: ['list-id', 'list-unsubscribe'],
         },
         { uid: true }
       )) {
+        const headersStr = msg.headers?.toString('utf-8') ?? '';
+        const { listId, listUnsubscribe } = extractListHeadersFromSource(headersStr);
         results.push({
           uid: msg.uid,
           envelope: {
@@ -99,16 +116,26 @@ export class ImapProvider {
           },
           snippet: extractSnippet(msg.source ?? Buffer.alloc(0)),
           flags: Array.from(msg.flags ?? []),
+          list_id: listId,
+          list_unsubscribe: listUnsubscribe,
         });
       }
 
+      // Post-filter by exact `before` timestamp. IMAP BEFORE operates at
+      // day granularity so we widened the query by one day above; trim
+      // same-day results here to honor the advertised exclusive cursor.
+      const beforeMs = criteria.before?.getTime();
+      const filtered = beforeMs !== undefined
+        ? results.filter((r) => new Date(r.envelope.date).getTime() < beforeMs)
+        : results;
+
       // Sort descending by date (newest first). IMAP UIDs are usually chronological
       // but not guaranteed, so sort on the envelope date we already have.
-      results.sort(
+      filtered.sort(
         (a, b) => new Date(b.envelope.date).getTime() - new Date(a.envelope.date).getTime()
       );
 
-      return results;
+      return filtered;
     } finally {
       lock.release();
     }
@@ -280,6 +307,23 @@ export class ImapProvider {
     }
   }
 
+  async listMailboxes(): Promise<Array<{
+    path: string;
+    name: string;
+    specialUse: string | null;
+    delimiter: string;
+    flags: string[];
+  }>> {
+    const raw = await this.client.list();
+    return raw.map((mb: any) => ({
+      path: mb.path,
+      name: mb.name,
+      specialUse: mb.specialUse ?? null,
+      delimiter: mb.delimiter ?? '/',
+      flags: Array.from(mb.flags ?? []),
+    }));
+  }
+
   async fetchMessage(mailbox: string, uid: number): Promise<EmailMessage> {
     const lock = await this.client.getMailboxLock(mailbox);
     try {
@@ -436,6 +480,16 @@ function extractHeader(source: string, name: string): string | null {
   const regex = new RegExp(`^${name}:\\s*(.+?)(?:\\r?\\n(?!\\s)|$)`, 'im');
   const match = source.match(regex);
   return match ? match[1].trim() : null;
+}
+
+export function extractListHeadersFromSource(source: string): {
+  listId: string | null;
+  listUnsubscribe: string | null;
+} {
+  return {
+    listId: extractHeader(source, 'List-Id'),
+    listUnsubscribe: extractHeader(source, 'List-Unsubscribe'),
+  };
 }
 
 function extractBodyText(source: string): string {

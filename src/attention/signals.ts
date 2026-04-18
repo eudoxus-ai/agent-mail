@@ -122,6 +122,13 @@ export function isAutomatedSender(address: string): boolean {
   return AUTOMATED_LOCAL_PARTS.some((re) => re.test(localPart));
 }
 
+export function isListMail(
+  listUnsubscribe: string | null | undefined,
+  listId: string | null | undefined
+): boolean {
+  return Boolean(listUnsubscribe) || Boolean(listId);
+}
+
 function collectParticipants(messages: EmailMessage[]): Participant[] {
   const seen = new Set<string>();
   const out: Participant[] = [];
