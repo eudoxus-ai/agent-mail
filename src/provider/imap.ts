@@ -448,6 +448,15 @@ export class ImapProvider {
     return { uid: (result as any)?.uid ?? 0 };
   }
 
+  async deleteMessage(mailbox: string, uid: number): Promise<void> {
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      await this.client.messageDelete(String(uid), { uid: true });
+    } finally {
+      lock.release();
+    }
+  }
+
   async mailboxExists(name: string): Promise<boolean> {
     const mailboxes = await this.client.list();
     return mailboxes.some((mb: any) => mb.path === name);

@@ -14,9 +14,30 @@ describe('buildUndoHint', () => {
       },
     });
   });
-  it('returns undo_intent for other tools', () => {
-    expect(buildUndoHint({
+  it('returns undo_intent for label_thread', () => {
+    const hint = buildUndoHint({
       intent_id: 'i2', tool: 'label_thread', created_at: '2026-04-18T12:00:00Z',
-    }).undo_hint.method).toBe('undo_intent');
+    });
+    expect(hint).not.toBeNull();
+    expect(hint!.undo_hint.method).toBe('undo_intent');
+  });
+  it('returns undo_intent for restore_messages', () => {
+    const hint = buildUndoHint({
+      intent_id: 'i3', tool: 'restore_messages', created_at: '2026-04-18T12:00:00Z',
+    });
+    expect(hint).not.toBeNull();
+    expect(hint!.undo_hint.method).toBe('undo_intent');
+  });
+  it('returns undo_intent for draft_reply', () => {
+    const hint = buildUndoHint({
+      intent_id: 'i4', tool: 'draft_reply', created_at: '2026-04-18T12:00:00Z',
+    });
+    expect(hint).not.toBeNull();
+    expect(hint!.undo_hint.method).toBe('undo_intent');
+  });
+  it('returns null for non-reversible tools', () => {
+    expect(buildUndoHint({ intent_id: 'i5', tool: 'queue_send', created_at: '2026-04-18T12:00:00Z' })).toBeNull();
+    expect(buildUndoHint({ intent_id: 'i6', tool: 'unsubscribe_sender', created_at: '2026-04-18T12:00:00Z' })).toBeNull();
+    expect(buildUndoHint({ intent_id: 'i7', tool: 'search_threads', created_at: '2026-04-18T12:00:00Z' })).toBeNull();
   });
 });

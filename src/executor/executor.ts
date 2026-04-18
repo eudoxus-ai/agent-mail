@@ -697,10 +697,9 @@ export class Executor {
       const message = await this.resolveQueuedSend(intent, account);
       const transport = createSmtpTransport(resolved);
       const result = await sendMail(transport, message);
-      const payload = Object.assign(
-        { sent: true, messageId: result.messageId },
-        buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at })
-      );
+      const payload: Record<string, unknown> = { sent: true, messageId: result.messageId };
+      const sendHint = buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at });
+      if (sendHint) Object.assign(payload, sendHint);
       return [{ type: 'text', text: JSON.stringify(payload) }];
     }
 
@@ -771,7 +770,8 @@ export class Executor {
       if (Object.keys(fanResult.errors).length > 0) {
         payload.per_account_errors = fanResult.errors;
       }
-      Object.assign(payload, buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at }));
+      const labelHint = buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at });
+      if (labelHint) Object.assign(payload, labelHint);
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
 
@@ -892,7 +892,8 @@ export class Executor {
         }));
       }
       if (!dryRun) {
-        Object.assign(payload, buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at }));
+        const holdHint = buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at });
+        if (holdHint) Object.assign(payload, holdHint);
       }
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
@@ -948,6 +949,16 @@ export class Executor {
         linkReversal(this.db, { restoreIntentId: intent.id, reverses: [...reverses] });
       }
 
+      // Persist targets so the rehold_messages undo knows where messages landed
+      if (!dryRun && moved.length > 0) {
+        insertIntentTargets(this.db, intent.id, moved.map((m) => ({
+          account_id: m.account_id,
+          uid: m.uid,
+          mailbox: m.destination_mailbox,
+          envelope_snapshot: { subject: '', from: '', original_mailbox: m.destination_mailbox },
+        })));
+      }
+
       const payload: {
         dry_run: boolean;
         moved: typeof moved;
@@ -960,7 +971,8 @@ export class Executor {
         errors,
       };
       if (!dryRun) {
-        Object.assign(payload, buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at }));
+        const restoreHint = buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at });
+        if (restoreHint) Object.assign(payload, restoreHint);
       }
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
@@ -1028,10 +1040,13 @@ export class Executor {
             references: intent.params.references as string[] | undefined,
           });
           const result = await imap.createDraft(raw);
-          const draftPayload = Object.assign(
-            { draft_id: result.uid, message: 'Draft created' },
-            buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at })
-          );
+          // Persist draft_id into intent params so performUndo can read it via intent.params.draft_id
+          intent.params = { ...intent.params, draft_id: result.uid };
+          this.db.prepare('UPDATE intents SET params = ? WHERE id = ?')
+            .run(JSON.stringify(intent.params), intent.id);
+          const draftPayload: Record<string, unknown> = { draft_id: result.uid, message: 'Draft created' };
+          const draftHint = buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at });
+          if (draftHint) Object.assign(draftPayload, draftHint);
           return [{ type: 'text', text: JSON.stringify(draftPayload) }];
         }
 
@@ -1045,10 +1060,9 @@ export class Executor {
             signal: createTimedAbortSignal(),
             headers,
           });
-          const unsubPayload = Object.assign(
-            { message: `Unsubscribe request sent (HTTP ${response.status})` },
-            buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at })
-          );
+          const unsubPayload: Record<string, unknown> = { message: `Unsubscribe request sent (HTTP ${response.status})` };
+          const unsubHint = buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at });
+          if (unsubHint) Object.assign(unsubPayload, unsubHint);
           return [{ type: 'text', text: JSON.stringify(unsubPayload) }];
         }
 
@@ -1102,6 +1116,40 @@ export class Executor {
           await imap.moveMessages(uids, holding, inbox);
         });
       }
+      return;
+    }
+
+    // restore_messages undo: re-hold each UID back to the holding folder
+    // Each target row has envelope_snapshot.original_mailbox = where the message lives now (its destination after restore).
+    if (undoOp.reverseAction === 'rehold_messages') {
+      const targets = getIntentTargets(this.db, intent.id);
+      const byAccount = new Map<string, Array<{ uid: number; currentMailbox: string }>>();
+      for (const t of targets) {
+        const list = byAccount.get(t.account_id) ?? [];
+        list.push({ uid: t.uid, currentMailbox: t.envelope_snapshot?.original_mailbox ?? t.mailbox });
+        byAccount.set(t.account_id, list);
+      }
+      for (const [accountId, list] of byAccount) {
+        await this.pool.withConnection(accountId, async (imap) => {
+          const holding = await imap.getMailboxPath('holding');
+          for (const { uid, currentMailbox } of list) {
+            await imap.moveMessages([uid], currentMailbox, holding);
+          }
+        });
+      }
+      return;
+    }
+
+    // draft_reply undo: delete the draft from the Drafts folder
+    if (undoOp.reverseAction === 'delete_draft') {
+      const draftId = intent.params.draft_id as number | undefined;
+      if (draftId === undefined) {
+        throw new Error('delete_draft: no draft_id in intent params');
+      }
+      await this.pool.withConnection(intent.account_id, async (imap) => {
+        const draftsMailbox = await imap.getMailboxPath('drafts');
+        await imap.deleteMessage(draftsMailbox, draftId);
+      });
       return;
     }
 
