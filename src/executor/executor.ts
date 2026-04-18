@@ -25,6 +25,7 @@ import {
 } from '../provider/url-safety.js';
 import { generateUndoToken, getUndoExpiry, parseUndoToken } from './undo.js';
 import { fanOut } from './fan-out.js';
+import { parseTargets, type Target } from '../tools/target.js';
 
 interface SearchThreadResult {
   account_id: string;
@@ -554,6 +555,58 @@ export class Executor {
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
 
+    // Multi-account label: group targets by account, fan out per-account
+    if (intent.tool === 'label_thread') {
+      const targets = intent.params.targets as Target[];
+      const action = intent.params.action as 'add' | 'remove';
+      const label = intent.params.label as string;
+      const grouped = parseTargets(targets);
+      const accountIds = Object.keys(grouped);
+      const allIds = this.accounts.map((a) => a.id);
+      const unknown = accountIds.filter((id) => !allIds.includes(id));
+      if (unknown.length > 0) {
+        throw new Error(`Unknown account_ids in targets: ${unknown.join(', ')}`);
+      }
+
+      const fanResult = await fanOut({
+        pool: this.pool,
+        accountIds,
+        fn: async (accountId, imap) => {
+          const byMailbox = new Map<string, number[]>();
+          for (const t of grouped[accountId]) {
+            const list = byMailbox.get(t.mailbox) ?? [];
+            list.push(t.uid);
+            byMailbox.set(t.mailbox, list);
+          }
+          for (const [mailbox, uids] of byMailbox) {
+            if (action === 'add') {
+              await imap.setFlags(uids, [label], mailbox);
+            } else {
+              await imap.removeFlags(uids, [label], mailbox);
+            }
+          }
+          return { uids: grouped[accountId].map((t) => t.uid) };
+        },
+      });
+
+      const payload: {
+        accounts_searched: string[];
+        accounts_available: string[];
+        per_account_errors?: Record<string, string>;
+        action: 'add' | 'remove';
+        label: string;
+      } = {
+        accounts_searched: fanResult.accounts_searched,
+        accounts_available: allIds,
+        action,
+        label,
+      };
+      if (Object.keys(fanResult.errors).length > 0) {
+        payload.per_account_errors = fanResult.errors;
+      }
+      return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
+    }
+
     // Account-qualified read: route by target.account_id, not intent.account_id
     if (intent.tool === 'read_thread') {
       const target = intent.params.target as {
@@ -592,25 +645,6 @@ export class Executor {
                 draft_id: result.uid,
                 message: 'Draft created',
               }),
-            },
-          ];
-        }
-
-        case 'label_thread': {
-          const uids = intent.params.uids as number[];
-          const mailbox = (intent.params.mailbox as string) ?? 'INBOX';
-          const action = intent.params.action as 'add' | 'remove';
-          const label = intent.params.label as string;
-
-          if (action === 'add') {
-            await imap.setFlags(uids, [label], mailbox);
-          } else {
-            await imap.removeFlags(uids, [label], mailbox);
-          }
-          return [
-            {
-              type: 'text',
-              text: `Label "${label}" ${action === 'add' ? 'applied' : 'removed'}`,
             },
           ];
         }
@@ -656,6 +690,33 @@ export class Executor {
     intent: Intent,
     undoOp: { reverseAction: string; params: Record<string, unknown> }
   ): Promise<void> {
+    // Multi-account undo: group targets by account and apply per-account
+    if (undoOp.reverseAction === 'reverse_label') {
+      const targets = intent.params.targets as Target[];
+      const action = intent.params.action as 'add' | 'remove';
+      const label = intent.params.label as string;
+      const grouped = parseTargets(targets);
+
+      for (const [accountId, list] of Object.entries(grouped)) {
+        await this.pool.withConnection(accountId, async (imap) => {
+          const byMailbox = new Map<string, number[]>();
+          for (const t of list) {
+            const arr = byMailbox.get(t.mailbox) ?? [];
+            arr.push(t.uid);
+            byMailbox.set(t.mailbox, arr);
+          }
+          for (const [mailbox, uids] of byMailbox) {
+            if (action === 'add') {
+              await imap.removeFlags(uids, [label], mailbox);
+            } else {
+              await imap.setFlags(uids, [label], mailbox);
+            }
+          }
+        });
+      }
+      return;
+    }
+
     await this.pool.withConnection(intent.account_id, async (imap) => {
       switch (undoOp.reverseAction) {
         case 'move_back_to_inbox': {
@@ -663,20 +724,6 @@ export class Executor {
           const quarantine = await imap.getMailboxPath('quarantine');
           const inbox = await imap.getMailboxPath('inbox');
           await imap.moveMessages(uids, quarantine, inbox);
-          break;
-        }
-
-        case 'reverse_label': {
-          const uids = intent.params.uids as number[];
-          const mailbox = (intent.params.mailbox as string) ?? 'INBOX';
-          const action = intent.params.action as 'add' | 'remove';
-          const label = intent.params.label as string;
-
-          if (action === 'add') {
-            await imap.removeFlags(uids, [label], mailbox);
-          } else {
-            await imap.setFlags(uids, [label], mailbox);
-          }
           break;
         }
 
