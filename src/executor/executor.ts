@@ -591,7 +591,9 @@ export class Executor {
           g.uids.push(r.uid);
           if (r.list_unsubscribe) g.withUnsub += 1;
           if (isAutomatedSender(addr)) g.automated += 1;
-          if (r.envelope.date > g.latest) g.latest = r.envelope.date;
+          if (!g.latest || new Date(r.envelope.date).getTime() > new Date(g.latest).getTime()) {
+            g.latest = r.envelope.date;
+          }
           groups.set(addr, g);
         }
         return Array.from(groups.values())
