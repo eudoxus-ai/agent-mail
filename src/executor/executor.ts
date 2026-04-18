@@ -1,6 +1,6 @@
 import type { Database } from '../ledger/sqlite.js';
 import type { AccountConfig, Intent, RiskLevel } from '../types.js';
-import { isAutomatedSender } from '../attention/signals.js';
+import { isAutomatedSender, isListMail } from '../attention/signals.js';
 import type { Logger } from '../logger.js';
 import type { ImapConnectionPool } from '../provider/imap-pool.js';
 import {
@@ -39,7 +39,11 @@ interface SearchThreadResult {
   };
   snippet: string;
   flags: string[];
+  list_id: string | null;
+  list_unsubscribe: string | null;
   is_automated: boolean;
+  is_list_mail: boolean;
+  target: { account_id: string; uid: number; mailbox: string };
 }
 
 interface SearchThreadsMultiPayload {
@@ -511,7 +515,11 @@ export class Executor {
           account_id: accountId,
           mailbox,
           ...r,
+          list_id: r.list_id ?? null,
+          list_unsubscribe: r.list_unsubscribe ?? null,
           is_automated: isAutomatedSender(r.envelope.from.address),
+          is_list_mail: isListMail(r.list_unsubscribe, r.list_id),
+          target: { account_id: accountId, uid: r.uid, mailbox },
         }));
       },
     });
