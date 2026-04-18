@@ -32,23 +32,23 @@ describe('evaluatePolicy', () => {
     expect(result.risk).toBe('high');
   });
 
-  it('quarantine_thread is ungated by default (no replies)', () => {
-    const result = evaluatePolicy(policy, 'quarantine_thread', {
+  it('hold_messages is ungated by default (no replies)', () => {
+    const result = evaluatePolicy(policy, 'hold_messages', {
       threadHasReplies: false,
     });
     expect(result.decision).toBe('execute');
   });
 
-  it('quarantine_thread is gated when thread has replies', () => {
-    const result = evaluatePolicy(policy, 'quarantine_thread', {
+  it('hold_messages is gated when thread has replies', () => {
+    const result = evaluatePolicy(policy, 'hold_messages', {
       threadHasReplies: true,
     });
     expect(result.decision).toBe('gate');
     expect(result.reason).toContain('when_thread_has_replies');
   });
 
-  it('quarantine_thread is ungated when no context provided', () => {
-    const result = evaluatePolicy(policy, 'quarantine_thread');
+  it('hold_messages is ungated when no context provided', () => {
+    const result = evaluatePolicy(policy, 'hold_messages');
     expect(result.decision).toBe('execute');
   });
 
@@ -95,8 +95,8 @@ describe('reversible policy axis', () => {
     expect(result.reversible).toBe(false);
   });
 
-  it('quarantine_thread is reversible', () => {
-    const result = evaluatePolicy(policy, 'quarantine_thread');
+  it('hold_messages is reversible', () => {
+    const result = evaluatePolicy(policy, 'hold_messages');
     expect(result.reversible).toBe(true);
   });
 

@@ -22,10 +22,7 @@ export function wrapToolHandler(
 }> {
   return async (params: Record<string, unknown>) => {
     try {
-      // Canonicalize quarantine_messages → quarantine_thread internally so
-      // all downstream machinery (policy, executor, audit) stays unchanged.
-      const canonicalToolName =
-        toolDef.name === 'quarantine_messages' ? 'quarantine_thread' : toolDef.name;
+      const canonicalToolName = toolDef.name;
 
       // Resolve principal account for the intent record. Migrated tools no
       // longer take `account_id` directly — derive a principal from targets[0]
@@ -53,10 +50,10 @@ export function wrapToolHandler(
       // Evaluate policy
       const policyContext: { threadHasReplies?: boolean } = {};
 
-      // For quarantine_thread, inspect actual thread context before applying
+      // For hold_messages, inspect actual thread context before applying
       // policy. Targets group by (account_id, mailbox); if any group has a
       // reply, the whole call is treated as having replies.
-      if (canonicalToolName === 'quarantine_thread' && Array.isArray(targets)) {
+      if (canonicalToolName === 'hold_messages' && Array.isArray(targets)) {
         const grouped = new Map<string, number[]>();
         for (const t of targets as Array<{
           account_id: string;

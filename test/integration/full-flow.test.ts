@@ -152,9 +152,9 @@ describe('Full E2E flow: triage, draft, queue, approve', () => {
   });
 
   it('quarantines and undoes', async () => {
-    // Quarantine (ungated when no replies)
+    // Hold (ungated when no replies)
     const quarantine = await executor.executeImmediate({
-      tool: 'quarantine_thread',
+      tool: 'hold_messages',
       toolParams: { targets: [{ account_id: 'gmail', uid: 2 }] },
       accountId: 'gmail',
       agentId: 'claude',

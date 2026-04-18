@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { wrapToolHandler } from '../../src/server/middleware.js';
-import { quarantineThreadTool } from '../../src/tools/quarantine-thread.js';
+import { holdMessagesTool } from '../../src/tools/hold-messages.js';
 import { Executor } from '../../src/executor/executor.js';
 import { openDatabase } from '../../src/ledger/db.js';
 import type { AccountConfig, PolicyConfig } from '../../src/types.js';
@@ -17,7 +17,7 @@ const accounts: AccountConfig[] = [
 
 const policy: PolicyConfig = {
   tools: {
-    quarantine_thread: {
+    hold_messages: {
       risk: 'medium',
       gate: 'configurable',
       default: 'ungated',
@@ -42,10 +42,10 @@ function makeExecutor(opts: { threadHasReplies: boolean }) {
   return { executor, db };
 }
 
-describe('quarantine_thread policy gating with targets', () => {
+describe('hold_messages policy gating with targets', () => {
   it('inspects thread reply state from targets and gates when replies exist', async () => {
     const { executor, db } = makeExecutor({ threadHasReplies: true });
-    const handler = wrapToolHandler(quarantineThreadTool, {
+    const handler = wrapToolHandler(holdMessagesTool, {
       db,
       executor,
       policy,
@@ -73,7 +73,7 @@ describe('quarantine_thread policy gating with targets', () => {
 
   it('executes immediately when thread has no replies', async () => {
     const { executor, db } = makeExecutor({ threadHasReplies: false });
-    const handler = wrapToolHandler(quarantineThreadTool, {
+    const handler = wrapToolHandler(holdMessagesTool, {
       db,
       executor,
       policy,
@@ -98,7 +98,7 @@ describe('quarantine_thread policy gating with targets', () => {
 
   it('checks every account/mailbox group when targets span multiple', async () => {
     const { executor, db } = makeExecutor({ threadHasReplies: false });
-    const handler = wrapToolHandler(quarantineThreadTool, {
+    const handler = wrapToolHandler(holdMessagesTool, {
       db,
       executor,
       policy,

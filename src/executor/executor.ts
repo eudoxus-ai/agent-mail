@@ -751,8 +751,8 @@ export class Executor {
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
 
-    // Multi-account quarantine: group targets by account+mailbox, fan out, support dry_run
-    if (intent.tool === 'quarantine_thread') {
+    // Multi-account hold: group targets by account+mailbox, fan out, support dry_run
+    if (intent.tool === 'hold_messages') {
       const targets = intent.params.targets as Target[];
       const dryRun = (intent.params.dry_run as boolean | undefined) ?? false;
       const grouped = parseTargets(targets);
@@ -780,11 +780,11 @@ export class Executor {
             uids: number[];
           }> = [];
 
-          const quarantine = await imap.getMailboxPath('quarantine');
+          const holding = await imap.getMailboxPath('holding');
 
           for (const [mailbox, uids] of byMailbox) {
             if (!dryRun) {
-              await imap.moveMessages(uids, mailbox, quarantine);
+              await imap.moveMessages(uids, mailbox, holding);
             }
             perMailbox.push({ mailbox, message_count: uids.length, uids });
           }
@@ -917,17 +917,17 @@ export class Executor {
       return;
     }
 
-    // Multi-account quarantine undo: group targets by account, restore to inbox
+    // Multi-account hold undo: group targets by account, restore to inbox
     if (undoOp.reverseAction === 'move_back_to_inbox') {
       const targets = intent.params.targets as Target[];
       const grouped = parseTargets(targets);
 
       for (const [accountId, list] of Object.entries(grouped)) {
         await this.pool.withConnection(accountId, async (imap) => {
-          const quarantine = await imap.getMailboxPath('quarantine');
+          const holding = await imap.getMailboxPath('holding');
           const inbox = await imap.getMailboxPath('inbox');
           const uids = list.map((t) => t.uid);
-          await imap.moveMessages(uids, quarantine, inbox);
+          await imap.moveMessages(uids, holding, inbox);
         });
       }
       return;

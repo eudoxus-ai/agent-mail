@@ -75,10 +75,10 @@ describe('MCP triage v2 end-to-end', () => {
     expect(sPayload.results[0].is_list_mail).toBe(true);
     expect(sPayload.results[0].list_id).toContain('Promos');
 
-    // 2. Pipe targets straight into quarantine_thread (canonical internal name)
+    // 2. Pipe targets straight into hold_messages (canonical internal name)
     const targets = sPayload.results.map((r: any) => r.target);
     const quar = await executor.executeImmediate({
-      tool: 'quarantine_thread',
+      tool: 'hold_messages',
       toolParams: { targets, dry_run: true },
       accountId: 'a@x.com',
       agentId: 'test',

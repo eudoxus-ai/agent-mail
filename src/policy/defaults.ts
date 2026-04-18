@@ -24,7 +24,7 @@ tools:
     reversible: false
     note: "HTTP List-Unsubscribe only. Mailto-based unsubscribes route through queue_send."
 
-  quarantine_thread:
+  hold_messages:
     risk: medium
     gate: configurable
     default: ungated
