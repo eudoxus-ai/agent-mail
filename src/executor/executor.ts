@@ -3,7 +3,6 @@ import type { AccountConfig, Intent, RiskLevel } from '../types.js';
 import { isAutomatedSender } from '../attention/signals.js';
 import type { Logger } from '../logger.js';
 import type { ImapConnectionPool } from '../provider/imap-pool.js';
-import type { ImapProvider } from '../provider/imap.js';
 import {
   createIntent,
   getIntent,
@@ -25,6 +24,29 @@ import {
   createTimedAbortSignal,
 } from '../provider/url-safety.js';
 import { generateUndoToken, getUndoExpiry, parseUndoToken } from './undo.js';
+import { fanOut } from './fan-out.js';
+
+interface SearchThreadResult {
+  account_id: string;
+  mailbox: string;
+  uid: number;
+  envelope: {
+    message_id: string;
+    subject: string;
+    from: { address: string; name: string | null };
+    date: string;
+  };
+  snippet: string;
+  flags: string[];
+  is_automated: boolean;
+}
+
+interface SearchThreadsMultiPayload {
+  accounts_searched: string[];
+  accounts_available: string[];
+  per_account_errors?: Record<string, string>;
+  results: SearchThreadResult[];
+}
 
 export interface ExecutorDeps {
   db: Database;
@@ -435,21 +457,16 @@ export class Executor {
     };
   }
 
-  private async searchThreads(
-    intent: Intent,
-    imap: ImapProvider
-  ): Promise<Array<{
-    uid: number;
-    envelope: {
-      message_id: string;
-      subject: string;
-      from: { address: string; name: string | null };
-      date: string;
-    };
-    snippet: string;
-    flags: string[];
-    is_automated: boolean;
-  }>> {
+  private async searchThreadsMulti(intent: Intent): Promise<SearchThreadsMultiPayload> {
+    const requestedIds = (intent.params.account_ids as string[] | undefined) ?? null;
+    const allIds = this.accounts.map((a) => a.id);
+    const targetIds = requestedIds ?? allIds;
+
+    const unknown = targetIds.filter((id) => !allIds.includes(id));
+    if (unknown.length > 0) {
+      throw new Error(`Unknown account_ids: ${unknown.join(', ')}`);
+    }
+
     const mailbox = (intent.params.mailbox as string) ?? 'INBOX';
     const baseCriteria = {
       from: intent.params.from as string | undefined,
@@ -461,30 +478,50 @@ export class Executor {
     };
     const limit = (intent.params.limit as number) ?? 20;
     const query = intent.params.query as string | undefined;
-    const resultSets = query
-      ? await Promise.all([
-          imap.search(mailbox, { ...baseCriteria, subject: query }, limit),
-          imap.search(mailbox, { ...baseCriteria, body: query }, limit),
-        ])
-      : [await imap.search(mailbox, baseCriteria, limit)];
 
-    const merged = new Map<number, Awaited<(typeof resultSets)[number][number]>>();
-    for (const set of resultSets) {
-      for (const result of set) {
-        merged.set(result.uid, result);
-      }
-    }
+    const fanResult = await fanOut({
+      pool: this.pool,
+      accountIds: targetIds,
+      fn: async (accountId, imap) => {
+        const resultSets = query
+          ? await Promise.all([
+              imap.search(mailbox, { ...baseCriteria, subject: query }, limit),
+              imap.search(mailbox, { ...baseCriteria, body: query }, limit),
+            ])
+          : [await imap.search(mailbox, baseCriteria, limit)];
 
-    return Array.from(merged.values())
+        const merged = new Map<number, Awaited<(typeof resultSets)[number][number]>>();
+        for (const set of resultSets) {
+          for (const result of set) {
+            merged.set(result.uid, result);
+          }
+        }
+        return Array.from(merged.values()).map((r) => ({
+          account_id: accountId,
+          mailbox,
+          ...r,
+          is_automated: isAutomatedSender(r.envelope.from.address),
+        }));
+      },
+    });
+
+    const allResults = Object.values(fanResult.per_account)
+      .flat()
       .sort(
         (a, b) =>
           new Date(b.envelope.date).getTime() - new Date(a.envelope.date).getTime()
       )
-      .slice(0, limit)
-      .map((result) => ({
-        ...result,
-        is_automated: isAutomatedSender(result.envelope.from.address),
-      }));
+      .slice(0, limit);
+
+    const payload: SearchThreadsMultiPayload = {
+      accounts_searched: fanResult.accounts_searched,
+      accounts_available: allIds,
+      results: allResults,
+    };
+    if (Object.keys(fanResult.errors).length > 0) {
+      payload.per_account_errors = fanResult.errors;
+    }
+    return payload;
   }
 
   private async performAction(
@@ -511,14 +548,15 @@ export class Executor {
       ];
     }
 
-    // All other tools use IMAP via the pool
+    // Multi-account read tools: fan out before borrowing a single connection
+    if (intent.tool === 'search_threads') {
+      const payload = await this.searchThreadsMulti(intent);
+      return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
+    }
+
+    // All other tools use IMAP via the pool (single-account principal)
     return this.pool.withConnection(intent.account_id, async (imap) => {
       switch (intent.tool) {
-        case 'search_threads': {
-          const results = await this.searchThreads(intent, imap);
-          return [{ type: 'text', text: JSON.stringify(results, null, 2) }];
-        }
-
         case 'read_thread': {
           const uid = intent.params.uid as number;
           const mailbox = (intent.params.mailbox as string) ?? 'INBOX';
