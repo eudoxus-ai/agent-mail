@@ -26,6 +26,7 @@ import {
   createTimedAbortSignal,
 } from '../provider/url-safety.js';
 import { generateUndoToken, getUndoExpiry, parseUndoToken } from './undo.js';
+import { buildUndoHint } from '../lib/undo-hint.js';
 import { fanOut } from './fan-out.js';
 import { parseTargets, type Target } from '../tools/target.js';
 import { insertIntentTargets, getIntentTargets } from '../ledger/intent-targets.js';
@@ -675,15 +676,11 @@ export class Executor {
       const message = await this.resolveQueuedSend(intent, account);
       const transport = createSmtpTransport(resolved);
       const result = await sendMail(transport, message);
-      return [
-        {
-          type: 'text',
-          text: JSON.stringify({
-            sent: true,
-            messageId: result.messageId,
-          }),
-        },
-      ];
+      const payload = Object.assign(
+        { sent: true, messageId: result.messageId },
+        buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at })
+      );
+      return [{ type: 'text', text: JSON.stringify(payload) }];
     }
 
     // Multi-account read tools: fan out before borrowing a single connection
@@ -742,6 +739,8 @@ export class Executor {
         per_account_errors?: Record<string, string>;
         action: 'add' | 'remove';
         label: string;
+        reversible?: true;
+        undo_hint?: { intent_id: string; method: string; window_expires_at: string };
       } = {
         accounts_searched: fanResult.accounts_searched,
         accounts_available: allIds,
@@ -751,6 +750,7 @@ export class Executor {
       if (Object.keys(fanResult.errors).length > 0) {
         payload.per_account_errors = fanResult.errors;
       }
+      Object.assign(payload, buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at }));
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
 
@@ -849,6 +849,8 @@ export class Executor {
         total_messages: number;
         per_account: typeof perAccount;
         moved?: Array<{ uid: number; account_id: string; subject: string; from: string; original_mailbox: string }>;
+        reversible?: true;
+        undo_hint?: { intent_id: string; method: string; window_expires_at: string };
       } = {
         accounts_searched: fanResult.accounts_searched,
         accounts_available: allIds,
@@ -867,6 +869,9 @@ export class Executor {
           from: e.from,
           original_mailbox: e.mailbox,
         }));
+      }
+      if (!dryRun) {
+        Object.assign(payload, buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at }));
       }
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
@@ -922,11 +927,20 @@ export class Executor {
         linkReversal(this.db, { restoreIntentId: intent.id, reverses: [...reverses] });
       }
 
-      const payload = {
+      const payload: {
+        dry_run: boolean;
+        moved: typeof moved;
+        errors: typeof errors;
+        reversible?: true;
+        undo_hint?: { intent_id: string; method: string; window_expires_at: string };
+      } = {
         dry_run: dryRun,
         moved,
         errors,
       };
+      if (!dryRun) {
+        Object.assign(payload, buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at }));
+      }
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
 
@@ -989,15 +1003,11 @@ export class Executor {
             references: intent.params.references as string[] | undefined,
           });
           const result = await imap.createDraft(raw);
-          return [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                draft_id: result.uid,
-                message: 'Draft created',
-              }),
-            },
-          ];
+          const draftPayload = Object.assign(
+            { draft_id: result.uid, message: 'Draft created' },
+            buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at })
+          );
+          return [{ type: 'text', text: JSON.stringify(draftPayload) }];
         }
 
         case 'unsubscribe_sender': {
@@ -1010,12 +1020,11 @@ export class Executor {
             signal: createTimedAbortSignal(),
             headers,
           });
-          return [
-            {
-              type: 'text',
-              text: `Unsubscribe request sent (HTTP ${response.status})`,
-            },
-          ];
+          const unsubPayload = Object.assign(
+            { message: `Unsubscribe request sent (HTTP ${response.status})` },
+            buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at })
+          );
+          return [{ type: 'text', text: JSON.stringify(unsubPayload) }];
         }
 
         default:

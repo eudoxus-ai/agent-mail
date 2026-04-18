@@ -63,6 +63,50 @@ describe('hold_messages', () => {
     expect(intent.undo_token).not.toBeNull();
   });
 
+  it('real run response includes reversible and undo_hint.method=restore_messages', async () => {
+    const pool = {
+      withConnection: vi.fn(async (_: string, fn: any) =>
+        fn({
+          getMailboxPath: async () => 'agent-mail-holding',
+          moveMessages: async () => {},
+          fetchEnvelopes: async () => [],
+        })
+      ),
+    };
+    const executor = new Executor({ db: openDatabase(':memory:'), accounts: makeAccounts(), pool: pool as any, logger });
+    const { intent, result } = await executor.executeImmediate({
+      tool: 'hold_messages',
+      toolParams: { targets: [{ account_id: 'a@x.com', uid: 1 }] },
+      accountId: 'a@x.com', agentId: 'test', risk: 'medium',
+    });
+    const payload = JSON.parse(result[0].text);
+    expect(payload.reversible).toBe(true);
+    expect(payload.undo_hint.method).toBe('restore_messages');
+    expect(payload.undo_hint.intent_id).toBe(intent.id);
+    expect(typeof payload.undo_hint.window_expires_at).toBe('string');
+  });
+
+  it('dry_run response omits reversible/undo_hint', async () => {
+    const pool = {
+      withConnection: vi.fn(async (_: string, fn: any) =>
+        fn({
+          getMailboxPath: async () => 'agent-mail-holding',
+          moveMessages: async () => {},
+          fetchEnvelopes: async () => [],
+        })
+      ),
+    };
+    const executor = new Executor({ db: openDatabase(':memory:'), accounts: makeAccounts(), pool: pool as any, logger });
+    const { result } = await executor.executeImmediate({
+      tool: 'hold_messages',
+      toolParams: { targets: [{ account_id: 'a@x.com', uid: 1 }], dry_run: true },
+      accountId: 'a@x.com', agentId: 'test', risk: 'medium',
+    });
+    const payload = JSON.parse(result[0].text);
+    expect(payload.reversible).toBeUndefined();
+    expect(payload.undo_hint).toBeUndefined();
+  });
+
   it('rejects unknown account_id in targets', async () => {
     const pool = { withConnection: vi.fn() };
     const executor = new Executor({ db: openDatabase(':memory:'), accounts: makeAccounts(), pool: pool as any, logger });

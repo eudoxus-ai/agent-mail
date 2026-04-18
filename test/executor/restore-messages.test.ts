@@ -63,6 +63,8 @@ describe('restore_messages', () => {
 
     const links = getReversalLinks(db, intent.id);
     expect(links.reverses).toContain('hold-1');
+    expect(payload.reversible).toBe(true);
+    expect(payload.undo_hint.method).toBe('undo_intent');
   });
 
   it('per-target error for UID with no ledger entry, still moves valid ones', async () => {
@@ -121,6 +123,8 @@ describe('restore_messages', () => {
     const payload = JSON.parse(result[0].text);
     expect(payload.dry_run).toBe(true);
     expect(payload.moved[0]).toMatchObject({ uid: 10, destination_mailbox: 'INBOX' });
+    expect(payload.reversible).toBeUndefined();
+    expect(payload.undo_hint).toBeUndefined();
   });
 
   it('rejects unknown account_id in targets', async () => {

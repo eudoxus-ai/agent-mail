@@ -69,6 +69,8 @@ describe('label_thread with targets', () => {
     expect(payload.accounts_searched.sort()).toEqual(['a@x.com', 'b@y.com']);
     expect(payload.action).toBe('add');
     expect(payload.label).toBe('Important');
+    expect(payload.reversible).toBe(true);
+    expect(payload.undo_hint.method).toBe('undo_intent');
   });
 
   it('rejects targets with unknown account_id', async () => {
