@@ -483,6 +483,9 @@ export class Executor {
       since: intent.params.since
         ? new Date(intent.params.since as string)
         : undefined,
+      before: intent.params.before
+        ? new Date(intent.params.before as string)
+        : undefined,
     };
     const limit = (intent.params.limit as number) ?? 20;
     const query = intent.params.query as string | undefined;
