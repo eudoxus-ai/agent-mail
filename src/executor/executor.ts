@@ -6,6 +6,7 @@ import type { ImapConnectionPool } from '../provider/imap-pool.js';
 import {
   createIntent,
   getIntent,
+  linkReversal,
   updateIntentStatus,
   updateIntentStatusIfCurrent,
   withImmediateTransaction,
@@ -866,6 +867,65 @@ export class Executor {
           original_mailbox: e.mailbox,
         }));
       }
+      return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
+    }
+
+    // Multi-account restore: move messages back to their original mailbox using ledger snapshots
+    if (intent.tool === 'restore_messages') {
+      const targets = intent.params.targets as Target[];
+      const dryRun = (intent.params.dry_run as boolean | undefined) ?? false;
+      const grouped = parseTargets(targets);
+      const accountIds = Object.keys(grouped);
+      const allIds = this.accounts.map((a) => a.id);
+      const unknown = accountIds.filter((id) => !allIds.includes(id));
+      if (unknown.length > 0) throw new Error(`Unknown account_ids in targets: ${unknown.join(', ')}`);
+
+      // Index ledger snapshots by (account_id, uid) → original_mailbox + source intent.
+      const rows = this.db
+        .prepare(
+          `SELECT it.intent_id, it.account_id, it.uid, it.envelope_snapshot
+           FROM intent_targets it
+           JOIN intents i ON i.id = it.intent_id
+           WHERE i.tool = 'hold_messages' AND i.status = 'executed'`
+        )
+        .all() as Array<{ intent_id: string; account_id: string; uid: number; envelope_snapshot: string | null }>;
+      const byKey = new Map<string, { intent_id: string; original_mailbox: string }>();
+      for (const r of rows) {
+        const snap = r.envelope_snapshot ? JSON.parse(r.envelope_snapshot) : null;
+        if (snap?.original_mailbox) {
+          byKey.set(`${r.account_id}:${r.uid}`, { intent_id: r.intent_id, original_mailbox: snap.original_mailbox });
+        }
+      }
+
+      const moved: Array<{ uid: number; account_id: string; destination_mailbox: string }> = [];
+      const errors: Array<{ uid: number; account_id: string; reason: string }> = [];
+      const reverses = new Set<string>();
+
+      for (const [accountId, list] of Object.entries(grouped)) {
+        await this.pool.withConnection(accountId, async (imap) => {
+          const holding = await imap.getMailboxPath('holding');
+          for (const t of list) {
+            const entry = byKey.get(`${accountId}:${t.uid}`);
+            if (!entry) {
+              errors.push({ uid: t.uid, account_id: accountId, reason: 'original_mailbox unknown (not in ledger)' });
+              continue;
+            }
+            if (!dryRun) await imap.moveMessages([t.uid], holding, entry.original_mailbox);
+            moved.push({ uid: t.uid, account_id: accountId, destination_mailbox: entry.original_mailbox });
+            reverses.add(entry.intent_id);
+          }
+        });
+      }
+
+      if (!dryRun && reverses.size > 0) {
+        linkReversal(this.db, { restoreIntentId: intent.id, reverses: [...reverses] });
+      }
+
+      const payload = {
+        dry_run: dryRun,
+        moved,
+        errors,
+      };
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
 

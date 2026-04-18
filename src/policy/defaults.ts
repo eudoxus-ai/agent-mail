@@ -32,6 +32,12 @@ tools:
     override:
       when_thread_has_replies: approval_required
 
+  restore_messages:
+    risk: low
+    gate: configurable
+    default: ungated
+    reversible: true
+
   queue_send:
     risk: high
     gate: always_gated

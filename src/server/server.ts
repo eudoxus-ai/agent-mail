@@ -20,6 +20,7 @@ import { getPendingActionsTool } from '../tools/get-pending-actions.js';
 import { getAuditLogTool } from '../tools/get-audit-log.js';
 import { queueSendTool } from '../tools/queue-send.js';
 import { holdMessagesTool } from '../tools/hold-messages.js';
+import { restoreMessagesTool } from '../tools/restore-messages.js';
 import { undoIntentTool } from '../tools/undo-intent.js';
 import { getOverviewTool, runGetOverview } from '../tools/get-overview.js';
 import { listSendersTool } from '../tools/list-senders.js';
@@ -38,6 +39,7 @@ const ALL_TOOLS: ToolDefinition[] = [
   getAuditLogTool,
   queueSendTool,
   holdMessagesTool,
+  restoreMessagesTool,
   undoIntentTool,
   getOverviewTool,
   listSendersTool,
