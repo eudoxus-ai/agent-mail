@@ -151,3 +151,29 @@ export function getIntentsByStatus(
     .all(status) as Array<Record<string, unknown>>;
   return rows.map(rowToIntent);
 }
+
+export function linkReversal(
+  db: Database,
+  args: { restoreIntentId: string; reverses: string[] }
+): void {
+  db.prepare(`UPDATE intents SET reverses_intent_id = ? WHERE id = ?`).run(
+    JSON.stringify(args.reverses),
+    args.restoreIntentId
+  );
+  const stmt = db.prepare(`UPDATE intents SET reversed_by_intent_id = ? WHERE id = ?`);
+  for (const id of args.reverses) stmt.run(args.restoreIntentId, id);
+}
+
+export function getReversalLinks(
+  db: Database,
+  id: string
+): { reverses: string[]; reversed_by: string | null } {
+  const row = db
+    .prepare(`SELECT reverses_intent_id, reversed_by_intent_id FROM intents WHERE id = ?`)
+    .get(id) as { reverses_intent_id: string | null; reversed_by_intent_id: string | null } | undefined;
+  if (!row) return { reverses: [], reversed_by: null };
+  return {
+    reverses: row.reverses_intent_id ? (JSON.parse(row.reverses_intent_id) as string[]) : [],
+    reversed_by: row.reversed_by_intent_id ?? null,
+  };
+}
