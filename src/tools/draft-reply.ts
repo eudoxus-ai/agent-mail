@@ -3,7 +3,7 @@ import type { ToolDefinition } from '../types.js';
 
 export const draftReplyTool: ToolDefinition = {
   name: 'draft_reply',
-  description: 'Create a draft reply. The draft is saved in the Drafts folder but NOT sent. Use queue_send to send it.',
+  description: 'Create a draft reply in the account\'s Drafts folder. Fully reversible: drafts can be deleted. This server cannot send mail — sending requires `queue_send` followed by human approval.',
   inputSchema: z.object({
     to: z.string().email().describe('Recipient email address'),
     subject: z.string().min(1).describe('Email subject'),
