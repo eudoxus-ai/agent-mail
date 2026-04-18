@@ -25,6 +25,7 @@ import { undoIntentTool } from '../tools/undo-intent.js';
 import { getOverviewTool, runGetOverview } from '../tools/get-overview.js';
 import { listSendersTool } from '../tools/list-senders.js';
 import { listMailboxesTool } from '../tools/list-mailboxes.js';
+import { getIntentTool } from '../tools/get-intent.js';
 
 import { runStartupMigrations } from './startup.js';
 import type { ToolDefinition } from '../types.js';
@@ -44,6 +45,7 @@ const ALL_TOOLS: ToolDefinition[] = [
   getOverviewTool,
   listSendersTool,
   listMailboxesTool,
+  getIntentTool,
 ];
 
 export interface McpServerBundle {

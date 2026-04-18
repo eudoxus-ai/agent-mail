@@ -6,6 +6,7 @@ import type { ImapConnectionPool } from '../provider/imap-pool.js';
 import {
   createIntent,
   getIntent,
+  getReversalLinks,
   linkReversal,
   updateIntentStatus,
   updateIntentStatusIfCurrent,
@@ -27,7 +28,7 @@ import {
 import { generateUndoToken, getUndoExpiry, parseUndoToken } from './undo.js';
 import { fanOut } from './fan-out.js';
 import { parseTargets, type Target } from '../tools/target.js';
-import { insertIntentTargets } from '../ledger/intent-targets.js';
+import { insertIntentTargets, getIntentTargets } from '../ledger/intent-targets.js';
 
 interface SearchThreadResult {
   account_id: string;
@@ -926,6 +927,34 @@ export class Executor {
         moved,
         errors,
       };
+      return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
+    }
+
+    // Read-only DB lookup: return full intent record with targets and reversal links
+    if (intent.tool === 'get_intent') {
+      const id = intent.params.intent_id as string;
+      const row = getIntent(this.db, id);
+      if (!row) {
+        return [{ type: 'text', text: JSON.stringify({ error: 'intent not found', intent_id: id }) }];
+      }
+      const targets = getIntentTargets(this.db, id).map((t) => ({
+        uid: t.uid,
+        account_id: t.account_id,
+        mailbox: t.mailbox,
+        subject: t.envelope_snapshot?.subject ?? null,
+        from: t.envelope_snapshot?.from ?? null,
+      }));
+      const links = getReversalLinks(this.db, id);
+      const payload: Record<string, unknown> = {
+        id: row.id,
+        type: row.tool,
+        created_at: row.created_at,
+        account_id: row.account_id,
+        status: row.status,
+        targets,
+      };
+      if (links.reverses.length > 0) payload.reverses_intent_id = links.reverses;
+      if (links.reversed_by) payload.reversed_by_intent_id = links.reversed_by;
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
 
