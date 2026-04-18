@@ -19,7 +19,7 @@ import { unsubscribeSenderTool } from '../tools/unsubscribe-sender.js';
 import { getPendingActionsTool } from '../tools/get-pending-actions.js';
 import { getAuditLogTool } from '../tools/get-audit-log.js';
 import { queueSendTool } from '../tools/queue-send.js';
-import { quarantineThreadTool } from '../tools/quarantine-thread.js';
+import { quarantineMessagesTool, quarantineThreadTool } from '../tools/quarantine-thread.js';
 import { undoIntentTool } from '../tools/undo-intent.js';
 import { getOverviewTool, runGetOverview } from '../tools/get-overview.js';
 import { listSendersTool } from '../tools/list-senders.js';
@@ -36,7 +36,8 @@ const ALL_TOOLS: ToolDefinition[] = [
   getPendingActionsTool,
   getAuditLogTool,
   queueSendTool,
-  quarantineThreadTool,
+  quarantineMessagesTool,
+  quarantineThreadTool, // deprecated alias for quarantine_messages
   undoIntentTool,
   getOverviewTool,
   listSendersTool,
