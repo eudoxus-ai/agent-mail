@@ -185,3 +185,12 @@ export interface SearchCriteria {
   seen?: boolean;
   mailbox?: string;
 }
+
+// === Multi-account envelope ===
+
+export interface MultiAccountEnvelope<T> {
+  accounts_searched: string[];
+  accounts_available: string[];
+  per_account_errors?: Record<string, string>;
+  results: T;
+}
