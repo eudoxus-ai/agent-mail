@@ -449,11 +449,11 @@ export class ImapProvider {
   }
 
   async getMailboxPath(
-    name: 'inbox' | 'drafts' | 'sent' | 'trash' | 'quarantine'
+    name: 'inbox' | 'drafts' | 'sent' | 'trash' | 'holding'
   ): Promise<string> {
-    if (name === 'quarantine') {
-      await this.ensureMailbox('agent-mail-quarantine');
-      return 'agent-mail-quarantine';
+    if (name === 'holding') {
+      await this.ensureMailbox('agent-mail-holding');
+      return 'agent-mail-holding';
     }
 
     const mailboxes = await this.client.list();
