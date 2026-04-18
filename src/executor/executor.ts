@@ -26,6 +26,7 @@ import {
 import { generateUndoToken, getUndoExpiry, parseUndoToken } from './undo.js';
 import { fanOut } from './fan-out.js';
 import { parseTargets, type Target } from '../tools/target.js';
+import { insertIntentTargets } from '../ledger/intent-targets.js';
 
 interface SearchThreadResult {
   account_id: string;
@@ -755,6 +756,7 @@ export class Executor {
     if (intent.tool === 'hold_messages') {
       const targets = intent.params.targets as Target[];
       const dryRun = (intent.params.dry_run as boolean | undefined) ?? false;
+      const includeSummary = (intent.params.include_summary as boolean | undefined) ?? false;
       const grouped = parseTargets(targets);
       const accountIds = Object.keys(grouped);
       const allIds = this.accounts.map((a) => a.id);
@@ -780,9 +782,29 @@ export class Executor {
             uids: number[];
           }> = [];
 
+          const envelopeSnapshots: Array<{
+            account_id: string;
+            uid: number;
+            mailbox: string;
+            subject: string;
+            from: string;
+          }> = [];
+
           const holding = await imap.getMailboxPath('holding');
 
           for (const [mailbox, uids] of byMailbox) {
+            if (includeSummary || !dryRun) {
+              const envs = await imap.fetchEnvelopes(mailbox, uids);
+              for (const env of envs) {
+                envelopeSnapshots.push({
+                  account_id: accountId,
+                  uid: env.uid,
+                  mailbox,
+                  subject: env.subject,
+                  from: env.from.address,
+                });
+              }
+            }
             if (!dryRun) {
               await imap.moveMessages(uids, mailbox, holding);
             }
@@ -792,13 +814,30 @@ export class Executor {
           return {
             account_id: accountId,
             per_mailbox: perMailbox,
+            envelopes: envelopeSnapshots,
             message_count: perMailbox.reduce((n, m) => n + m.message_count, 0),
           };
         },
       });
 
-      const perAccount = Object.values(fanResult.per_account);
-      const totalMessages = perAccount.reduce((n, a) => n + a.message_count, 0);
+      const perAccountRaw = Object.values(fanResult.per_account);
+
+      // Aggregate envelopes from all accounts (internal scaffolding — not exposed)
+      const allEnvelopes = perAccountRaw.flatMap((a: any) => a.envelopes ?? []);
+
+      // Persist targets to ledger on real (non-dry) runs
+      if (!dryRun && allEnvelopes.length > 0) {
+        insertIntentTargets(this.db, intent.id, allEnvelopes.map((e: any) => ({
+          account_id: e.account_id,
+          uid: e.uid,
+          mailbox: e.mailbox,
+          envelope_snapshot: { subject: e.subject, from: e.from, original_mailbox: e.mailbox },
+        })));
+      }
+
+      // Strip internal `envelopes` field before building the public payload
+      const perAccount = perAccountRaw.map(({ envelopes: _envs, ...rest }: any) => rest);
+      const totalMessages = perAccount.reduce((n: number, a: any) => n + a.message_count, 0);
 
       const payload: {
         accounts_searched: string[];
@@ -807,6 +846,7 @@ export class Executor {
         dry_run: boolean;
         total_messages: number;
         per_account: typeof perAccount;
+        moved?: Array<{ uid: number; account_id: string; subject: string; from: string; original_mailbox: string }>;
       } = {
         accounts_searched: fanResult.accounts_searched,
         accounts_available: allIds,
@@ -816,6 +856,15 @@ export class Executor {
       };
       if (Object.keys(fanResult.errors).length > 0) {
         payload.per_account_errors = fanResult.errors;
+      }
+      if (includeSummary) {
+        payload.moved = allEnvelopes.map((e: any) => ({
+          uid: e.uid,
+          account_id: e.account_id,
+          subject: e.subject,
+          from: e.from,
+          original_mailbox: e.mailbox,
+        }));
       }
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }

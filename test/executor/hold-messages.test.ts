@@ -21,6 +21,7 @@ describe('hold_messages', () => {
         fn({
           getMailboxPath: async () => 'agent-mail-holding',
           moveMessages: async () => { moveCalls.push(accountId); },
+          fetchEnvelopes: async () => [],
         })
       ),
     };
@@ -46,6 +47,7 @@ describe('hold_messages', () => {
         fn({
           getMailboxPath: async () => 'agent-mail-holding',
           moveMessages: async (uids: number[]) => { moveCalls.push({ accountId, uids }); },
+          fetchEnvelopes: async () => [],
         })
       ),
     };

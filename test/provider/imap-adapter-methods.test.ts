@@ -78,3 +78,37 @@ describe('ImapProvider.deleteMailbox', () => {
     expect(mailboxDelete).toHaveBeenCalledWith('agent-mail-quarantine');
   });
 });
+
+describe('ImapProvider.fetchEnvelopes (slim fields)', () => {
+  it('returns uid, subject, and from.address for each UID', async () => {
+    const provider = makeProvider();
+    const lock = { release: vi.fn() };
+    const fakeMessages = [
+      {
+        uid: 42,
+        envelope: {
+          subject: 'Hello world',
+          from: [{ address: 'sender@example.com', name: 'Sender' }],
+          to: [],
+          cc: [],
+          messageId: '<abc@example.com>',
+          date: new Date('2024-01-01T00:00:00Z'),
+        },
+        flags: new Set<string>(),
+        source: Buffer.from(''),
+      },
+    ];
+    async function* fakeAsyncIter() { yield* fakeMessages; }
+    (provider as any).client = {
+      async getMailboxLock() { return lock; },
+      fetch: () => fakeAsyncIter(),
+    };
+    const results = await provider.fetchEnvelopes('INBOX', [42]);
+    expect(results).toHaveLength(1);
+    expect(results[0].uid).toBe(42);
+    expect(results[0].subject).toBe('Hello world');
+    // from is a Participant object; the address field should be normalised to lower-case
+    expect(results[0].from.address).toBe('sender@example.com');
+    expect(lock.release).toHaveBeenCalled();
+  });
+});
