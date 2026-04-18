@@ -527,15 +527,17 @@ export class Executor {
         }));
 
         // Populate snippet for threads that don't already have one.
-        // Done in parallel per-thread. Each call adds one extra IMAP round-trip,
-        // so search_threads now issues N+1 IMAP calls per page (1 search + N snippet fetches).
-        await Promise.all(
-          baseResults.map(async (r) => {
-            if (!r.snippet) {
-              r.snippet = await imap.fetchSnippet(mailbox, r.uid);
-            }
-          })
-        );
+        // Only runs when include_snippets: true — each call adds one extra IMAP round-trip
+        // (N+1 calls per page). Default is off to keep searches fast.
+        if (intent.params.include_snippets === true) {
+          await Promise.all(
+            baseResults.map(async (r) => {
+              if (!r.snippet) {
+                r.snippet = await imap.fetchSnippet(mailbox, r.uid);
+              }
+            })
+          );
+        }
 
         return baseResults;
       },
