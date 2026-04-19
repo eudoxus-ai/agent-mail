@@ -4,6 +4,7 @@ import type { Logger } from '../logger.js';
 import type { Executor } from '../executor/executor.js';
 import { evaluatePolicy } from '../policy/engine.js';
 import { getAccount, getDefaultAccount } from '../provider/accounts.js';
+import { describeIntent } from '../ledger/audit-summary.js';
 
 export interface MiddlewareDeps {
   db: Database;
@@ -12,6 +13,7 @@ export interface MiddlewareDeps {
   accounts: AccountConfig[];
   logger: Logger;
   agentId: string;
+  reviewerPort?: number;
 }
 
 export function wrapToolHandler(
@@ -98,6 +100,8 @@ export function wrapToolHandler(
           risk: policyResult.risk,
         });
 
+        const reviewerPort = deps.reviewerPort ?? 4242;
+        const humanSummary = describeIntent(canonicalToolName, params);
         return {
           content: [
             {
@@ -105,6 +109,8 @@ export function wrapToolHandler(
               text: JSON.stringify({
                 status: 'pending',
                 intent_id: intent.id,
+                approval_url: `http://127.0.0.1:${reviewerPort}/intents/${intent.id}`,
+                human_summary: humanSummary,
                 message: `Action queued for approval: ${toolDef.name}`,
                 reason: policyResult.reason,
               }),

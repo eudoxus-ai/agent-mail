@@ -63,8 +63,15 @@ export interface McpServerBundle {
   pool: ImapConnectionPool;
 }
 
-export async function createMcpServer(): Promise<McpServerBundle> {
+export interface CreateMcpServerOptions {
+  reviewerPort?: number;
+}
+
+export async function createMcpServer(
+  options: CreateMcpServerOptions = {}
+): Promise<McpServerBundle> {
   const logger = createLogger('mcp');
+  const reviewerPort = options.reviewerPort ?? 4242;
 
   // Verify Keychain access
   try {
@@ -238,6 +245,7 @@ export async function createMcpServer(): Promise<McpServerBundle> {
       accounts,
       logger,
       agentId,
+      reviewerPort,
     });
 
     server.tool(
