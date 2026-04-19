@@ -11,6 +11,7 @@ const sample = {
   },
   snippet: 's', flags: [],
   list_id: null, list_unsubscribe: null, is_list_mail: false,
+  category: 'personal',
   target: { account_id: 'a', uid: 7, mailbox: 'INBOX' },
 };
 
@@ -32,8 +33,13 @@ describe('projectResult', () => {
     });
   });
   it('ALLOWED_FIELDS lists core projectable fields', () => {
-    for (const f of ['uid', 'subject', 'from_address', 'from_name', 'date', 'target']) {
+    for (const f of ['uid', 'subject', 'from_address', 'from_name', 'date', 'target', 'category']) {
       expect(ALLOWED_FIELDS).toContain(f);
     }
+  });
+  it('projects category field when requested', () => {
+    expect(projectResult(sample, ['uid', 'category'])).toEqual({
+      uid: 7, category: 'personal',
+    });
   });
 });

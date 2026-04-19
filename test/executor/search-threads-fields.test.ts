@@ -123,6 +123,46 @@ describe('search_threads fields projection', () => {
     }
   });
 
+  it('full-shape result includes a valid category heuristic', async () => {
+    const { executor } = buildExecutor(fakeCorpus());
+
+    const { result } = await executor.executeImmediate({
+      tool: 'search_threads',
+      toolParams: { limit: 5 },
+      accountId: 'a@x.com',
+      agentId: 'test',
+      risk: 'none',
+    });
+
+    const payload = JSON.parse(result[0].text);
+    expect(payload.results).toHaveLength(5);
+    const valid = ['newsletter', 'promotional', 'transactional', 'notification', 'personal'];
+    for (const r of payload.results) {
+      expect(r).toHaveProperty('category');
+      expect(valid).toContain(r.category);
+    }
+  });
+
+  it('projects `["uid", "category"]` to exactly those keys', async () => {
+    const { executor } = buildExecutor(fakeCorpus());
+
+    const { result } = await executor.executeImmediate({
+      tool: 'search_threads',
+      toolParams: { limit: 5, fields: ['uid', 'category'] },
+      accountId: 'a@x.com',
+      agentId: 'test',
+      risk: 'none',
+    });
+
+    const payload = JSON.parse(result[0].text);
+    expect(payload.results).toHaveLength(5);
+    const valid = ['newsletter', 'promotional', 'transactional', 'notification', 'personal'];
+    for (const r of payload.results) {
+      expect(Object.keys(r).sort()).toEqual(['category', 'uid']);
+      expect(valid).toContain(r.category);
+    }
+  });
+
   it('omits both flat and nested sender fields when `fields: ["uid"]`', async () => {
     const { executor } = buildExecutor(fakeCorpus());
 

@@ -4,6 +4,7 @@ export const ALLOWED_FIELDS = [
   'from_address', 'from_name',
   'snippet', 'flags',
   'list_id', 'list_unsubscribe', 'is_list_mail',
+  'category',
   'target',
 ] as const;
 
@@ -24,6 +25,7 @@ interface FullResult {
   list_id: string | null;
   list_unsubscribe: string | null;
   is_list_mail: boolean;
+  category: string;
   target: { account_id: string; uid: number; mailbox: string };
 }
 
@@ -50,6 +52,7 @@ export function projectResult(
       case 'list_id': out.list_id = r.list_id; break;
       case 'list_unsubscribe': out.list_unsubscribe = r.list_unsubscribe; break;
       case 'is_list_mail': out.is_list_mail = r.is_list_mail; break;
+      case 'category': out.category = r.category; break;
       case 'target': out.target = r.target; break;
     }
   }

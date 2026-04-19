@@ -1,6 +1,7 @@
 import type { Database } from '../ledger/sqlite.js';
 import type { AccountConfig, Intent, RiskLevel } from '../types.js';
 import { isListMail } from '../attention/signals.js';
+import { classifyCategory, type Category } from '../attention/category.js';
 import type { Logger } from '../logger.js';
 import type { ImapConnectionPool } from '../provider/imap-pool.js';
 import {
@@ -51,6 +52,7 @@ interface SearchThreadResult {
   list_id: string | null;
   list_unsubscribe: string | null;
   is_list_mail: boolean;
+  category: Category;
   target: { account_id: string; uid: number; mailbox: string };
 }
 
@@ -533,6 +535,11 @@ export class Executor {
           list_id: r.list_id ?? null,
           list_unsubscribe: r.list_unsubscribe ?? null,
           is_list_mail: isListMail(r.list_unsubscribe, r.list_id),
+          category: classifyCategory({
+            list_id: r.list_id ?? null,
+            list_unsubscribe: r.list_unsubscribe ?? null,
+            subject: r.envelope?.subject ?? '',
+          }),
           target: { account_id: accountId, uid: r.uid, mailbox },
         }));
 
