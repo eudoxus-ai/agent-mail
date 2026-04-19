@@ -1266,6 +1266,49 @@ export class Executor {
       }
     }
 
+    // Policy's `when_thread_has_replies: approval_required` override can't be
+    // evaluated by the middleware for hold_by_sender because the UID list
+    // hasn't been expanded yet. Enforce the gate here, after expansion,
+    // before any move. Fail-closed with a structured error so Claude Chat
+    // (or any caller) can relay a specific next-step hint. We also run this
+    // check on dry_run to surface the warning in previews.
+    if (expandedTargets.length > 0) {
+      // Group by (account_id, mailbox). hold_by_sender only searches a single
+      // mailbox per call today, but grouping matches threadHasReplies's
+      // expected per-mailbox shape and future-proofs multi-mailbox cases.
+      const groups = new Map<string, { accountId: string; mailbox: string; uids: number[] }>();
+      for (const t of expandedTargets) {
+        const mbx = t.mailbox ?? 'INBOX';
+        const key = `${t.account_id}\u0000${mbx}`;
+        const g = groups.get(key) ?? { accountId: t.account_id, mailbox: mbx, uids: [] };
+        g.uids.push(t.uid);
+        groups.set(key, g);
+      }
+      let repliedGroupCount = 0;
+      for (const g of groups.values()) {
+        // eslint-disable-next-line no-await-in-loop
+        const has = await this.threadHasReplies(g.accountId, g.mailbox, g.uids);
+        if (has) repliedGroupCount += 1;
+      }
+      if (repliedGroupCount > 0) {
+        const errorPayload = {
+          error: true,
+          code: 'replies_present',
+          message:
+            `hold_by_sender matched ${expandedTargets.length} message(s) ` +
+            `in ${repliedGroupCount} replied thread group(s). Policy requires ` +
+            `approval for threads with replies, which this bulk tool cannot route. ` +
+            `Re-run with specific UIDs via hold_messages (which gates replied ` +
+            `threads through approval), or inspect the expanded UID list via ` +
+            `dry_run: true first.`,
+          matched_count: expandedTargets.length,
+          replied_thread_count: repliedGroupCount,
+          hint: 'Use dry_run: true to preview, then hand-select UIDs via hold_messages.',
+        };
+        return [{ type: 'text', text: JSON.stringify(errorPayload, null, 2) }];
+      }
+    }
+
     if (expandedTargets.length === 0) {
       const payload: {
         accounts_searched: string[];
