@@ -80,6 +80,7 @@ export interface PolicyResult {
   risk: RiskLevel;
   reason: string;
   reversible: boolean;
+  unknownTool?: boolean;
 }
 
 export interface ToolPolicy {

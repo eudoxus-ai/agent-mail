@@ -84,10 +84,15 @@ export function wrapToolHandler(
       const policyResult = evaluatePolicy(deps.policy, canonicalToolName, policyContext);
 
       if (policyResult.decision === 'gate') {
-        // Create gated intent
+        // Create gated intent. Unknown-tool fallbacks carry a marker so the
+        // reviewer daemon can suppress their noisy notifications.
+        const toolParamsToStore = policyResult.unknownTool
+          ? { ...params, __unknown_tool_fallback: true }
+          : params;
+
         const intent = await deps.executor.createGatedIntent({
           tool: canonicalToolName,
-          toolParams: params,
+          toolParams: toolParamsToStore,
           accountId: resolvedAccountId,
           agentId: deps.agentId,
           risk: policyResult.risk,

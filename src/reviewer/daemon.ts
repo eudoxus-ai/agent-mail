@@ -6,6 +6,7 @@ import { Executor } from '../executor/executor.js';
 import { createReviewerApp } from './app.js';
 import { IntentWatcher } from './watcher.js';
 import { notifyIntent } from './notify.js';
+import { shouldNotify } from './notification-policy.js';
 import { createLogger } from '../logger.js';
 import { ACCOUNTS_YAML_PATH, LEDGER_DB_PATH } from '../config.js';
 
@@ -33,8 +34,12 @@ export async function startDaemon(port: number = 4242): Promise<void> {
     db,
     pollingIntervalMs: 3000,
     onNewIntent: (intent) => {
-      logger.info(`New pending intent: ${intent.id} (${intent.tool})`);
-      notifyIntent(intent, port);
+      logger.info(`New pending intent: ${intent.id} (${intent.tool}, risk=${intent.risk})`);
+      if (shouldNotify(intent)) {
+        notifyIntent(intent, port);
+      } else {
+        logger.debug(`Suppressed notification for low-priority intent ${intent.id}`);
+      }
     },
   });
   watcher.start();
