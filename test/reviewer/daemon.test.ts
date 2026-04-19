@@ -3,8 +3,8 @@ import { openDatabase } from '../../src/ledger/db.js';
 import { createIntent } from '../../src/ledger/intents.js';
 import type { Database } from '../../src/ledger/sqlite.js';
 import { IntentWatcher } from '../../src/reviewer/watcher.js';
-import { shouldNotify } from '../../src/reviewer/notification-policy.js';
-import type { Intent } from '../../src/types.js';
+import { createIntentNotifier } from '../../src/reviewer/daemon.js';
+import { createLogger } from '../../src/logger.js';
 
 let db: Database;
 
@@ -12,17 +12,14 @@ beforeEach(() => {
   db = openDatabase(':memory:');
 });
 
-/**
- * The daemon wraps `notifyIntent` with `shouldNotify`. These tests mirror
- * that wiring exactly so we can verify suppression behavior without
- * spinning up the HTTP listener.
- */
-function makeWrappedOnNewIntent(notify: (intent: Intent) => void) {
-  return (intent: Intent) => {
-    if (shouldNotify(intent)) {
-      notify(intent);
-    }
-  };
+const PORT = 4242;
+
+function makeNotifier(notify: ReturnType<typeof vi.fn>) {
+  return createIntentNotifier({
+    logger: createLogger('test'),
+    port: PORT,
+    notify,
+  });
 }
 
 describe('daemon notification wiring', () => {
@@ -31,7 +28,7 @@ describe('daemon notification wiring', () => {
     const watcher = new IntentWatcher({
       db,
       pollingIntervalMs: 50,
-      onNewIntent: makeWrappedOnNewIntent(notify),
+      onNewIntent: makeNotifier(notify),
     });
 
     createIntent(db, {
@@ -53,7 +50,7 @@ describe('daemon notification wiring', () => {
     const watcher = new IntentWatcher({
       db,
       pollingIntervalMs: 50,
-      onNewIntent: makeWrappedOnNewIntent(notify),
+      onNewIntent: makeNotifier(notify),
     });
 
     const intent = createIntent(db, {
@@ -69,6 +66,7 @@ describe('daemon notification wiring', () => {
 
     expect(notify).toHaveBeenCalledTimes(1);
     expect(notify.mock.calls[0][0].id).toBe(intent.id);
+    expect(notify.mock.calls[0][1]).toBe(PORT);
   });
 
   it('suppresses notifications tagged with __unknown_tool_fallback', async () => {
@@ -76,7 +74,7 @@ describe('daemon notification wiring', () => {
     const watcher = new IntentWatcher({
       db,
       pollingIntervalMs: 50,
-      onNewIntent: makeWrappedOnNewIntent(notify),
+      onNewIntent: makeNotifier(notify),
     });
 
     createIntent(db, {

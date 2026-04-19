@@ -9,6 +9,26 @@ import { notifyIntent } from './notify.js';
 import { shouldNotify } from './notification-policy.js';
 import { createLogger } from '../logger.js';
 import { ACCOUNTS_YAML_PATH, LEDGER_DB_PATH } from '../config.js';
+import type { Intent } from '../types.js';
+import type { Logger } from '../logger.js';
+
+export interface NotifierDeps {
+  logger: Logger;
+  port: number;
+  notify?: (intent: Intent, port: number) => void;
+}
+
+export function createIntentNotifier(deps: NotifierDeps): (intent: Intent) => void {
+  const notify = deps.notify ?? notifyIntent;
+  return (intent) => {
+    deps.logger.info(`New pending intent: ${intent.id} (${intent.tool}, risk=${intent.risk})`);
+    if (shouldNotify(intent)) {
+      notify(intent, deps.port);
+    } else {
+      deps.logger.debug(`Suppressed notification for low-priority intent ${intent.id}`);
+    }
+  };
+}
 
 export async function startDaemon(port: number = 4242): Promise<void> {
   const logger = createLogger('cli');
@@ -33,14 +53,7 @@ export async function startDaemon(port: number = 4242): Promise<void> {
   const watcher = new IntentWatcher({
     db,
     pollingIntervalMs: 3000,
-    onNewIntent: (intent) => {
-      logger.info(`New pending intent: ${intent.id} (${intent.tool}, risk=${intent.risk})`);
-      if (shouldNotify(intent)) {
-        notifyIntent(intent, port);
-      } else {
-        logger.debug(`Suppressed notification for low-priority intent ${intent.id}`);
-      }
-    },
+    onNewIntent: createIntentNotifier({ logger, port }),
   });
   watcher.start();
 
