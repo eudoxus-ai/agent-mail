@@ -14,7 +14,9 @@ beforeEach(() => {
 
 describe('buildMacOsNotificationArgs', () => {
   it('builds an osascript invocation without shell escaping', () => {
-    expect(buildMacOsNotificationArgs('Review "Quarterly plan"', 4242)).toEqual([
+    expect(
+      buildMacOsNotificationArgs('Review "Quarterly plan"', 4242, 'intent-abc')
+    ).toEqual([
       '-e',
       'on run argv',
       '-e',
@@ -23,7 +25,7 @@ describe('buildMacOsNotificationArgs', () => {
       'end run',
       'Review "Quarterly plan"',
       'agent-mail',
-      'Open reviewer at 127.0.0.1:4242',
+      'http://127.0.0.1:4242/intents/intent-abc',
     ]);
   });
 });
@@ -50,7 +52,7 @@ describe('notifyIntent', () => {
       'osascript',
       expect.arrayContaining([
         'agent-mail',
-        'Open reviewer at 127.0.0.1:4343',
+        'http://127.0.0.1:4343/intents/intent-123',
       ]),
       { timeout: 5000 },
       expect.any(Function)

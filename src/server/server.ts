@@ -7,6 +7,7 @@ import { loadPolicy } from '../policy/engine.js';
 import { Executor } from '../executor/executor.js';
 import { wrapToolHandler } from './middleware.js';
 import { createLogger } from '../logger.js';
+import { DEFAULT_REVIEWER_PORT } from '../config.js';
 import { getPendingIntents } from '../ledger/intents.js';
 import { getAuditLog } from '../ledger/audit.js';
 
@@ -71,7 +72,7 @@ export async function createMcpServer(
   options: CreateMcpServerOptions = {}
 ): Promise<McpServerBundle> {
   const logger = createLogger('mcp');
-  const reviewerPort = options.reviewerPort ?? 4242;
+  const reviewerPort = options.reviewerPort ?? DEFAULT_REVIEWER_PORT;
 
   // Verify Keychain access
   try {

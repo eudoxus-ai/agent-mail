@@ -5,9 +5,9 @@ import { ImapConnectionPool } from '../provider/imap-pool.js';
 import { Executor } from '../executor/executor.js';
 import { createReviewerApp } from '../reviewer/app.js';
 import { createLogger } from '../logger.js';
-import { ACCOUNTS_YAML_PATH, LEDGER_DB_PATH } from '../config.js';
+import { ACCOUNTS_YAML_PATH, LEDGER_DB_PATH, DEFAULT_REVIEWER_PORT } from '../config.js';
 
-export async function startReviewer(port: number = 4242): Promise<void> {
+export async function startReviewer(port: number = DEFAULT_REVIEWER_PORT): Promise<void> {
   const logger = createLogger('cli');
   const host = '127.0.0.1';
 

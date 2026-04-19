@@ -1,10 +1,16 @@
 import { execFile } from 'node:child_process';
 import type { Intent } from '../types.js';
 import { describeIntent } from '../ledger/audit-summary.js';
+import { DEFAULT_REVIEWER_PORT } from '../config.js';
+import { buildApprovalUrl } from './urls.js';
 
 const REVIEWER_TITLE = 'agent-mail';
 
-export function buildMacOsNotificationArgs(summary: string, port: number): string[] {
+export function buildMacOsNotificationArgs(
+  summary: string,
+  port: number,
+  intentId: string
+): string[] {
   return [
     '-e',
     'on run argv',
@@ -14,13 +20,13 @@ export function buildMacOsNotificationArgs(summary: string, port: number): strin
     'end run',
     summary,
     REVIEWER_TITLE,
-    `Open reviewer at 127.0.0.1:${port}`,
+    buildApprovalUrl(port, intentId),
   ];
 }
 
 export function notifyIntent(
   intent: Intent,
-  port: number = 4242,
+  port: number = DEFAULT_REVIEWER_PORT,
   currentPlatform: NodeJS.Platform = process.platform
 ): void {
   const summary = describeIntent(intent.tool, intent.params);
@@ -29,9 +35,16 @@ export function notifyIntent(
     return;
   }
 
-  execFile('osascript', buildMacOsNotificationArgs(summary, port), { timeout: 5000 }, (error) => {
-    if (error) {
-      console.warn(`Failed to post macOS notification for intent ${intent.id}: ${error.message}`);
+  execFile(
+    'osascript',
+    buildMacOsNotificationArgs(summary, port, intent.id),
+    { timeout: 5000 },
+    (error) => {
+      if (error) {
+        console.warn(
+          `Failed to post macOS notification for intent ${intent.id}: ${error.message}`
+        );
+      }
     }
-  });
+  );
 }

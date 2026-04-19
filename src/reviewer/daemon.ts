@@ -8,7 +8,7 @@ import { IntentWatcher } from './watcher.js';
 import { notifyIntent } from './notify.js';
 import { shouldNotify } from './notification-policy.js';
 import { createLogger } from '../logger.js';
-import { ACCOUNTS_YAML_PATH, LEDGER_DB_PATH } from '../config.js';
+import { ACCOUNTS_YAML_PATH, LEDGER_DB_PATH, DEFAULT_REVIEWER_PORT } from '../config.js';
 import type { Intent } from '../types.js';
 import type { Logger } from '../logger.js';
 
@@ -30,7 +30,7 @@ export function createIntentNotifier(deps: NotifierDeps): (intent: Intent) => vo
   };
 }
 
-export async function startDaemon(port: number = 4242): Promise<void> {
+export async function startDaemon(port: number = DEFAULT_REVIEWER_PORT): Promise<void> {
   const logger = createLogger('cli');
   const host = '127.0.0.1';
 
