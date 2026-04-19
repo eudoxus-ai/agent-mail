@@ -17,10 +17,11 @@ export function buildUndoHint(args: UndoHintArgs): {
   if (!REVERSIBLE_TOOLS.has(args.tool)) return null;
   const created = new Date(args.created_at);
   const expires = new Date(created.getTime() + (args.window_ms ?? DEFAULT_WINDOW_MS));
-  const method =
-    args.tool === 'hold_messages' || args.tool === 'hold_by_sender'
-      ? 'restore_messages'
-      : 'undo_intent';
+  // Always recommend `undo_intent`: it takes `intent_id` directly and knows
+  // how to reverse any reversible intent. `restore_messages` takes `targets`
+  // (not `intent_id`), so recommending it in `to_undo` would produce a hint
+  // an agent couldn't follow verbatim.
+  const method = 'undo_intent';
   const window_expires_at = expires.toISOString();
   const to_undo = `To undo: call ${method} with intent_id "${args.intent_id}" (expires ${window_expires_at}).`;
   return {

@@ -105,7 +105,7 @@ describe('MCP triage v3: hold → get_intent → partial restore', () => {
     // -----------------------------------------------------------------------
     expect(holdPayload.moved).toHaveLength(3);
     expect(holdPayload.reversible).toBe(true);
-    expect(holdPayload.undo_hint.method).toBe('restore_messages');
+    expect(holdPayload.undo_hint.method).toBe('undo_intent');
 
     const holdIntentId = holdResult.intent.id;
 

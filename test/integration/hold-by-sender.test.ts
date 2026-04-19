@@ -154,7 +154,7 @@ describe('hold_by_sender integration', () => {
     expect(payload.total_messages).toBe(5);
     expect(payload.moved).toHaveLength(5);
     expect(payload.reversible).toBe(true);
-    expect(payload.undo_hint.method).toBe('restore_messages');
+    expect(payload.undo_hint.method).toBe('undo_intent');
     expect(payload.undo_hint.intent_id).toBe(intent.id);
     expect(intent.undo_token).not.toBeNull();
 
