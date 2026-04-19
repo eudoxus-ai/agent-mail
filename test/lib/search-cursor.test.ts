@@ -14,6 +14,10 @@ describe('search cursor', () => {
     const bad = Buffer.from(JSON.stringify({ foo: 'bar' })).toString('base64url');
     expect(decodeCursor(bad)).toBeNull();
   });
+  it('returns null when before is not a parseable timestamp (regression)', () => {
+    const bad = encodeCursor({ before: 'not-a-date', boundary_seen: [] } as any);
+    expect(decodeCursor(bad)).toBeNull();
+  });
   it('returns null when boundary_seen is not an array', () => {
     const bad = Buffer.from(
       JSON.stringify({ before: '2026-04-18T10:00:00Z', boundary_seen: 'nope' })

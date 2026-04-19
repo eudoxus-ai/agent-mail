@@ -171,6 +171,28 @@ describe('search_threads opaque cursor pagination', () => {
     expect(payload.next_cursor).toBeUndefined();
   });
 
+  it('does not crash on a base64url-JSON cursor with unparseable `before` (regression)', async () => {
+    const corpus = fakeCorpus();
+    const { executor } = buildExecutor(corpus);
+    // Valid base64url + JSON, but `before` is not a date. decodeCursor must
+    // return null so the search falls back to no-cursor semantics.
+    const cursor = Buffer.from(
+      JSON.stringify({ before: 'not-a-date', boundary_seen: [] })
+    ).toString('base64url');
+
+    const { result } = await executor.executeImmediate({
+      tool: 'search_threads',
+      toolParams: { limit: 10, cursor },
+      accountId: 'a@x.com',
+      agentId: 'test',
+      risk: 'none',
+    });
+
+    const payload = JSON.parse(result[0].text);
+    expect(payload.results).toHaveLength(10);
+    expect(payload.results[0].uid).toBe(corpus[0].uid);
+  });
+
   it('does not crash on invalid cursor (treated as absent)', async () => {
     const corpus = fakeCorpus();
     const { executor } = buildExecutor(corpus);

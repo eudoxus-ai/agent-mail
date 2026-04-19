@@ -32,6 +32,11 @@ export function decodeCursor(raw: string): SearchCursor | null {
   try {
     const obj = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'));
     if (!obj || typeof obj.before !== 'string') return null;
+    // `before` must parse to a real timestamp; otherwise downstream
+    // `new Date(before).toISOString()` throws and turns a malformed cursor
+    // into a hard tool failure instead of the documented "treat as absent"
+    // fallback.
+    if (Number.isNaN(new Date(obj.before).getTime())) return null;
     if (!Array.isArray(obj.boundary_seen)) return null;
     if (!obj.boundary_seen.every(isBoundaryRow)) return null;
     return { before: obj.before, boundary_seen: obj.boundary_seen };
