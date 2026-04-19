@@ -610,25 +610,33 @@ export class Executor {
       },
     });
 
-    // Apply cursor tuple filter: strictly (date, uid) < (cursor.before,
-    // cursor.lastUid). This is what makes boundary-timestamp pagination
-    // correct — strict date-only less-than would lose rows that share the
-    // cursor boundary date but have uid > lastUid.
+    // Apply cursor filter: keep rows strictly older than `cursor.before`, and
+    // rows at the boundary date only if their `{account_id, mailbox, uid}`
+    // tuple was NOT already emitted on the previous page. UIDs are only
+    // unique per account/mailbox, so a scalar UID comparison would drop
+    // cross-account boundary rows (e.g. account B's uid=5 at the same
+    // timestamp as account A's uid=100).
     const cursorBoundaryMs = decodedCursor
       ? new Date(decodedCursor.before).getTime()
       : null;
-    const cursorLastUid = decodedCursor ? decodedCursor.lastUid : null;
+    const boundarySeenKeys = decodedCursor
+      ? new Set(
+          decodedCursor.boundary_seen.map(
+            (r) => `${r.account_id}\x00${r.mailbox}\x00${r.uid}`
+          )
+        )
+      : null;
     const allResults = Object.values(fanResult.per_account)
       .flat()
       .filter((r) => {
-        if (cursorBoundaryMs === null || cursorLastUid === null) return true;
+        if (cursorBoundaryMs === null || boundarySeenKeys === null) return true;
         const rowMs = new Date(r.envelope.date).getTime();
-        // Continuation rule for a newest-first listing: rows come AFTER the
-        // cursor if either their date is strictly older, or they share the
-        // boundary date but have a larger UID (we sort same-date groups by
-        // uid ascending and emit them in that stable order).
         if (rowMs < cursorBoundaryMs) return true;
-        if (rowMs === cursorBoundaryMs) return r.uid > cursorLastUid;
+        if (rowMs === cursorBoundaryMs) {
+          return !boundarySeenKeys.has(
+            `${r.account_id}\x00${r.mailbox}\x00${r.uid}`
+          );
+        }
         return false;
       })
       .sort(
@@ -656,9 +664,21 @@ export class Executor {
     }
     if (allResults.length >= limit && allResults.length > 0) {
       const oldest = allResults[allResults.length - 1];
+      const boundaryDate = oldest.envelope.date;
+      const boundaryMs = new Date(boundaryDate).getTime();
+      // Every row on this page sharing the oldest date must be recorded, not
+      // just the last one — otherwise page 2 would re-emit the boundary rows
+      // we already returned. Capped at `limit` entries.
+      const boundary_seen = allResults
+        .filter((r) => new Date(r.envelope.date).getTime() === boundaryMs)
+        .map((r) => ({
+          account_id: r.account_id,
+          mailbox: r.mailbox,
+          uid: r.uid,
+        }));
       payload.next_cursor = encodeCursor({
-        before: oldest.envelope.date,
-        lastUid: oldest.uid,
+        before: boundaryDate,
+        boundary_seen,
       });
     }
     return payload;

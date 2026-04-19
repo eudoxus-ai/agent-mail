@@ -111,7 +111,10 @@ describe('search_threads opaque cursor pagination', () => {
     expect(decoded).not.toBeNull();
     // oldest of first page is the 10th newest = index 9 in corpus
     expect(decoded!.before).toBe(corpus[9].envelope.date);
-    expect(decoded!.lastUid).toBe(corpus[9].uid);
+    // boundary_seen should contain the single row at the boundary date.
+    expect(decoded!.boundary_seen).toEqual([
+      { account_id: 'a@x.com', mailbox: 'INBOX', uid: corpus[9].uid },
+    ]);
   });
 
   it('advances past the first page when cursor is passed back', async () => {
@@ -259,13 +262,95 @@ describe('search_threads opaque cursor pagination', () => {
     expect(combined).toEqual(corpus.map((r) => r.uid).sort((a, b) => a - b));
   });
 
+  it('preserves cross-account boundary rows with the same timestamp (regression)', async () => {
+    // Two accounts, each with 10 messages at EXACTLY the same timestamp.
+    // UIDs overlap across accounts (both use 1..10). A cursor keyed by a
+    // single lastUid will drop account B's rows on page 2 because their
+    // UIDs are not strictly greater than account A's lastUid.
+    const sharedDate = '2026-04-15T12:00:00.000Z';
+    const makeCorpus = () =>
+      Array.from({ length: 10 }, (_, i) => ({
+        uid: i + 1,
+        envelope: {
+          message_id: `m${i}`,
+          subject: `s ${i}`,
+          from: { address: 'x@y', name: null },
+          date: sharedDate,
+        },
+        snippet: '',
+        flags: [],
+        list_id: null,
+        list_unsubscribe: null,
+      }));
+    const corpusA = makeCorpus();
+    const corpusB = makeCorpus();
+    const searchSpy = vi.fn(async (_mailbox: string, criteria: any, limit: number, accountId: string) => {
+      let rows = accountId === 'a@x.com' ? corpusA : corpusB;
+      if (criteria.before instanceof Date) {
+        const beforeMs = criteria.before.getTime();
+        rows = rows.filter((r) => new Date(r.envelope.date).getTime() < beforeMs);
+      }
+      return rows.slice(0, limit);
+    });
+    const pool = {
+      withConnection: vi.fn(async (id: string, fn: any) =>
+        fn({
+          search: (mailbox: string, criteria: any, lim: number) => searchSpy(mailbox, criteria, lim, id),
+          fetchSnippet: async () => '',
+        })
+      ),
+    };
+    const multiAccounts: AccountConfig[] = [
+      { id: 'a@x.com', email: 'a@x.com', imap: { host: 'h', port: 993, tls: true }, smtp: { host: 'h', port: 465, tls: true } },
+      { id: 'b@x.com', email: 'b@x.com', imap: { host: 'h', port: 993, tls: true }, smtp: { host: 'h', port: 465, tls: true } },
+    ];
+    const executor = new Executor({
+      db: openDatabase(':memory:'),
+      accounts: multiAccounts,
+      pool: pool as any,
+      logger,
+    });
+
+    const page1 = JSON.parse(
+      (await executor.executeImmediate({
+        tool: 'search_threads',
+        toolParams: { limit: 10 },
+        accountId: 'a@x.com',
+        agentId: 'test',
+        risk: 'none',
+      })).result[0].text
+    );
+    expect(page1.results).toHaveLength(10);
+    expect(page1.next_cursor).toBeTruthy();
+
+    const page2 = JSON.parse(
+      (await executor.executeImmediate({
+        tool: 'search_threads',
+        toolParams: { limit: 10, cursor: page1.next_cursor },
+        accountId: 'a@x.com',
+        agentId: 'test',
+        risk: 'none',
+      })).result[0].text
+    );
+
+    // The remaining 10 rows (from the other account) must surface, not be
+    // dropped because their UIDs collide with the already-seen account's.
+    expect(page2.results).toHaveLength(10);
+    const toKey = (r: any) => `${r.account_id}:${r.uid}`;
+    const page1Keys = new Set(page1.results.map(toKey));
+    const page2Keys = page2.results.map(toKey);
+    for (const k of page2Keys) expect(page1Keys.has(k)).toBe(false);
+    const combined = new Set([...page1Keys, ...page2Keys]);
+    expect(combined.size).toBe(20);
+  });
+
   it('cursor overrides `before` param', async () => {
     const corpus = fakeCorpus();
     const { executor, searchSpy } = buildExecutor(corpus);
 
     const cursor = encodeCursor({
       before: '2026-04-20T00:00:00.000Z',
-      lastUid: 9999,
+      boundary_seen: [],
     });
 
     await executor.executeImmediate({
