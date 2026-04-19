@@ -96,7 +96,7 @@ describe('hold_messages include_summary', () => {
     expect(targets[1].destination_uid).toBe(1011);
   });
 
-  it('omits moved when include_summary is not set; still persists targets on real run', async () => {
+  it('omits moved when include_summary is explicitly false; still persists targets on real run', async () => {
     const pool = {
       withConnection: vi.fn(async (_: string, fn: any) =>
         fn({
@@ -111,7 +111,7 @@ describe('hold_messages include_summary', () => {
     const executor = new Executor({ db, accounts, pool: pool as any, logger });
     const { intent, result } = await executor.executeImmediate({
       tool: 'hold_messages',
-      toolParams: { targets: [{ account_id: 'a@x.com', uid: 10, mailbox: 'INBOX' }] },
+      toolParams: { targets: [{ account_id: 'a@x.com', uid: 10, mailbox: 'INBOX' }], include_summary: false },
       accountId: 'a@x.com', agentId: 'test', risk: 'medium',
     });
     const payload = JSON.parse(result[0].text);

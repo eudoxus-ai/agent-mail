@@ -806,7 +806,7 @@ export class Executor {
     if (intent.tool === 'hold_messages') {
       const targets = intent.params.targets as Target[];
       const dryRun = (intent.params.dry_run as boolean | undefined) ?? false;
-      const includeSummary = (intent.params.include_summary as boolean | undefined) ?? false;
+      const includeSummary = (intent.params.include_summary as boolean | undefined) ?? true;
       return this.holdTargets(intent, targets, { dryRun, includeSummary });
     }
 

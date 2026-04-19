@@ -9,8 +9,8 @@ import { undoIntentTool } from '../../src/tools/undo-intent.js';
 
 describe('mutation tool descriptions lead with reversibility', () => {
   it('hold_messages', () => {
-    expect(holdMessagesTool.description).toMatch(/Fully reversible/);
-    expect(holdMessagesTool.description).toMatch(/This server cannot permanently delete/);
+    expect(holdMessagesTool.description).toMatch(/REVERSIBLE for 30 days/);
+    expect(holdMessagesTool.description).toMatch(/cannot permanently delete/);
   });
   it('restore_messages', () => {
     expect(restoreMessagesTool.description).toMatch(/Fully reversible/);
