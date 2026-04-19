@@ -186,6 +186,79 @@ describe('search_threads opaque cursor pagination', () => {
     expect(payload.results[0].uid).toBe(corpus[0].uid);
   });
 
+  it('includes boundary-timestamp rows when 15 messages share one date (regression)', async () => {
+    // 15 messages, all sharing the SAME timestamp, distinct UIDs.
+    // A naive cursor that only passes `before` (strict less-than on IMAP
+    // SEARCH) will return 0 rows on page 2 since nothing is strictly older.
+    const sharedDate = '2026-04-15T12:00:00.000Z';
+    const corpus = Array.from({ length: 15 }, (_, i) => ({
+      uid: 2000 + i,
+      envelope: {
+        message_id: `m${i}`,
+        subject: `s ${i}`,
+        from: { address: 'x@y', name: null },
+        date: sharedDate,
+      },
+      snippet: '',
+      flags: [],
+      list_id: null,
+      list_unsubscribe: null,
+    }));
+    // Search spy: filter by before (strict <) if provided, else return all.
+    // This mirrors real IMAP SEARCH BEFORE semantics (date-exclusive).
+    const searchSpy = vi.fn(async (_mailbox: string, criteria: any, limit: number) => {
+      let rows = corpus;
+      if (criteria.before instanceof Date) {
+        const beforeMs = criteria.before.getTime();
+        rows = rows.filter((r) => new Date(r.envelope.date).getTime() < beforeMs);
+      }
+      return rows.slice(0, limit);
+    });
+    const pool = {
+      withConnection: vi.fn(async (_id: string, fn: any) =>
+        fn({ search: searchSpy, fetchSnippet: async () => '' })
+      ),
+    };
+    const executor = new Executor({
+      db: openDatabase(':memory:'),
+      accounts: accounts(),
+      pool: pool as any,
+      logger,
+    });
+
+    const page1 = JSON.parse(
+      (await executor.executeImmediate({
+        tool: 'search_threads',
+        toolParams: { limit: 10 },
+        accountId: 'a@x.com',
+        agentId: 'test',
+        risk: 'none',
+      })).result[0].text
+    );
+    expect(page1.results).toHaveLength(10);
+    expect(page1.next_cursor).toBeTruthy();
+    const page1Uids = page1.results.map((r: any) => r.uid);
+
+    const page2 = JSON.parse(
+      (await executor.executeImmediate({
+        tool: 'search_threads',
+        toolParams: { limit: 10, cursor: page1.next_cursor },
+        accountId: 'a@x.com',
+        agentId: 'test',
+        risk: 'none',
+      })).result[0].text
+    );
+
+    // The 5 remaining messages (not returned on page 1) should surface here.
+    expect(page2.results).toHaveLength(5);
+    const page2Uids = page2.results.map((r: any) => r.uid);
+    // No overlap between pages.
+    expect(page2Uids.some((id: number) => page1Uids.includes(id))).toBe(false);
+    // Together pages must cover all 15 corpus UIDs.
+    const combined = [...page1Uids, ...page2Uids].sort((a, b) => a - b);
+    expect(combined).toEqual(corpus.map((r) => r.uid).sort((a, b) => a - b));
+  });
+
   it('cursor overrides `before` param', async () => {
     const corpus = fakeCorpus();
     const { executor, searchSpy } = buildExecutor(corpus);
