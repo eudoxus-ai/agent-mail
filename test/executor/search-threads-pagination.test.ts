@@ -281,6 +281,9 @@ describe('search_threads opaque cursor pagination', () => {
     });
 
     const [, criteria] = searchSpy.mock.calls[0];
-    expect((criteria.before as Date).toISOString()).toBe('2026-04-20T00:00:00.000Z');
+    // Cursor `before` is padded by 1ms so IMAP's strict less-than still
+    // surfaces boundary-timestamp rows; tuple filter in JS enforces
+    // the true `(date, uid) < (cursor.before, cursor.lastUid)` ordering.
+    expect((criteria.before as Date).toISOString()).toBe('2026-04-20T00:00:00.001Z');
   });
 });

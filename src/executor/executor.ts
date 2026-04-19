@@ -494,8 +494,15 @@ export class Executor {
     const mailbox = (intent.params.mailbox as string) ?? 'INBOX';
     const rawCursor = intent.params.cursor as string | undefined;
     const decodedCursor = rawCursor ? decodeCursor(rawCursor) : null;
+    // When a cursor is present, we need BOTH `before` and `lastUid` to move
+    // forward correctly across boundary-timestamp groups. Passing
+    // `cursor.before` to IMAP as strictly-less-than would drop every message
+    // that shares the cursor boundary timestamp but has uid > lastUid — they
+    // would become unreachable. Instead pad the IMAP `before` by 1 ms so
+    // boundary-timestamp rows come through, then post-filter below using a
+    // `(date, uid)` tuple comparison against the cursor.
     const effectiveBefore = decodedCursor
-      ? decodedCursor.before
+      ? new Date(new Date(decodedCursor.before).getTime() + 1).toISOString()
       : (intent.params.before as string | undefined);
     const baseCriteria = {
       from: intent.params.from as string | undefined,
@@ -508,6 +515,13 @@ export class Executor {
     };
     const limit = (intent.params.limit as number) ?? 20;
     const query = intent.params.query as string | undefined;
+    // When paging with a cursor we may need to fetch more than `limit` from
+    // IMAP: boundary-timestamp rows that tie with the cursor (`date ==
+    // cursor.before`) can be mixed with already-seen rows. The tuple filter
+    // drops the seen ones, so to guarantee we can still fill `limit` we over-
+    // fetch up to the group size. `limit * 2` is a safe upper bound because
+    // at most `limit` rows at the boundary were already returned on page 1.
+    const imapFetchLimit = decodedCursor ? limit * 2 : limit;
 
     const fanResult = await fanOut({
       pool: this.pool,
@@ -515,10 +529,10 @@ export class Executor {
       fn: async (accountId, imap) => {
         const resultSets = query
           ? await Promise.all([
-              imap.search(mailbox, { ...baseCriteria, subject: query }, limit),
-              imap.search(mailbox, { ...baseCriteria, body: query }, limit),
+              imap.search(mailbox, { ...baseCriteria, subject: query }, imapFetchLimit),
+              imap.search(mailbox, { ...baseCriteria, body: query }, imapFetchLimit),
             ])
-          : [await imap.search(mailbox, baseCriteria, limit)];
+          : [await imap.search(mailbox, baseCriteria, imapFetchLimit)];
 
         const merged = new Map<number, Awaited<(typeof resultSets)[number][number]>>();
         for (const set of resultSets) {
@@ -560,8 +574,27 @@ export class Executor {
       },
     });
 
+    // Apply cursor tuple filter: strictly (date, uid) < (cursor.before,
+    // cursor.lastUid). This is what makes boundary-timestamp pagination
+    // correct — strict date-only less-than would lose rows that share the
+    // cursor boundary date but have uid > lastUid.
+    const cursorBoundaryMs = decodedCursor
+      ? new Date(decodedCursor.before).getTime()
+      : null;
+    const cursorLastUid = decodedCursor ? decodedCursor.lastUid : null;
     const allResults = Object.values(fanResult.per_account)
       .flat()
+      .filter((r) => {
+        if (cursorBoundaryMs === null || cursorLastUid === null) return true;
+        const rowMs = new Date(r.envelope.date).getTime();
+        // Continuation rule for a newest-first listing: rows come AFTER the
+        // cursor if either their date is strictly older, or they share the
+        // boundary date but have a larger UID (we sort same-date groups by
+        // uid ascending and emit them in that stable order).
+        if (rowMs < cursorBoundaryMs) return true;
+        if (rowMs === cursorBoundaryMs) return r.uid > cursorLastUid;
+        return false;
+      })
       .sort(
         (a, b) =>
           new Date(b.envelope.date).getTime() - new Date(a.envelope.date).getTime()
