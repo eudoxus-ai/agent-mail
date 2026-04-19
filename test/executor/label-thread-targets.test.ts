@@ -43,7 +43,7 @@ describe('label_thread with targets', () => {
       logger,
     });
 
-    const { result } = await executor.executeImmediate({
+    const { intent, result } = await executor.executeImmediate({
       tool: 'label_thread',
       toolParams: {
         targets: [
@@ -71,6 +71,9 @@ describe('label_thread with targets', () => {
     expect(payload.label).toBe('Important');
     expect(payload.reversible).toBe(true);
     expect(payload.undo_hint.method).toBe('undo_intent');
+    expect(payload.to_undo).toMatch(/undo_intent.*intent_id "[^"]+"/);
+    expect(payload.to_undo).toContain(intent.id);
+    expect(payload.to_undo).toContain(payload.undo_hint.window_expires_at);
   });
 
   it('rejects targets with unknown account_id', async () => {

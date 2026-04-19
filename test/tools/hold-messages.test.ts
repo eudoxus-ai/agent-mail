@@ -4,10 +4,9 @@ import { holdMessagesTool } from '../../src/tools/hold-messages.js';
 describe('hold_messages tool', () => {
   it('has reversibility-first description leading with the contract', () => {
     expect(holdMessagesTool.name).toBe('hold_messages');
-    expect(holdMessagesTool.description.startsWith(
-      'Move messages to the holding folder. Fully reversible'
-    )).toBe(true);
-    expect(holdMessagesTool.description).toMatch(/This server cannot permanently delete/);
+    expect(holdMessagesTool.description).toMatch(/REVERSIBLE for 30 days/);
+    expect(holdMessagesTool.description).toMatch(/cannot permanently delete/);
+    expect(holdMessagesTool.description).toMatch(/agent-mail-holding/);
   });
   it('marks itself as non-destructive', () => {
     expect(holdMessagesTool.annotations).toMatchObject({

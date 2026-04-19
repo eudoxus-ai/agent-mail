@@ -40,6 +40,8 @@ describe('MCP triage v2 end-to-end', () => {
           ],
           getMailboxPath: async () => 'agent-mail-quarantine',
           moveMessages: async (uids: number[]) => ({ uidMap: new Map(uids.map((u) => [u, u])) }),
+          fetchEnvelopes: async (_m: string, uids: number[]) =>
+            uids.map((uid) => ({ uid, subject: 's', from: { address: 'f@x.com', name: null }, snippet: '' })),
           listMailboxes: async () => [
             { path: 'INBOX', name: 'INBOX', specialUse: '\\Inbox', delimiter: '/', flags: [] },
           ],

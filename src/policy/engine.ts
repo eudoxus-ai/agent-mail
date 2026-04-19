@@ -34,7 +34,13 @@ export function evaluatePolicy(
 
   if (!toolPolicy) {
     // Unknown tool defaults to gated for safety
-    return { decision: 'gate', risk: 'high', reason: 'Unknown tool, gating by default', reversible: false };
+    return {
+      decision: 'gate',
+      risk: 'high',
+      reason: `Tool "${toolName}" has no policy entry; gating conservatively. Add it to policy.yaml to configure.`,
+      reversible: false,
+      unknownTool: true,
+    };
   }
 
   const risk = toolPolicy.risk;

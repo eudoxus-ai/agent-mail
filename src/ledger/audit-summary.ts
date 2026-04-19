@@ -70,6 +70,16 @@ export function buildAuditSummary(
       };
     }
 
+    case 'hold_by_sender': {
+      const from = params.from as string | undefined;
+      const verb = dryRun ? 'Previewed hold of messages from' : 'Held messages from';
+      return {
+        summary: `${verb} ${from ?? 'unknown sender'}`,
+        from,
+        dry_run: dryRun,
+      };
+    }
+
     case 'restore_messages': {
       const count = targets?.length ?? 0;
       const verb = dryRun ? 'Previewed restore of' : 'Restored';
@@ -116,6 +126,12 @@ export function describeIntent(tool: string, params: Record<string, unknown>): s
       const dryRun = params.dry_run === true;
       const verb = dryRun ? 'Preview hold of' : 'Hold';
       return `${verb} ${count} message${count !== 1 ? 's' : ''}`;
+    }
+    case 'hold_by_sender': {
+      const from = params.from as string | undefined;
+      const dryRun = params.dry_run === true;
+      const verb = dryRun ? 'Preview hold of messages from' : 'Hold messages from';
+      return `${verb} ${from ?? 'unknown sender'}`;
     }
     case 'restore_messages': {
       const targets = params.targets as Target[] | undefined;

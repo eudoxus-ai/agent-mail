@@ -4,6 +4,9 @@ import type { Logger } from '../logger.js';
 import type { Executor } from '../executor/executor.js';
 import { evaluatePolicy } from '../policy/engine.js';
 import { getAccount, getDefaultAccount } from '../provider/accounts.js';
+import { describeIntent } from '../ledger/audit-summary.js';
+import { DEFAULT_REVIEWER_PORT } from '../config.js';
+import { buildApprovalUrl } from '../reviewer/urls.js';
 
 export interface MiddlewareDeps {
   db: Database;
@@ -12,6 +15,7 @@ export interface MiddlewareDeps {
   accounts: AccountConfig[];
   logger: Logger;
   agentId: string;
+  reviewerPort?: number;
 }
 
 export function wrapToolHandler(
@@ -84,15 +88,22 @@ export function wrapToolHandler(
       const policyResult = evaluatePolicy(deps.policy, canonicalToolName, policyContext);
 
       if (policyResult.decision === 'gate') {
-        // Create gated intent
+        // Create gated intent. Unknown-tool fallbacks carry a marker so the
+        // reviewer daemon can suppress their noisy notifications.
+        const toolParamsToStore = policyResult.unknownTool
+          ? { ...params, __unknown_tool_fallback: true }
+          : params;
+
         const intent = await deps.executor.createGatedIntent({
           tool: canonicalToolName,
-          toolParams: params,
+          toolParams: toolParamsToStore,
           accountId: resolvedAccountId,
           agentId: deps.agentId,
           risk: policyResult.risk,
         });
 
+        const reviewerPort = deps.reviewerPort ?? DEFAULT_REVIEWER_PORT;
+        const humanSummary = describeIntent(canonicalToolName, params);
         return {
           content: [
             {
@@ -100,6 +111,8 @@ export function wrapToolHandler(
               text: JSON.stringify({
                 status: 'pending',
                 intent_id: intent.id,
+                approval_url: buildApprovalUrl(reviewerPort, intent.id),
+                human_summary: humanSummary,
                 message: `Action queued for approval: ${toolDef.name}`,
                 reason: policyResult.reason,
               }),

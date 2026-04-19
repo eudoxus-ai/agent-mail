@@ -8,6 +8,8 @@ export const LEDGER_DB_PATH = join(AGENT_MAIL_DIR, 'ledger.db');
 export const POLICY_YAML_PATH = join(AGENT_MAIL_DIR, 'policy.yaml');
 export const LOG_FILE_PATH = join(AGENT_MAIL_DIR, 'agent-mail.log');
 
+export const DEFAULT_REVIEWER_PORT = 4242;
+
 export function ensureAgentMailDir(): void {
   if (!existsSync(AGENT_MAIL_DIR)) {
     mkdirSync(AGENT_MAIL_DIR, { recursive: true, mode: 0o700 });

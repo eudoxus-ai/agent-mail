@@ -67,6 +67,9 @@ describe('restore_messages', () => {
     expect(links.reverses).toContain('hold-1');
     expect(payload.reversible).toBe(true);
     expect(payload.undo_hint.method).toBe('undo_intent');
+    expect(payload.to_undo).toMatch(/undo_intent.*intent_id "[^"]+"/);
+    expect(payload.to_undo).toContain(intent.id);
+    expect(payload.to_undo).toContain(payload.undo_hint.window_expires_at);
   });
 
   it('per-target error for UID with no ledger entry, still moves valid ones', async () => {
@@ -128,6 +131,7 @@ describe('restore_messages', () => {
     expect(payload.moved[0]).toMatchObject({ uid: 10, destination_mailbox: 'INBOX' });
     expect(payload.reversible).toBeUndefined();
     expect(payload.undo_hint).toBeUndefined();
+    expect(payload.to_undo).toBeUndefined();
   });
 
   it('uses destination_uid (remapped UID in holding) when moving back', async () => {

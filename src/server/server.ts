@@ -7,6 +7,7 @@ import { loadPolicy } from '../policy/engine.js';
 import { Executor } from '../executor/executor.js';
 import { wrapToolHandler } from './middleware.js';
 import { createLogger } from '../logger.js';
+import { DEFAULT_REVIEWER_PORT } from '../config.js';
 import { getPendingIntents } from '../ledger/intents.js';
 import { getAuditLog } from '../ledger/audit.js';
 
@@ -20,6 +21,7 @@ import { getPendingActionsTool } from '../tools/get-pending-actions.js';
 import { getAuditLogTool } from '../tools/get-audit-log.js';
 import { queueSendTool } from '../tools/queue-send.js';
 import { holdMessagesTool } from '../tools/hold-messages.js';
+import { holdBySenderTool } from '../tools/hold-by-sender.js';
 import { restoreMessagesTool } from '../tools/restore-messages.js';
 import { undoIntentTool } from '../tools/undo-intent.js';
 import { getOverviewTool, runGetOverview } from '../tools/get-overview.js';
@@ -50,6 +52,7 @@ const ALL_TOOLS: ToolDefinition[] = [
   getAuditLogTool,
   queueSendTool,
   holdMessagesTool,
+  holdBySenderTool,
   restoreMessagesTool,
   undoIntentTool,
   getOverviewTool,
@@ -63,8 +66,15 @@ export interface McpServerBundle {
   pool: ImapConnectionPool;
 }
 
-export async function createMcpServer(): Promise<McpServerBundle> {
+export interface CreateMcpServerOptions {
+  reviewerPort?: number;
+}
+
+export async function createMcpServer(
+  options: CreateMcpServerOptions = {}
+): Promise<McpServerBundle> {
   const logger = createLogger('mcp');
+  const reviewerPort = options.reviewerPort ?? DEFAULT_REVIEWER_PORT;
 
   // Verify Keychain access
   try {
@@ -238,6 +248,7 @@ export async function createMcpServer(): Promise<McpServerBundle> {
       accounts,
       logger,
       agentId,
+      reviewerPort,
     });
 
     server.tool(
