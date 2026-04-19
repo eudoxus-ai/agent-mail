@@ -5,9 +5,17 @@ import { DEFAULT_POLICY_YAML } from './defaults.js';
 import type { PolicyConfig, PolicyResult, ToolPolicy, GateType, RiskLevel } from '../types.js';
 
 export function loadPolicy(policyPath: string = POLICY_YAML_PATH): PolicyConfig {
+  const defaults = parsePolicyConfig(yaml.load(DEFAULT_POLICY_YAML));
   try {
     const content = readFileSync(policyPath, 'utf-8');
-    return parsePolicyConfig(yaml.load(content));
+    const user = parsePolicyConfig(yaml.load(content));
+    // Layer user policy over defaults so new shipped tools get sensible
+    // entries without forcing users to edit their policy.yaml.
+    return {
+      ...defaults,
+      ...user,
+      tools: { ...defaults.tools, ...user.tools },
+    };
   } catch (error) {
     if (
       error &&
@@ -15,7 +23,7 @@ export function loadPolicy(policyPath: string = POLICY_YAML_PATH): PolicyConfig 
       'code' in error &&
       error.code === 'ENOENT'
     ) {
-      return parsePolicyConfig(yaml.load(DEFAULT_POLICY_YAML));
+      return defaults;
     }
     throw error;
   }
