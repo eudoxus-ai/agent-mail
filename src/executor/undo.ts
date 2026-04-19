@@ -25,6 +25,7 @@ export function getUndoExpiry(tool: string): string | null {
 
   switch (tool) {
     case 'hold_messages':
+    case 'hold_by_sender':
     case 'label_thread':
     case 'restore_messages':
     case 'draft_reply':
@@ -37,6 +38,7 @@ export function getUndoExpiry(tool: string): string | null {
 function getReversAction(tool: string): string {
   switch (tool) {
     case 'hold_messages':
+    case 'hold_by_sender':
       return 'move_back_to_inbox';
     case 'label_thread':
       return 'reverse_label';

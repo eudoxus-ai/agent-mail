@@ -807,142 +807,12 @@ export class Executor {
       const targets = intent.params.targets as Target[];
       const dryRun = (intent.params.dry_run as boolean | undefined) ?? false;
       const includeSummary = (intent.params.include_summary as boolean | undefined) ?? false;
-      const grouped = parseTargets(targets);
-      const accountIds = Object.keys(grouped);
-      const allIds = this.accounts.map((a) => a.id);
-      const unknown = accountIds.filter((id) => !allIds.includes(id));
-      if (unknown.length > 0) {
-        throw new Error(`Unknown account_ids in targets: ${unknown.join(', ')}`);
-      }
+      return this.holdTargets(intent, targets, { dryRun, includeSummary });
+    }
 
-      const fanResult = await fanOut({
-        pool: this.pool,
-        accountIds,
-        fn: async (accountId, imap) => {
-          const byMailbox = new Map<string, number[]>();
-          for (const t of grouped[accountId]) {
-            const list = byMailbox.get(t.mailbox) ?? [];
-            list.push(t.uid);
-            byMailbox.set(t.mailbox, list);
-          }
-
-          const perMailbox: Array<{
-            mailbox: string;
-            message_count: number;
-            uids: number[];
-          }> = [];
-
-          const envelopeSnapshots: Array<{
-            account_id: string;
-            uid: number;
-            mailbox: string;
-            subject: string;
-            from: string;
-          }> = [];
-
-          const holding = await imap.getMailboxPath('holding');
-
-          // uidMap accumulates source→destination UID mappings for all mailboxes
-          const combinedUidMap = new Map<number, number>();
-
-          for (const [mailbox, uids] of byMailbox) {
-            if (includeSummary || !dryRun) {
-              const envs = await imap.fetchEnvelopes(mailbox, uids);
-              for (const env of envs) {
-                envelopeSnapshots.push({
-                  account_id: accountId,
-                  uid: env.uid,
-                  mailbox,
-                  subject: env.subject,
-                  from: env.from.address,
-                });
-              }
-            }
-            if (!dryRun) {
-              const { uidMap } = await imap.moveMessages(uids, mailbox, holding);
-              for (const [src, dst] of uidMap) {
-                combinedUidMap.set(src, dst);
-              }
-            }
-            perMailbox.push({ mailbox, message_count: uids.length, uids });
-          }
-
-          return {
-            account_id: accountId,
-            per_mailbox: perMailbox,
-            envelopes: envelopeSnapshots,
-            uidMap: combinedUidMap,
-            message_count: perMailbox.reduce((n, m) => n + m.message_count, 0),
-          };
-        },
-      });
-
-      const perAccountRaw = Object.values(fanResult.per_account);
-
-      // Aggregate envelopes from all accounts (internal scaffolding — not exposed)
-      const allEnvelopes = perAccountRaw.flatMap((a: any) => a.envelopes ?? []);
-
-      // Aggregate uidMaps from all per-account results
-      const allUidMaps: Map<string, Map<number, number>> = new Map();
-      for (const a of perAccountRaw as any[]) {
-        if (a.account_id && a.uidMap instanceof Map) {
-          allUidMaps.set(a.account_id, a.uidMap);
-        }
-      }
-
-      // Persist targets to ledger on real (non-dry) runs
-      if (!dryRun && allEnvelopes.length > 0) {
-        insertIntentTargets(this.db, intent.id, allEnvelopes.map((e: any) => {
-          const acctUidMap = allUidMaps.get(e.account_id);
-          const destinationUid = acctUidMap?.get(e.uid) ?? null;
-          return {
-            account_id: e.account_id,
-            uid: e.uid,
-            mailbox: e.mailbox,
-            envelope_snapshot: { subject: e.subject, from: e.from, original_mailbox: e.mailbox },
-            destination_uid: destinationUid ?? undefined,
-          };
-        }));
-      }
-
-      // Strip internal `envelopes` and `uidMap` fields before building the public payload
-      const perAccount = perAccountRaw.map(({ envelopes: _envs, uidMap: _um, ...rest }: any) => rest);
-      const totalMessages = perAccount.reduce((n: number, a: any) => n + a.message_count, 0);
-
-      const payload: {
-        accounts_searched: string[];
-        accounts_available: string[];
-        per_account_errors?: Record<string, string>;
-        dry_run: boolean;
-        total_messages: number;
-        per_account: typeof perAccount;
-        moved?: Array<{ uid: number; account_id: string; subject: string; from: string; original_mailbox: string }>;
-        reversible?: true;
-        undo_hint?: { intent_id: string; method: string; window_expires_at: string };
-      } = {
-        accounts_searched: fanResult.accounts_searched,
-        accounts_available: allIds,
-        dry_run: dryRun,
-        total_messages: totalMessages,
-        per_account: perAccount,
-      };
-      if (Object.keys(fanResult.errors).length > 0) {
-        payload.per_account_errors = fanResult.errors;
-      }
-      if (includeSummary) {
-        payload.moved = allEnvelopes.map((e: any) => ({
-          uid: e.uid,
-          account_id: e.account_id,
-          subject: e.subject,
-          from: e.from,
-          original_mailbox: e.mailbox,
-        }));
-      }
-      if (!dryRun) {
-        const holdHint = buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at });
-        if (holdHint) Object.assign(payload, holdHint);
-      }
-      return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
+    // Expand (from, before) → targets in INBOX, then delegate to the same hold path.
+    if (intent.tool === 'hold_by_sender') {
+      return this.holdBySender(intent);
     }
 
     // Multi-account restore: move messages back to their original mailbox using ledger snapshots
@@ -961,7 +831,7 @@ export class Executor {
           `SELECT it.intent_id, it.account_id, it.uid, it.envelope_snapshot, it.destination_uid
            FROM intent_targets it
            JOIN intents i ON i.id = it.intent_id
-           WHERE i.tool = 'hold_messages' AND i.status = 'executed'`
+           WHERE i.tool IN ('hold_messages', 'hold_by_sender') AND i.status = 'executed'`
         )
         .all() as Array<{ intent_id: string; account_id: string; uid: number; envelope_snapshot: string | null; destination_uid: number | null }>;
       const byKey = new Map<string, { intent_id: string; original_mailbox: string; destination_uid: number | null }>();
@@ -1139,6 +1009,268 @@ export class Executor {
           return [{ type: 'text', text: `Unknown tool: ${intent.tool}` }];
       }
     });
+  }
+
+  /**
+   * Shared hold execution: group targets by account+mailbox, fan out, move
+   * to the holding folder, and persist ledger rows for restore/undo. Used by
+   * both `hold_messages` (direct target list) and `hold_by_sender`
+   * (search-expanded target list).
+   */
+  private async holdTargets(
+    intent: Intent,
+    targets: Target[],
+    opts: { dryRun: boolean; includeSummary: boolean }
+  ): Promise<Array<{ type: 'text'; text: string }>> {
+    const { dryRun, includeSummary } = opts;
+    const grouped = parseTargets(targets);
+    const accountIds = Object.keys(grouped);
+    const allIds = this.accounts.map((a) => a.id);
+    const unknown = accountIds.filter((id) => !allIds.includes(id));
+    if (unknown.length > 0) {
+      throw new Error(`Unknown account_ids in targets: ${unknown.join(', ')}`);
+    }
+
+    const fanResult = await fanOut({
+      pool: this.pool,
+      accountIds,
+      fn: async (accountId, imap) => {
+        const byMailbox = new Map<string, number[]>();
+        for (const t of grouped[accountId]) {
+          const list = byMailbox.get(t.mailbox) ?? [];
+          list.push(t.uid);
+          byMailbox.set(t.mailbox, list);
+        }
+
+        const perMailbox: Array<{
+          mailbox: string;
+          message_count: number;
+          uids: number[];
+        }> = [];
+
+        const envelopeSnapshots: Array<{
+          account_id: string;
+          uid: number;
+          mailbox: string;
+          subject: string;
+          from: string;
+        }> = [];
+
+        const holding = await imap.getMailboxPath('holding');
+
+        // uidMap accumulates source→destination UID mappings for all mailboxes
+        const combinedUidMap = new Map<number, number>();
+
+        for (const [mailbox, uids] of byMailbox) {
+          if (includeSummary || !dryRun) {
+            const envs = await imap.fetchEnvelopes(mailbox, uids);
+            for (const env of envs) {
+              envelopeSnapshots.push({
+                account_id: accountId,
+                uid: env.uid,
+                mailbox,
+                subject: env.subject,
+                from: env.from.address,
+              });
+            }
+          }
+          if (!dryRun) {
+            const { uidMap } = await imap.moveMessages(uids, mailbox, holding);
+            for (const [src, dst] of uidMap) {
+              combinedUidMap.set(src, dst);
+            }
+          }
+          perMailbox.push({ mailbox, message_count: uids.length, uids });
+        }
+
+        return {
+          account_id: accountId,
+          per_mailbox: perMailbox,
+          envelopes: envelopeSnapshots,
+          uidMap: combinedUidMap,
+          message_count: perMailbox.reduce((n, m) => n + m.message_count, 0),
+        };
+      },
+    });
+
+    const perAccountRaw = Object.values(fanResult.per_account);
+
+    // Aggregate envelopes from all accounts (internal scaffolding — not exposed)
+    const allEnvelopes = perAccountRaw.flatMap((a: any) => a.envelopes ?? []);
+
+    // Aggregate uidMaps from all per-account results
+    const allUidMaps: Map<string, Map<number, number>> = new Map();
+    for (const a of perAccountRaw as any[]) {
+      if (a.account_id && a.uidMap instanceof Map) {
+        allUidMaps.set(a.account_id, a.uidMap);
+      }
+    }
+
+    // Persist targets to ledger on real (non-dry) runs
+    if (!dryRun && allEnvelopes.length > 0) {
+      insertIntentTargets(
+        this.db,
+        intent.id,
+        allEnvelopes.map((e: any) => {
+          const acctUidMap = allUidMaps.get(e.account_id);
+          const destinationUid = acctUidMap?.get(e.uid) ?? null;
+          return {
+            account_id: e.account_id,
+            uid: e.uid,
+            mailbox: e.mailbox,
+            envelope_snapshot: {
+              subject: e.subject,
+              from: e.from,
+              original_mailbox: e.mailbox,
+            },
+            destination_uid: destinationUid ?? undefined,
+          };
+        })
+      );
+    }
+
+    // Strip internal `envelopes` and `uidMap` fields before building the public payload
+    const perAccount = perAccountRaw.map(
+      ({ envelopes: _envs, uidMap: _um, ...rest }: any) => rest
+    );
+    const totalMessages = perAccount.reduce(
+      (n: number, a: any) => n + a.message_count,
+      0
+    );
+
+    const payload: {
+      accounts_searched: string[];
+      accounts_available: string[];
+      per_account_errors?: Record<string, string>;
+      dry_run: boolean;
+      total_messages: number;
+      per_account: typeof perAccount;
+      moved?: Array<{
+        uid: number;
+        account_id: string;
+        subject: string;
+        from: string;
+        original_mailbox: string;
+      }>;
+      reversible?: true;
+      undo_hint?: { intent_id: string; method: string; window_expires_at: string };
+    } = {
+      accounts_searched: fanResult.accounts_searched,
+      accounts_available: allIds,
+      dry_run: dryRun,
+      total_messages: totalMessages,
+      per_account: perAccount,
+    };
+    if (Object.keys(fanResult.errors).length > 0) {
+      payload.per_account_errors = fanResult.errors;
+    }
+    if (includeSummary) {
+      payload.moved = allEnvelopes.map((e: any) => ({
+        uid: e.uid,
+        account_id: e.account_id,
+        subject: e.subject,
+        from: e.from,
+        original_mailbox: e.mailbox,
+      }));
+    }
+    if (!dryRun) {
+      const holdHint = buildUndoHint({
+        intent_id: intent.id,
+        tool: intent.tool,
+        created_at: intent.created_at,
+      });
+      if (holdHint) Object.assign(payload, holdHint);
+    }
+    return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
+  }
+
+  /**
+   * Expand a sender+before search into UIDs, then hold them via holdTargets.
+   * Reuses the IMAP search path so we don't duplicate FROM/BEFORE semantics.
+   */
+  private async holdBySender(
+    intent: Intent
+  ): Promise<Array<{ type: 'text'; text: string }>> {
+    const from = intent.params.from as string;
+    const before = intent.params.before as string | undefined;
+    const requestedIds = intent.params.account_ids as string[] | undefined;
+    const mailbox = (intent.params.mailbox as string | undefined) ?? 'INBOX';
+    const dryRun = (intent.params.dry_run as boolean | undefined) ?? false;
+    const includeSummary =
+      (intent.params.include_summary as boolean | undefined) ?? true;
+    const limit = Math.min(
+      (intent.params.limit as number | undefined) ?? 500,
+      1000
+    );
+
+    const allIds = this.accounts.map((a) => a.id);
+    const targetIds = requestedIds ?? allIds;
+    const unknown = targetIds.filter((id) => !allIds.includes(id));
+    if (unknown.length > 0) {
+      throw new Error(`Unknown account_ids: ${unknown.join(', ')}`);
+    }
+
+    const criteria = {
+      from,
+      before: before ? new Date(before) : undefined,
+    };
+
+    const searchResult = await fanOut({
+      pool: this.pool,
+      accountIds: targetIds,
+      fn: async (_accountId, imap) => {
+        const rows = await imap.search(mailbox, criteria, limit);
+        return rows.map((r) => r.uid);
+      },
+    });
+
+    const expandedTargets: Target[] = [];
+    for (const accountId of searchResult.accounts_searched) {
+      const uids = searchResult.per_account[accountId] ?? [];
+      for (const uid of uids) {
+        expandedTargets.push({ account_id: accountId, uid, mailbox });
+      }
+    }
+
+    if (expandedTargets.length === 0) {
+      const payload: {
+        accounts_searched: string[];
+        accounts_available: string[];
+        per_account_errors?: Record<string, string>;
+        dry_run: boolean;
+        total_messages: number;
+        per_account: unknown[];
+        moved?: unknown[];
+      } = {
+        accounts_searched: searchResult.accounts_searched,
+        accounts_available: allIds,
+        dry_run: dryRun,
+        total_messages: 0,
+        per_account: [],
+      };
+      if (Object.keys(searchResult.errors).length > 0) {
+        payload.per_account_errors = searchResult.errors;
+      }
+      if (includeSummary) payload.moved = [];
+      return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
+    }
+
+    const result = await this.holdTargets(intent, expandedTargets, {
+      dryRun,
+      includeSummary,
+    });
+
+    // Merge search-time per_account_errors so the caller sees both search
+    // failures and move failures in one place.
+    if (Object.keys(searchResult.errors).length > 0) {
+      const parsed = JSON.parse(result[0].text);
+      parsed.per_account_errors = {
+        ...(parsed.per_account_errors ?? {}),
+        ...searchResult.errors,
+      };
+      return [{ type: 'text', text: JSON.stringify(parsed, null, 2) }];
+    }
+    return result;
   }
 
   private async performUndo(

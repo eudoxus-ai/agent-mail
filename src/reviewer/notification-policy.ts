@@ -1,6 +1,6 @@
 import type { Intent } from '../types.js';
 
-const NOTIFY_TOOLS = new Set(['queue_send', 'hold_messages', 'restore_messages']);
+const NOTIFY_TOOLS = new Set(['queue_send', 'hold_messages', 'hold_by_sender', 'restore_messages']);
 
 export function shouldNotify(intent: Intent): boolean {
   const params = (intent.params ?? {}) as Record<string, unknown>;

@@ -7,7 +7,7 @@ export interface UndoHintArgs {
 
 const DEFAULT_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
-const REVERSIBLE_TOOLS = new Set(['hold_messages', 'label_thread', 'restore_messages', 'draft_reply']);
+const REVERSIBLE_TOOLS = new Set(['hold_messages', 'hold_by_sender', 'label_thread', 'restore_messages', 'draft_reply']);
 
 export function buildUndoHint(args: UndoHintArgs): {
   reversible: true;
@@ -16,7 +16,10 @@ export function buildUndoHint(args: UndoHintArgs): {
   if (!REVERSIBLE_TOOLS.has(args.tool)) return null;
   const created = new Date(args.created_at);
   const expires = new Date(created.getTime() + (args.window_ms ?? DEFAULT_WINDOW_MS));
-  const method = args.tool === 'hold_messages' ? 'restore_messages' : 'undo_intent';
+  const method =
+    args.tool === 'hold_messages' || args.tool === 'hold_by_sender'
+      ? 'restore_messages'
+      : 'undo_intent';
   return {
     reversible: true,
     undo_hint: {

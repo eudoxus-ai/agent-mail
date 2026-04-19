@@ -33,6 +33,14 @@ tools:
     override:
       when_thread_has_replies: approval_required
 
+  hold_by_sender:
+    risk: medium
+    gate: configurable
+    default: ungated
+    reversible: true
+    override:
+      when_thread_has_replies: approval_required
+
   restore_messages:
     risk: low
     gate: configurable
