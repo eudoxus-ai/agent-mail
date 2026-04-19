@@ -38,12 +38,11 @@ describe('buildUndoHint', () => {
     expect(hint).not.toBeNull();
     expect(hint!.undo_hint.method).toBe('undo_intent');
   });
-  it('returns undo_intent for draft_reply', () => {
+  it('returns null for draft_reply (not reversible)', () => {
     const hint = buildUndoHint({
       intent_id: 'i4', tool: 'draft_reply', created_at: '2026-04-18T12:00:00Z',
     });
-    expect(hint).not.toBeNull();
-    expect(hint!.undo_hint.method).toBe('undo_intent');
+    expect(hint).toBeNull();
   });
   it('returns null for non-reversible tools', () => {
     expect(buildUndoHint({ intent_id: 'i5', tool: 'queue_send', created_at: '2026-04-18T12:00:00Z' })).toBeNull();

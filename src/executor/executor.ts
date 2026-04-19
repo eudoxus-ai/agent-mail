@@ -986,8 +986,6 @@ export class Executor {
           this.db.prepare('UPDATE intents SET params = ? WHERE id = ?')
             .run(JSON.stringify(intent.params), intent.id);
           const draftPayload: Record<string, unknown> = { draft_id: result.uid, message: 'Draft created' };
-          const draftHint = buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at });
-          if (draftHint) Object.assign(draftPayload, draftHint);
           return [{ type: 'text', text: JSON.stringify(draftPayload) }];
         }
 

@@ -7,7 +7,7 @@ export interface UndoHintArgs {
 
 const DEFAULT_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
-const REVERSIBLE_TOOLS = new Set(['hold_messages', 'hold_by_sender', 'label_thread', 'restore_messages', 'draft_reply']);
+const REVERSIBLE_TOOLS = new Set(['hold_messages', 'hold_by_sender', 'label_thread', 'restore_messages']);
 
 export function buildUndoHint(args: UndoHintArgs): {
   reversible: true;
