@@ -1,10 +1,11 @@
 import { z } from 'zod';
 import type { ToolDefinition } from '../types.js';
+import { ALLOWED_FIELDS } from '../lib/envelope-projection.js';
 
 export const searchThreadsTool: ToolDefinition = {
   name: 'search_threads',
   description:
-    'Search email threads across all accounts (or a scoped subset). Returns snippets (account_id, uid, mailbox, subject, sender, date, snippet, list_id, list_unsubscribe, is_list_mail, target) newest-first. Envelope includes accounts_searched, accounts_available, per_account_errors, and `next_cursor` when more results are available. To paginate, pass `next_cursor` back verbatim as `cursor` on the next call (preferred). `before` (ISO8601, exclusive) is still supported for manual pagination. Each result carries a preassembled `target` object suitable for hold_messages. Set `include_snippets: true` to populate the `snippet` field (adds one IMAP fetch per result; off by default). For full attention signals, use get_overview.',
+    'Search email threads across all accounts (or a scoped subset). Returns snippets (account_id, uid, mailbox, subject, sender, date, snippet, list_id, list_unsubscribe, is_list_mail, target) newest-first. Envelope includes accounts_searched, accounts_available, per_account_errors, and `next_cursor` when more results are available. To paginate, pass `next_cursor` back verbatim as `cursor` on the next call (preferred). `before` (ISO8601, exclusive) is still supported for manual pagination. Each result carries a preassembled `target` object suitable for hold_messages. Set `include_snippets: true` to populate the `snippet` field (adds one IMAP fetch per result; off by default). Use `fields` to project only the keys you need per result (recommended for bulk triage to shrink payloads; `from_address` and `from_name` are flat top-level projections of the nested envelope sender). For full attention signals, use get_overview.',
   inputSchema: z.object({
     query: z.string().min(1).optional().describe('Search query text'),
     from: z.string().min(1).optional().describe('Filter by sender email/name'),
@@ -39,6 +40,10 @@ export const searchThreadsTool: ToolDefinition = {
       .boolean()
       .optional()
       .describe('If true, populate the `snippet` field on each result (adds one IMAP fetch per result). Default false because snippet fetches are expensive; only set true when you need body previews to disambiguate.'),
+    fields: z
+      .array(z.enum(ALLOWED_FIELDS as unknown as [string, ...string[]]))
+      .optional()
+      .describe('Project only these fields per result. Omit for full shape. Recommended for bulk triage to reduce payload size.'),
   }),
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   async execute() {

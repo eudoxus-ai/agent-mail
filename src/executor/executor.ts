@@ -32,6 +32,7 @@ import { fanOut } from './fan-out.js';
 import { parseTargets, type Target } from '../tools/target.js';
 import { insertIntentTargets, getIntentTargets } from '../ledger/intent-targets.js';
 import { decodeCursor, encodeCursor } from '../lib/search-cursor.js';
+import { projectResult } from '../lib/envelope-projection.js';
 
 interface SearchThreadResult {
   account_id: string;
@@ -561,11 +562,14 @@ export class Executor {
       per_account_counts[accountId] = (rows as any[]).length;
     }
 
+    const fields = intent.params.fields as string[] | undefined;
+    const projected = allResults.map((r) => projectResult(r, fields));
+
     const payload: SearchThreadsMultiPayload = {
       accounts_searched: fanResult.accounts_searched,
       accounts_available: allIds,
       per_account_counts,
-      results: allResults,
+      results: projected as unknown as SearchThreadResult[],
     };
     if (Object.keys(fanResult.errors).length > 0) {
       payload.per_account_errors = fanResult.errors;
