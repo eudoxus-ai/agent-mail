@@ -1307,14 +1307,29 @@ export class Executor {
 
     // Multi-account hold undo: group targets by account, restore to inbox
     // Use destination_uid from ledger so we find the correct UID in holding.
+    //
+    // Targets come from intent.params for hold_messages (the caller passed a
+    // Target[] in). For hold_by_sender, intent.params has no targets because
+    // the UID list was expanded at execution time from a FROM/BEFORE search —
+    // so we fall back to the `intent_targets` ledger table, which holdTargets
+    // always persists on non-dry runs. Both paths then look up destination_uid
+    // from the same ledger rows.
     if (undoOp.reverseAction === 'move_back_to_inbox') {
-      const targets = intent.params.targets as Target[];
-      const grouped = parseTargets(targets);
       const ledgerTargets = getIntentTargets(this.db, intent.id);
       const ledgerByKey = new Map<string, number | null>();
       for (const lt of ledgerTargets) {
         ledgerByKey.set(`${lt.account_id}:${lt.uid}`, lt.destination_uid);
       }
+
+      const paramsTargets = intent.params.targets as Target[] | undefined;
+      const effectiveTargets: Target[] = Array.isArray(paramsTargets)
+        ? paramsTargets
+        : ledgerTargets.map((lt) => ({
+            account_id: lt.account_id,
+            uid: lt.uid,
+            mailbox: lt.envelope_snapshot?.original_mailbox ?? lt.mailbox,
+          }));
+      const grouped = parseTargets(effectiveTargets);
 
       for (const [accountId, list] of Object.entries(grouped)) {
         await this.pool.withConnection(accountId, async (imap) => {
