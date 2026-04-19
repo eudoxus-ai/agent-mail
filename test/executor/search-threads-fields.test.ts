@@ -98,4 +98,49 @@ describe('search_threads fields projection', () => {
       expect(r).toHaveProperty('uid');
     }
   });
+
+  it('exposes flat from_address and from_name alongside nested envelope.from when `fields` is omitted', async () => {
+    const { executor } = buildExecutor(fakeCorpus());
+
+    const { result } = await executor.executeImmediate({
+      tool: 'search_threads',
+      toolParams: { limit: 5 },
+      accountId: 'a@x.com',
+      agentId: 'test',
+      risk: 'none',
+    });
+
+    const payload = JSON.parse(result[0].text);
+    expect(payload.results).toHaveLength(5);
+    for (const r of payload.results) {
+      // Flat top-level projection of sender
+      expect(r).toHaveProperty('from_address');
+      expect(r).toHaveProperty('from_name');
+      expect(typeof r.from_address).toBe('string');
+      // Back-compat: nested envelope.from still present with same values
+      expect(r.envelope.from.address).toBe(r.from_address);
+      expect(r.envelope.from.name).toBe(r.from_name);
+    }
+  });
+
+  it('omits both flat and nested sender fields when `fields: ["uid"]`', async () => {
+    const { executor } = buildExecutor(fakeCorpus());
+
+    const { result } = await executor.executeImmediate({
+      tool: 'search_threads',
+      toolParams: { limit: 5, fields: ['uid'] },
+      accountId: 'a@x.com',
+      agentId: 'test',
+      risk: 'none',
+    });
+
+    const payload = JSON.parse(result[0].text);
+    expect(payload.results).toHaveLength(5);
+    for (const r of payload.results) {
+      expect(Object.keys(r)).toEqual(['uid']);
+      expect(r).not.toHaveProperty('from_address');
+      expect(r).not.toHaveProperty('from_name');
+      expect(r).not.toHaveProperty('envelope');
+    }
+  });
 });

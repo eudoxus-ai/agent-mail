@@ -38,6 +38,8 @@ interface SearchThreadResult {
   account_id: string;
   mailbox: string;
   uid: number;
+  from_address: string;
+  from_name: string | null;
   envelope: {
     message_id: string;
     subject: string;
@@ -526,6 +528,8 @@ export class Executor {
           account_id: accountId,
           mailbox,
           ...r,
+          from_address: r.envelope?.from?.address ?? '',
+          from_name: r.envelope?.from?.name ?? null,
           list_id: r.list_id ?? null,
           list_unsubscribe: r.list_unsubscribe ?? null,
           is_list_mail: isListMail(r.list_unsubscribe, r.list_id),
