@@ -35,6 +35,32 @@ import { insertIntentTargets, getIntentTargets } from '../ledger/intent-targets.
 import { decodeCursor, encodeCursor } from '../lib/search-cursor.js';
 import { projectResult } from '../lib/envelope-projection.js';
 
+/**
+ * Thrown from `holdBySender` when the replies-present policy gate blocks the
+ * move. Carries the structured payload returned to the caller AND a human
+ * summary used as the intent's `error_detail` so audit logs tell the truth
+ * (otherwise the intent would land as "executed" with a "Held messages from X"
+ * summary, which is misleading since zero messages moved).
+ *
+ * Caught by `executeImmediate`'s catch block, which marks the intent `failed`,
+ * emits a `failed` audit entry, and returns the structured payload instead of
+ * rethrowing.
+ */
+class HoldBySenderBlockedError extends Error {
+  readonly payload: Record<string, unknown>;
+  readonly errorDetail: { message: string; code: string };
+
+  constructor(payload: Record<string, unknown>, summary: string) {
+    super(summary);
+    this.name = 'HoldBySenderBlockedError';
+    this.payload = payload;
+    this.errorDetail = {
+      message: summary,
+      code: (payload.code as string) ?? 'blocked',
+    };
+  }
+}
+
 interface SearchThreadResult {
   account_id: string;
   mailbox: string;
@@ -150,9 +176,10 @@ export class Executor {
 
       return { intent: getIntent(this.db, intent.id)!, result };
     } catch (error) {
-      const errorDetail = {
-        message: error instanceof Error ? error.message : String(error),
-      };
+      const errorDetail =
+        error instanceof HoldBySenderBlockedError
+          ? error.errorDetail
+          : { message: error instanceof Error ? error.message : String(error) };
       updateIntentStatus(this.db, intent.id, 'failed', {
         error_detail: errorDetail,
       });
@@ -163,6 +190,15 @@ export class Executor {
         actor: 'policy',
         detail: buildAuditSummary(params.tool, 'failed', params.toolParams, errorDetail),
       });
+      // Blocked-by-policy is not a crash — swallow the sentinel and return
+      // the structured payload so the agent can act on it. Any other error
+      // propagates as before.
+      if (error instanceof HoldBySenderBlockedError) {
+        return {
+          intent: getIntent(this.db, intent.id)!,
+          result: [{ type: 'text', text: JSON.stringify(error.payload, null, 2) }],
+        };
+      }
       throw error;
     }
   }
@@ -1305,7 +1341,15 @@ export class Executor {
           replied_thread_count: repliedGroupCount,
           hint: 'Use dry_run: true to preview, then hand-select UIDs via hold_messages.',
         };
-        return [{ type: 'text', text: JSON.stringify(errorPayload, null, 2) }];
+        // Throw a sentinel so `executeImmediate` marks the intent `failed` with
+        // a useful `error_detail` (instead of recording it as a successful
+        // "Held messages from X" in the audit log). The payload still reaches
+        // the caller: `executeImmediate`'s catch swallows this error and
+        // returns `payload` as the result text.
+        const summary =
+          `Blocked: ${repliedGroupCount} matched thread group(s) have replies. ` +
+          `Re-run with specific UIDs via hold_messages, or preview with dry_run: true.`;
+        throw new HoldBySenderBlockedError(errorPayload, summary);
       }
     }
 

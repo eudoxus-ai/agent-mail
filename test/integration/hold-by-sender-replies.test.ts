@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Executor } from '../../src/executor/executor.js';
 import { openDatabase } from '../../src/ledger/db.js';
+import { getIntent } from '../../src/ledger/intents.js';
+import { getAuditLog } from '../../src/ledger/audit.js';
 import { createLogger } from '../../src/logger.js';
 
 const logger = createLogger('cli', { minLevel: 'error' });
@@ -134,7 +136,7 @@ describe('hold_by_sender replies gate (regression)', () => {
   });
 
   it('aborts with structured replies_present error and moves no messages', async () => {
-    const { result } = await executor.executeImmediate({
+    const { intent, result } = await executor.executeImmediate({
       tool: 'hold_by_sender',
       toolParams: { from: 'x@example.com' },
       accountId: ACCOUNT_ID,
@@ -154,6 +156,29 @@ describe('hold_by_sender replies gate (regression)', () => {
     expect(s.holding).toHaveLength(0);
     expect(s.inbox).toHaveLength(3);
     expect(s.moveLog).toHaveLength(0);
+
+    // Ledger: the intent is marked `failed` (not `executed`) with a
+    // human-readable `error_detail`, so audit consumers don't see a
+    // "Held messages from X" line when zero messages moved.
+    const db = (executor as any).db;
+    const persisted = getIntent(db, intent.id)!;
+    expect(persisted.status).toBe('failed');
+    expect(persisted.error_detail).toBeTruthy();
+    const detail = persisted.error_detail as { message: string; code?: string };
+    expect(detail.message).toMatch(/replies/i);
+    expect(detail.code).toBe('replies_present');
+
+    // Audit log: a `failed` entry exists, and no `executed` entry.
+    const entries = getAuditLog(db, { intent_id: intent.id });
+    const actions = entries.map((e) => e.action);
+    expect(actions).toContain('failed');
+    expect(actions).not.toContain('executed');
+    const failedEntry = entries.find((e) => e.action === 'failed')!;
+    const failedDetail = failedEntry.detail as { summary: string; error: string };
+    // Audit summary must not claim success (no "Held messages from ...").
+    expect(failedDetail.summary).toMatch(/^Failed:/);
+    expect(failedDetail.summary).not.toMatch(/^Held messages from/);
+    expect(failedDetail.error).toMatch(/replies/i);
   });
 
   it('dry_run still reports replies_present (warn on preview)', async () => {
