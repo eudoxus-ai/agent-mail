@@ -77,6 +77,24 @@ describe('evaluatePolicy', () => {
     expect(() => loadPolicy(path)).toThrow('invalid default');
   });
 
+  it('layers user policy over defaults so missing tools still resolve', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agent-mail-policy-'));
+    const path = join(dir, 'policy.yaml');
+    // User policy omits list_senders entirely and overrides one other tool.
+    writeFileSync(
+      path,
+      'tools:\n  search_threads: { risk: low, gate: configurable, default: approval_required }\n'
+    );
+
+    const loaded = loadPolicy(path);
+    // User override wins.
+    const search = evaluatePolicy(loaded, 'search_threads');
+    expect(search.decision).toBe('gate');
+    // Default for list_senders still applies.
+    const listSenders = evaluatePolicy(loaded, 'list_senders');
+    expect(listSenders.decision).toBe('execute');
+  });
+
   it('throws when a configurable tool has an invalid override value', () => {
     const dir = mkdtempSync(join(tmpdir(), 'agent-mail-policy-'));
     const path = join(dir, 'policy.yaml');
