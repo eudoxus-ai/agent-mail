@@ -31,6 +31,7 @@ import { buildUndoHint } from '../lib/undo-hint.js';
 import { fanOut } from './fan-out.js';
 import { parseTargets, type Target } from '../tools/target.js';
 import { insertIntentTargets, getIntentTargets } from '../ledger/intent-targets.js';
+import { decodeCursor, encodeCursor } from '../lib/search-cursor.js';
 
 interface SearchThreadResult {
   account_id: string;
@@ -56,6 +57,7 @@ interface SearchThreadsMultiPayload {
   per_account_errors?: Record<string, string>;
   per_account_counts?: Record<string, number>;
   results: SearchThreadResult[];
+  next_cursor?: string;
 }
 
 export interface ExecutorDeps {
@@ -485,6 +487,11 @@ export class Executor {
     }
 
     const mailbox = (intent.params.mailbox as string) ?? 'INBOX';
+    const rawCursor = intent.params.cursor as string | undefined;
+    const decodedCursor = rawCursor ? decodeCursor(rawCursor) : null;
+    const effectiveBefore = decodedCursor
+      ? decodedCursor.before
+      : (intent.params.before as string | undefined);
     const baseCriteria = {
       from: intent.params.from as string | undefined,
       to: intent.params.to as string | undefined,
@@ -492,9 +499,7 @@ export class Executor {
       since: intent.params.since
         ? new Date(intent.params.since as string)
         : undefined,
-      before: intent.params.before
-        ? new Date(intent.params.before as string)
-        : undefined,
+      before: effectiveBefore ? new Date(effectiveBefore) : undefined,
     };
     const limit = (intent.params.limit as number) ?? 20;
     const query = intent.params.query as string | undefined;
@@ -564,6 +569,13 @@ export class Executor {
     };
     if (Object.keys(fanResult.errors).length > 0) {
       payload.per_account_errors = fanResult.errors;
+    }
+    if (allResults.length >= limit && allResults.length > 0) {
+      const oldest = allResults[allResults.length - 1];
+      payload.next_cursor = encodeCursor({
+        before: oldest.envelope.date,
+        lastUid: oldest.uid,
+      });
     }
     return payload;
   }

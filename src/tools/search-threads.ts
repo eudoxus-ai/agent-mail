@@ -4,7 +4,7 @@ import type { ToolDefinition } from '../types.js';
 export const searchThreadsTool: ToolDefinition = {
   name: 'search_threads',
   description:
-    'Search email threads across all accounts (or a scoped subset). Returns snippets (account_id, uid, mailbox, subject, sender, date, snippet, list_id, list_unsubscribe, is_list_mail, target) newest-first. Envelope includes accounts_searched, accounts_available, and per_account_errors. Paginate older results with `before` (ISO8601, exclusive); each result already carries a preassembled `target` object suitable for hold_messages. Set `include_snippets: true` to populate the `snippet` field (adds one IMAP fetch per result; off by default). For full attention signals, use get_overview.',
+    'Search email threads across all accounts (or a scoped subset). Returns snippets (account_id, uid, mailbox, subject, sender, date, snippet, list_id, list_unsubscribe, is_list_mail, target) newest-first. Envelope includes accounts_searched, accounts_available, per_account_errors, and `next_cursor` when more results are available. To paginate, pass `next_cursor` back verbatim as `cursor` on the next call (preferred). `before` (ISO8601, exclusive) is still supported for manual pagination. Each result carries a preassembled `target` object suitable for hold_messages. Set `include_snippets: true` to populate the `snippet` field (adds one IMAP fetch per result; off by default). For full attention signals, use get_overview.',
   inputSchema: z.object({
     query: z.string().min(1).optional().describe('Search query text'),
     from: z.string().min(1).optional().describe('Filter by sender email/name'),
@@ -17,7 +17,11 @@ export const searchThreadsTool: ToolDefinition = {
     before: z
       .string()
       .optional()
-      .describe('ISO8601 datetime — only messages strictly before this instant. Use the oldest `envelope.date` from a prior page to paginate.'),
+      .describe('ISO8601 datetime — only messages strictly before this instant. Prefer `cursor` for pagination; use `before` only for manual time-range queries.'),
+    cursor: z
+      .string()
+      .optional()
+      .describe('Opaque cursor from a prior response `next_cursor`. When provided, `before` is ignored.'),
     account_ids: z
       .array(z.string().min(1))
       .min(1)
