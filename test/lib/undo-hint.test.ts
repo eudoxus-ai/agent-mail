@@ -12,7 +12,17 @@ describe('buildUndoHint', () => {
         method: 'restore_messages',
         window_expires_at: '2026-05-18T12:00:00.000Z',
       },
+      to_undo: 'To undo: call restore_messages with intent_id "i1" (expires 2026-05-18T12:00:00.000Z).',
     });
+  });
+
+  it('includes a human-readable to_undo string naming intent_id and expiry', () => {
+    const hint = buildUndoHint({
+      intent_id: 'abc-123', tool: 'label_thread', created_at: '2026-04-18T12:00:00Z',
+    });
+    expect(hint).not.toBeNull();
+    expect(hint!.to_undo).toMatch(/undo_intent.*intent_id "abc-123"/);
+    expect(hint!.to_undo).toMatch(/expires 2026-05-18T12:00:00\.000Z/);
   });
   it('returns undo_intent for label_thread', () => {
     const hint = buildUndoHint({

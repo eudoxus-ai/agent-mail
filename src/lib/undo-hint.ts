@@ -12,6 +12,7 @@ const REVERSIBLE_TOOLS = new Set(['hold_messages', 'hold_by_sender', 'label_thre
 export function buildUndoHint(args: UndoHintArgs): {
   reversible: true;
   undo_hint: { intent_id: string; method: string; window_expires_at: string };
+  to_undo: string;
 } | null {
   if (!REVERSIBLE_TOOLS.has(args.tool)) return null;
   const created = new Date(args.created_at);
@@ -20,12 +21,15 @@ export function buildUndoHint(args: UndoHintArgs): {
     args.tool === 'hold_messages' || args.tool === 'hold_by_sender'
       ? 'restore_messages'
       : 'undo_intent';
+  const window_expires_at = expires.toISOString();
+  const to_undo = `To undo: call ${method} with intent_id "${args.intent_id}" (expires ${window_expires_at}).`;
   return {
     reversible: true,
     undo_hint: {
       intent_id: args.intent_id,
       method,
-      window_expires_at: expires.toISOString(),
+      window_expires_at,
     },
+    to_undo,
   };
 }

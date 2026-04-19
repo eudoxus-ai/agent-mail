@@ -84,6 +84,9 @@ describe('hold_messages', () => {
     expect(payload.undo_hint.method).toBe('restore_messages');
     expect(payload.undo_hint.intent_id).toBe(intent.id);
     expect(typeof payload.undo_hint.window_expires_at).toBe('string');
+    expect(payload.to_undo).toMatch(/restore_messages.*intent_id "[^"]+"/);
+    expect(payload.to_undo).toContain(intent.id);
+    expect(payload.to_undo).toContain(payload.undo_hint.window_expires_at);
   });
 
   it('dry_run response omits reversible/undo_hint', async () => {
@@ -105,6 +108,7 @@ describe('hold_messages', () => {
     const payload = JSON.parse(result[0].text);
     expect(payload.reversible).toBeUndefined();
     expect(payload.undo_hint).toBeUndefined();
+    expect(payload.to_undo).toBeUndefined();
   });
 
   it('rejects unknown account_id in targets', async () => {

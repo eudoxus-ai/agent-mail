@@ -788,6 +788,7 @@ export class Executor {
         label: string;
         reversible?: true;
         undo_hint?: { intent_id: string; method: string; window_expires_at: string };
+        to_undo?: string;
       } = {
         accounts_searched: fanResult.accounts_searched,
         accounts_available: allIds,
@@ -904,6 +905,7 @@ export class Executor {
         errors: typeof errors;
         reversible?: true;
         undo_hint?: { intent_id: string; method: string; window_expires_at: string };
+        to_undo?: string;
       } = {
         dry_run: dryRun,
         moved,
@@ -1154,6 +1156,7 @@ export class Executor {
       }>;
       reversible?: true;
       undo_hint?: { intent_id: string; method: string; window_expires_at: string };
+      to_undo?: string;
     } = {
       accounts_searched: fanResult.accounts_searched,
       accounts_available: allIds,
