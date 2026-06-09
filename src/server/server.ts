@@ -28,8 +28,10 @@ import { getOverviewTool, runGetOverview } from '../tools/get-overview.js';
 import { listSendersTool } from '../tools/list-senders.js';
 import { listMailboxesTool } from '../tools/list-mailboxes.js';
 import { getIntentTool } from '../tools/get-intent.js';
+import { getScanResultTool } from '../tools/get-scan-result.js';
+import { ScanJobRunner, withTimeout } from '../executor/scan-jobs-runner.js';
 
-import { runStartupMigrations } from './startup.js';
+import { runStartupMigrations, runStartupScanCleanup } from './startup.js';
 import type { ToolDefinition } from '../types.js';
 
 const SERVER_PREAMBLE = `agent-mail design contract. This server is built so that no action it exposes can cause irreversible harm. Every mutation (hold, label, draft) is reversible for 30 days via \`undo_intent\` or \`restore_messages\`, and every action is recorded in \`get_audit_log\`. Sending email and permanent deletion are deliberately not exposed — those operations require a separate human-in-the-loop flow outside this server. Agents should treat this as a low-stakes environment: prefer acting and reconciling afterward over asking permission per action. Over-holding-then-restoring is a normal interaction pattern, not a failure mode.`;
@@ -59,6 +61,7 @@ const ALL_TOOLS: ToolDefinition[] = [
   listSendersTool,
   listMailboxesTool,
   getIntentTool,
+  getScanResultTool,
 ];
 
 export interface McpServerBundle {
@@ -116,6 +119,14 @@ export async function createMcpServer(
     );
   }
 
+  // Reap scan jobs orphaned in 'running' by a previous crash/restart.
+  const reapedJobs = runStartupScanCleanup(db);
+  if (reapedJobs > 0) {
+    logger.warn(
+      `Marked ${reapedJobs} orphaned scan job(s) as 'failed' (server restarted mid-scan).`
+    );
+  }
+
   // Load policy
   const policy = loadPolicy();
 
@@ -134,6 +145,24 @@ export async function createMcpServer(
 
   // Create executor
   const executor = new Executor({ db, accounts, pool, logger });
+
+  // Runner for async (background) scan jobs
+  const scanRunner = new ScanJobRunner({ db, logger });
+
+  // Read tools that support `async: true` — the scan work each runs.
+  // get_overview uses runGetOverview directly; the other two reuse the
+  // executor's no-intent read path. Returns the raw payload (byte-identical to
+  // the synchronous result).
+  const SCAN_TOOLS = new Set(['get_overview', 'list_senders', 'search_threads']);
+  const runScan = (
+    tool: string,
+    validated: Record<string, unknown>
+  ): Promise<unknown> => {
+    if (tool === 'get_overview') {
+      return runGetOverview({ pool, accounts, input: validated as any });
+    }
+    return executor.runRead(tool, validated);
+  };
 
   // Create MCP server
   const serverOptions = buildServerOptions();
@@ -157,7 +186,11 @@ export async function createMcpServer(
 
   // Register all tools
   for (const toolDef of ALL_TOOLS) {
-    // get_overview runs directly against the pool (multi-account)
+    // get_overview runs directly against the pool (multi-account). Both
+    // list_senders and search_threads also support `async: true`; the async
+    // branch below is shared. The synchronous get_overview path is guarded by
+    // `withTimeout` so a heavy call fails fast advising `async: true` rather
+    // than hanging.
     if (toolDef.name === 'get_overview') {
       server.tool(
         toolDef.name,
@@ -166,11 +199,21 @@ export async function createMcpServer(
         async (params: Record<string, unknown>) => {
           try {
             const validated = validateParams(toolDef, params);
-            const result = await runGetOverview({
-              pool,
-              accounts,
-              input: validated as any,
-            });
+            if (validated.async === true) {
+              const handle = scanRunner.start(toolDef.name, validated, agentId, () =>
+                runScan(toolDef.name, validated)
+              );
+              return {
+                content: [
+                  { type: 'text' as const, text: JSON.stringify(handle, null, 2) },
+                ],
+              };
+            }
+            const result = await withTimeout(
+              runGetOverview({ pool, accounts, input: validated as any }),
+              undefined,
+              'get_overview'
+            );
             return {
               content: [
                 { type: 'text' as const, text: JSON.stringify(result, null, 2) },
@@ -192,6 +235,23 @@ export async function createMcpServer(
               ],
             };
           }
+        }
+      );
+      continue;
+    }
+
+    // get_scan_result reads the scan_jobs ledger directly (like
+    // get_pending_actions) — it never touches IMAP.
+    if (toolDef.name === 'get_scan_result') {
+      server.tool(
+        toolDef.name,
+        toolDef.description,
+        toolDef.inputSchema.shape,
+        async (params: Record<string, unknown>) => {
+          const validated = validateParams(toolDef, params);
+          const context = { accountId: '', agentId, db, accounts, logger };
+          const result = await toolDef.execute(validated, context);
+          return { content: result.content ?? [] };
         }
       );
       continue;
@@ -256,7 +316,31 @@ export async function createMcpServer(
       toolDef.description,
       toolDef.inputSchema.shape,
       async (params: Record<string, unknown>) => {
-        return handler(validateParams(toolDef, params));
+        const validated = validateParams(toolDef, params);
+        // list_senders / search_threads support `async: true`: register a
+        // background scan job and return a pollable handle immediately instead
+        // of routing through the synchronous executor path.
+        if (SCAN_TOOLS.has(toolDef.name) && validated.async === true) {
+          const handle = scanRunner.start(toolDef.name, validated, agentId, () =>
+            runScan(toolDef.name, validated)
+          );
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify(handle, null, 2) },
+            ],
+          };
+        }
+        // Synchronous scan tools (list_senders / search_threads) get the same
+        // fail-fast timeout guard as get_overview: a heavy sync read that
+        // exceeds the timeout rejects fast advising `async: true` instead of
+        // hanging the IMAP connection. Reads have no side effects, so a
+        // discarded in-flight result is safe; a timed-out executeImmediate may
+        // leave its intent in `executing`, which the boot `checkStuckExecuting`
+        // reaper handles.
+        if (SCAN_TOOLS.has(toolDef.name)) {
+          return withTimeout(handler(validated), undefined, toolDef.name);
+        }
+        return handler(validated);
       }
     );
   }

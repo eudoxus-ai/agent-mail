@@ -203,6 +203,48 @@ export class Executor {
     }
   }
 
+  /**
+   * No-intent read path for scans. Scans are idempotent reads tracked by
+   * `scan_jobs`, not the `intents` ledger, so this reuses the same fan-out read
+   * logic as `performAction` WITHOUT creating an intent or audit rows. Returns
+   * the raw payload (the same object the synchronous tool dispatch serializes).
+   *
+   * Used by both the sync dispatch path (wrapped in `withTimeout`) and the
+   * async `ScanJobRunner.start` background work closure.
+   */
+  async runRead(
+    tool: string,
+    params: Record<string, unknown>
+  ): Promise<unknown> {
+    // Build a minimal intent-shaped object: the multi read methods only read
+    // `intent.params`. account_id is irrelevant for fan-out reads (they derive
+    // targets from params.account_ids or all accounts).
+    const pseudoIntent = {
+      id: 'scan',
+      account_id: '',
+      tool,
+      params,
+      risk: 'none',
+      status: 'executing',
+      error_detail: null,
+      agent_id: null,
+      created_at: new Date().toISOString(),
+      resolved_at: null,
+      resolved_by: null,
+      undo_token: null,
+      undo_expires_at: null,
+    } as Intent;
+
+    switch (tool) {
+      case 'search_threads':
+        return this.searchThreadsMulti(pseudoIntent);
+      case 'list_senders':
+        return this.listSendersMulti(pseudoIntent);
+      default:
+        throw new Error(`runRead: unsupported tool "${tool}"`);
+    }
+  }
+
   async createGatedIntent(params: {
     tool: string;
     toolParams: Record<string, unknown>;

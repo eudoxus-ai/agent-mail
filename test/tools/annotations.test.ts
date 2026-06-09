@@ -7,6 +7,7 @@ import { getAuditLogTool } from '../../src/tools/get-audit-log.js';
 import { getOverviewTool } from '../../src/tools/get-overview.js';
 import { getPendingActionsTool } from '../../src/tools/get-pending-actions.js';
 import { getIntentTool } from '../../src/tools/get-intent.js';
+import { getScanResultTool } from '../../src/tools/get-scan-result.js';
 import { labelThreadTool } from '../../src/tools/label-thread.js';
 import { holdMessagesTool } from '../../src/tools/hold-messages.js';
 import { restoreMessagesTool } from '../../src/tools/restore-messages.js';
@@ -26,6 +27,7 @@ const cases: Array<
   ['get_overview', getOverviewTool, { readOnlyHint: true, destructiveHint: false, idempotentHint: true }],
   ['get_pending_actions', getPendingActionsTool, { readOnlyHint: true, destructiveHint: false, idempotentHint: true }],
   ['get_intent', getIntentTool, { readOnlyHint: true, destructiveHint: false, idempotentHint: true }],
+  ['get_scan_result', getScanResultTool, { readOnlyHint: true, destructiveHint: false, idempotentHint: true }],
   ['label_thread', labelThreadTool, { readOnlyHint: false, destructiveHint: false, idempotentHint: true }],
   ['hold_messages', holdMessagesTool, { readOnlyHint: false, destructiveHint: false, idempotentHint: true }],
   ['restore_messages', restoreMessagesTool, { readOnlyHint: false, destructiveHint: false, idempotentHint: true }],

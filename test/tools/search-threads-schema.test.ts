@@ -14,4 +14,9 @@ describe('search_threads schema', () => {
       searchThreadsTool.inputSchema.parse({ before: 123 as any })
     ).toThrow();
   });
+
+  it('accepts an `async` boolean (defaults absent = sync)', () => {
+    expect(searchThreadsTool.inputSchema.parse({ async: true }).async).toBe(true);
+    expect(searchThreadsTool.inputSchema.parse({}).async).toBeUndefined();
+  });
 });

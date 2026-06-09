@@ -13,6 +13,10 @@ export const listSendersTool: ToolDefinition = {
     min_count: z.number().int().positive().optional().describe('Omit senders with fewer than this many messages (default 1)'),
     sample_size: z.number().int().positive().max(20).optional().describe('UIDs to include per sender (default 5)'),
     scan_limit: z.number().int().positive().max(1000).optional().describe('Max messages per account to scan (default 500)'),
+    async: z
+      .boolean()
+      .optional()
+      .describe('If true, run the scan in the background and return immediately with `{ job_id, status: "running" }`; poll `get_scan_result` with the job_id. Use for large scans (high scan_limit or many accounts) that risk timing out synchronously. Default false.'),
   }),
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   async execute() {

@@ -44,6 +44,10 @@ export const searchThreadsTool: ToolDefinition = {
       .array(z.enum(ALLOWED_FIELDS as unknown as [string, ...string[]]))
       .optional()
       .describe('Project only these fields per result. Omit for full shape. Recommended for bulk triage to reduce payload size.'),
+    async: z
+      .boolean()
+      .optional()
+      .describe('If true, run the search in the background and return immediately with `{ job_id, status: "running" }`; poll `get_scan_result` with the job_id. Use for large scans across many accounts/mailboxes that risk timing out synchronously. Default false.'),
   }),
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   async execute() {

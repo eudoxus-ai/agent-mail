@@ -30,6 +30,19 @@ CREATE TABLE IF NOT EXISTS audit_log (
   detail JSON,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS scan_jobs (
+  id TEXT PRIMARY KEY,
+  tool TEXT NOT NULL,
+  params JSON NOT NULL,
+  status TEXT NOT NULL DEFAULT 'running'
+    CHECK (status IN ('running', 'done', 'failed')),
+  result JSON,
+  error_detail JSON,
+  agent_id TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  completed_at DATETIME
+);
 `;
 
 export function openDatabase(dbPath: string = LEDGER_DB_PATH): Database {
