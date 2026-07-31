@@ -66,6 +66,8 @@ Rationale is sizing. Attachment payloads dominate mailbox bytes and are rarely t
 
 Configurable per account via `cache.attachments: none | metadata | full`. Default `metadata`.
 
+Metadata-only storage is only viable if the payload is reachable on demand, so this decision carries a new tool with it — see §"Component: `get_attachment`".
+
 ### D2: Read-path-only cache
 
 **The cache is never authoritative for a write.** Every mutation — hold, restore, label, flag, send — continues to execute IMAP-first through `Executor.performAction`, unchanged. The cache is a derived, disposable artifact: deleting `cache.db` loses nothing and triggers a re-backfill.
@@ -87,6 +89,7 @@ This preserves the property the README leads with — the intent ledger is the r
 2. Ingest: `EmailMessage` → cache rows + FTS index.
 3. Sync engine: mailbox discovery, newest-first resumable backfill, QRESYNC/CONDSTORE delta, UIDVALIDITY invalidation.
 4. Query layer: cache-backed implementations of the reads behind `search_threads` and `get_overview`.
+4b. New tool `get_attachment` — on-demand payload fetch, since bodies are cached but attachments are not.
 5. Global persistent threading (fixes documented limitation #1).
 6. Post-mutation invalidation hooks.
 7. Coverage/freshness reporting so the agent knows what the cache does and doesn't have.
@@ -120,9 +123,12 @@ src/
   executor/
     executor.ts     # MODIFIED: route reads to cache, call invalidate after writes
   provider/
-    imap.ts         # MODIFIED: add fetchRange/fetchBodies for bulk ingest
+    imap.ts         # MODIFIED: add fetchRange/fetchBodies for bulk ingest,
+                    #           plus fetchAttachment for on-demand payloads
+  tools/
+    get-attachment.ts  # NEW: on-demand attachment payload fetch
   cli/
-    daemon.ts       # MODIFIED: run the sync engine
+    daemon.ts       # MODIFIED: run the sync engine, GC staged attachments
 ```
 
 ### Boundaries
@@ -358,6 +364,66 @@ invalidate(cache, {
 
 Applies the optimistic echo (D2), marks the mailbox for priority resync. Failures here are logged and swallowed — a failed cache update must never fail a successful mail operation.
 
+## Component: `get_attachment`
+
+D1 caches attachment metadata but not payloads, so the agent needs a way to pull the bytes. New tool at `src/tools/get-attachment.ts`, backed by a new `ImapProvider.fetchAttachment(mailbox, uid, partId)`.
+
+### Discoverability
+
+Attachment metadata is surfaced wherever messages are returned, so the agent can see what exists before deciding to fetch:
+
+```json
+"attachments": [
+  { "part_id": "2", "filename": "q2-pricing.pdf", "mime_type": "application/pdf", "size": 184320 }
+]
+```
+
+Added to `read_thread` results and available as a projected field on `search_threads`. Additive — no existing key changes.
+
+### Input / output
+
+```ts
+z.object({
+  target: TargetSchema,            // { account_id, mailbox, uid } — same shape as hold_messages
+  part_id: z.string().min(1),      // from the attachments metadata
+  inline: z.boolean().optional(),  // base64 in the response instead of on disk
+})
+```
+
+Default behavior writes the payload to disk and returns a path:
+
+```json
+{
+  "filename": "q2-pricing.pdf",
+  "mime_type": "application/pdf",
+  "size": 184320,
+  "path": "/Users/you/.agent-mail/attachments/2026-07-31/a3f2…/q2-pricing.pdf",
+  "expires_at": "2026-08-07T18:04:11Z"
+}
+```
+
+Path-return rather than inline base64 is the default because agent-mail is local-first — the agent is on the same machine and can open the file with its own tools, and a 184 KB PDF base64'd into an MCP response is ~250 KB of tokens for nothing. `inline: true` returns base64 for payloads under 256 KB, for clients that can't reach the filesystem.
+
+### Safety
+
+An attachment is attacker-controlled bytes arriving from the network, so this gets the same paranoid treatment as `url-safety.ts`:
+
+- **Sandboxed destination.** Always under `~/.agent-mail/attachments/<date>/<random>/`, created 0700. The random component means two fetches of the same filename never collide or overwrite.
+- **Filename sanitization.** The MIME filename is attacker-controlled. Basename only, path separators and `..` stripped, null bytes rejected, leading dots stripped, length capped. A filename that sanitizes to empty becomes `attachment-<part_id>`.
+- **Never executable.** Written 0600. No exec bit, ever, regardless of MIME type.
+- **Never opened.** The tool returns a path; it does not launch, preview, or execute anything.
+- **Size cap.** `cache.max_attachment_bytes`, default 25 MB. Larger payloads are refused with a structured error rather than streamed to disk.
+- **Symlink refusal.** Destination is verified to be a regular file in the expected directory before write.
+- **TTL.** Fetched attachments are garbage-collected after 7 days by the daemon. The cache is not an attachment archive; it's a staging area.
+
+### Policy
+
+```yaml
+get_attachment:  { risk: low, gate: ungated, reversible: false }
+```
+
+Reading is `risk: none` elsewhere in the policy, but this writes a file to disk — a real if minor side effect — so `low` is the honest rating. Ungated by default because refusing to open a PDF someone emailed you is friction without safety, and `gate: configurable` lets a cautious user require approval.
+
 ## Rollout
 
 Config key `cache.mode`:
@@ -422,8 +488,52 @@ From the April design's "Known limitations (fixed in Z)":
 | 6 | IDLE / push | **Unblocked** — phase 3 |
 | 2 | Plus-addressing / aliases | Unchanged, still primary-email only |
 
-## Open questions
+## Resolved decisions
 
-1. **Which mailboxes by default?** INBOX + Sent + Archive is the useful minimum. Gmail's All Mail duplicates everything and would roughly double the cache — probably exclude by default and let it be opted in.
-2. **Backfill depth.** Unbounded is the honest default for a search tool, but the first sync of a decade-old Gmail account is a multi-hour, multi-GB operation. A `backfill_days` default of ~730 with explicit "go deeper" may be the better first-run experience.
-3. **Does the daemon become mandatory?** Today it's optional (reviewer notifications only). Sync makes it load-bearing for the good experience. That's a setup-docs and install-flow change, not just code.
+### D3: Default synced mailboxes exclude Gmail's All Mail
+
+```
+INBOX, Sent (\Sent), Archive (\Archive), agent-mail-holding
+```
+
+Gmail's All Mail (`\All`) is **excluded by default**. It contains a copy of nearly every message, so including it roughly doubles both cache size and backfill time while adding almost no reachable mail — anything in All Mail is either in INBOX, in Sent, or archived. Users can opt in per account:
+
+```yaml
+cache:
+  mailboxes: [INBOX, "\\Sent", "\\Archive", "\\All"]
+```
+
+Special-use flags are resolved via `LIST` rather than hardcoded names, so Gmail's `[Gmail]/Sent Mail` and iCloud's `Sent Messages` both map to `\Sent` without provider-specific strings.
+
+Consequence to document: messages that exist *only* in All Mail (archived directly, never in a synced mailbox) won't be cached. Search falls back to IMAP for those, and coverage reporting makes the gap visible rather than silent.
+
+### D4: `backfill_days` defaults to 730
+
+Two years. Unbounded is the honest default for a search tool, but the first sync of a decade-old Gmail account is a multi-hour, multi-GB operation that would make the feature feel broken on first run. Two years covers the overwhelming majority of "what did we decide about X" questions.
+
+Deeper history is one config change plus a re-run:
+
+```yaml
+cache:
+  backfill_days: null   # unbounded
+```
+
+Backfill is newest-first and resumable, so extending the window later is additive — it walks further down the existing UID list rather than starting over. Coverage reporting always states the actual `oldest` date per mailbox, so the agent knows where the floor is and can say "I only have two years locally" instead of silently returning nothing.
+
+### D5: The daemon becomes load-bearing, with a documented install-flow change
+
+Today the daemon is optional and only drives reviewer notifications. Sync makes it the thing that keeps the cache warm, so it moves from nice-to-have to expected.
+
+Deliberately *load-bearing*, not *mandatory* — the fallback path stays real:
+
+- Daemon running → cache is fresh, reads are local.
+- Daemon down → MCP servers detect stale `last_delta_at`, report `state: "stale"`, and fall back to IMAP. Degraded, not broken.
+
+Install-flow changes required:
+
+1. `add-account` offers to install the daemon at the end of setup, explaining what it does (keeps mail synced locally, powers fast search) and what it costs (a background process, ~300–400 MB per account on disk).
+2. First-run backfill shows progress rather than appearing to hang — `agent-mail status` reports per-mailbox backfill percentage and ETA.
+3. README gains a "Local cache" section covering what's stored, where, how much disk, how to shrink the window, and how to delete it (`rm ~/.agent-mail/cache.db`).
+4. `uninstall-daemon` mentions the cache and offers to remove it.
+
+The privacy story needs care in that documentation. The README currently leads with "your email content never leaves your machine," which stays true — but "we now keep two years of full message bodies in a SQLite file on your disk" is a material change in what's sitting at rest locally, and users should learn it from the docs rather than from `du`.
