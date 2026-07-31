@@ -115,6 +115,8 @@ src/
     schema.ts       # NEW: DDL
     migrations.ts   # NEW: additive migrations, mirrors ledger/migrations.ts
     ingest.ts       # NEW: EmailMessage -> rows + FTS (pure, testable)
+    store.ts        # NEW: transactional writes — messages + FTS + threads
+    fts-query.ts    # NEW: user text -> safe FTS5 MATCH expression
     sync.ts         # NEW: SyncEngine — backfill, delta, uidvalidity handling
     query.ts        # NEW: cache-backed search/overview reads
     coverage.ts     # NEW: what's cached, how fresh
@@ -320,6 +322,8 @@ LIMIT :limit;
 ```
 
 Column weights boost subject over body, participants over attachment names. When `query` is absent the FTS join drops and it's a plain indexed scan ordered by `date DESC` — which is also what makes cursor pagination exact instead of the current UID-order approximation.
+
+**User text never reaches MATCH directly.** FTS5's MATCH argument is a query language, not a string literal, so raw input is the same hazard class as string-concatenated SQL. `search_threads({query: "q2-pricing"})` parses the hyphen as a column filter and throws `no such column: pricing`; `foo:bar`, an unbalanced quote, and a bare `(` all fail the same way. `cache/fts-query.ts` tokenizes user text and re-emits it as quoted string literals, which also strips FTS5 operators of their special meaning — `query: "not urgent"` should find mail containing both words, not parse as a negation. Trailing `*` survives as prefix search, being the one operator that's unambiguous and useful.
 
 **`get_overview`'s four candidate sets** become four indexed queries against one local DB instead of four IMAP searches × N accounts:
 
