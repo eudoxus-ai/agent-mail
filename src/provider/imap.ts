@@ -714,6 +714,72 @@ export class ImapProvider {
   }
 
   /**
+   * Download one attachment payload.
+   *
+   * Attachment bytes are never cached (design D1), so this always hits the
+   * server. The size is checked against BODYSTRUCTURE before downloading —
+   * refusing a 2 GB part after streaming it to memory would be too late.
+   */
+  async fetchAttachment(
+    mailbox: string,
+    uid: number,
+    partId: string,
+    maxBytes: number
+  ): Promise<{
+    content: Buffer;
+    filename: string | null;
+    mimeType: string | null;
+  } | null> {
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      const msg = await this.client.fetchOne(
+        String(uid),
+        { uid: true, bodyStructure: true },
+        { uid: true }
+      );
+      if (!msg || !msg.bodyStructure) return null;
+
+      const meta = collectAttachments(msg.bodyStructure).find(
+        (a) => a.part_id === partId
+      );
+      if (!meta) return null;
+
+      if (meta.size != null && meta.size > maxBytes) {
+        throw new Error(
+          `Attachment is ${meta.size} bytes, which exceeds the ${maxBytes} byte limit`
+        );
+      }
+
+      const downloaded = await this.client.download(String(uid), partId, {
+        uid: true,
+        maxBytes,
+      });
+      if (!downloaded?.content) return null;
+
+      const chunks: Buffer[] = [];
+      let total = 0;
+      for await (const chunk of downloaded.content as NodeJS.ReadableStream) {
+        const buf = typeof chunk === 'string' ? Buffer.from(chunk) : (chunk as Buffer);
+        total += buf.byteLength;
+        // BODYSTRUCTURE size is advisory — enforce again on the real stream so
+        // a lying server can't push us past the limit.
+        if (total > maxBytes) {
+          throw new Error(`Attachment exceeds the ${maxBytes} byte limit`);
+        }
+        chunks.push(buf);
+      }
+
+      return {
+        content: Buffer.concat(chunks),
+        filename: meta.filename,
+        mimeType: meta.mime_type,
+      };
+    } finally {
+      lock.release();
+    }
+  }
+
+  /**
    * QRESYNC delta: everything that changed since a known MODSEQ, in one round
    * trip. Returns null when the server can't serve one, which routes the sync
    * engine to its UIDNEXT-scan fallback.

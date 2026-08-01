@@ -237,6 +237,7 @@ Notifications are posted with `osascript` instead of `node-notifier`/`terminal-n
 |------|-------------|------|------|
 | `search_threads` | Search emails across all accounts (or scoped via `account_ids`) | None | Immediate |
 | `read_thread` | Read a single message identified by `target: {account_id, uid}` | None | Immediate |
+| `get_attachment` | Download one attachment to a private staging directory and return its path | Low | Immediate |
 | `get_overview` | Cross-account summary of recent mail that needs attention | None | Immediate |
 | `draft_reply` | Create a draft (saved to Drafts, not sent) | Low | Immediate |
 | `label_thread` | Add/remove IMAP flags on `targets: [{account_id, uid}]` | Low | Immediate |
@@ -311,6 +312,87 @@ hold_messages:
   gate: always_gated
 ```
 
+## Local cache
+
+By default agent-mail reads everything over IMAP, live. That is correct but slow: IMAP has no aggregate operations, so a broad question ("what's still unanswered from June") costs one network round trip per account per query, and body search is either unavailable or unrankable.
+
+The optional local cache mirrors your mail into a SQLite database on your Mac and serves searches from disk instead.
+
+### What gets stored, and where
+
+`~/.agent-mail/cache.db`, created `0600` inside the `0700` agent-mail directory. It holds message envelopes, flags, **full message bodies** (text and HTML), and attachment *metadata* — filename, type and size. Attachment payloads are not stored; `get_attachment` fetches those on demand.
+
+Be aware of what that means: **two years of your full message bodies sit at rest in a file on your disk.** Nothing leaves your machine — the same local-first guarantee as the rest of agent-mail — but this is meaningfully more of your mail sitting in one readable place than before. Budget roughly 300–400 MB per account for a two-year window.
+
+To delete it, stop the daemon and `rm ~/.agent-mail/cache.db`. Nothing is lost: the cache is derived from your mail server and rebuilds itself. The intent ledger, which is the actual record of what agents did, is a separate file and is untouched.
+
+### Turning it on
+
+Create `~/.agent-mail/cache.yaml`:
+
+```yaml
+cache:
+  mode: shadow    # off (default) | shadow | on
+```
+
+- **`off`** — the cache is never read. The daemon still syncs it in the background, so it warms up.
+- **`shadow`** — every search runs against both the cache and IMAP. IMAP's answer is what you get; the two are compared and any difference is logged to `~/.agent-mail/agent-mail.log`. Run here for a few days first.
+- **`on`** — searches are served from the cache, falling back to IMAP when the cache is stale or a mailbox hasn't finished backfilling.
+
+Shadow mode exists because the failure that matters for a mail cache is silently *missing* a message. Watch the log for `cache: shadow divergence` before switching to `on`.
+
+### The daemon does the syncing
+
+Sync runs in the background daemon, not in the MCP server — several MCP servers can be running at once (Claude Desktop, Claude Code, a CLI invocation), and each one syncing would duplicate every fetch. So the cache needs the daemon installed:
+
+```bash
+./bin/agent-mail.mjs install-daemon
+```
+
+If the daemon isn't running, searches report `cache.state: "stale"` and fall back to IMAP. Degraded, not broken.
+
+### First sync
+
+The first backfill walks your mail newest-first, so recent mail is searchable within seconds while older mail fills in behind it. Responses carry a coverage block so an agent can tell "nothing matched" from "nothing matched in what I have locally":
+
+```json
+"cache": {
+  "state": "backfilling",
+  "last_synced_at": "2026-07-31T18:04:11Z",
+  "coverage": { "work": { "INBOX": { "complete": false, "oldest": "2025-02-14T…", "messages": 8412 } } }
+}
+```
+
+Check progress any time with `./bin/agent-mail.mjs status`.
+
+### Settings
+
+```yaml
+cache:
+  mode: off
+
+  # Entries starting with a backslash are IMAP special-use flags, resolved per
+  # provider — Gmail's "[Gmail]/Sent Mail" and iCloud's "Sent Messages" both
+  # match "\Sent".
+  #
+  # Gmail's All Mail ("\All") is excluded on purpose: it holds a near-copy of
+  # every message, roughly doubling cache size and backfill time for very
+  # little extra reach. Add "\All" if you want it anyway.
+  mailboxes: [INBOX, "\Sent", "\Archive", agent-mail-holding]
+
+  # How far back to backfill. null means your entire mail history — a
+  # decade-old account can take hours and several GB.
+  backfill_days: 730
+
+  attachments: metadata          # none | metadata | full
+  max_attachment_bytes: 26214400 # 25 MB
+  sync_interval_seconds: 60
+```
+
+### Attachments
+
+Attachment payloads are never cached, so `get_attachment` always fetches from the server. By default it writes the file to `~/.agent-mail/attachments/<date>/<random>/` and returns the path — your agent can open it with its own file tools, and a large PDF doesn't get base64'd into the conversation. Staged files are written `0600`, never executable regardless of type, and deleted after 7 days.
+
 ## Architecture
 
 **Intent Ledger.** Every action is an intent stored in SQLite. Intents go through a lifecycle: `pending` → `approved` → `executing` → `executed` (or `rejected`, `failed`, `undone`). The `executing` intermediate status prevents duplicate execution on crash.
@@ -320,6 +402,8 @@ hold_messages:
 **IMAP threading.** Threads are reconstructed from `In-Reply-To` and `References` headers (RFC 2822). No provider-specific thread support needed.
 
 **SQLite WAL.** Multiple processes (MCP server instances + reviewer UI) share one database file with WAL mode, `busy_timeout(5000)`, and `wal_autocheckpoint(1000)`.
+
+**Local cache (optional).** A second SQLite database, `cache.db`, mirrors mail for fast local search with an FTS5 full-text index. It is strictly derived state: the daemon is its only writer, MCP servers open it read-only, and every mutation still executes against IMAP first. Deleting it loses nothing. See [Local cache](#local-cache).
 
 ## Development
 
@@ -337,6 +421,13 @@ To remove the background daemon:
 
 ```bash
 ./bin/agent-mail.mjs uninstall-daemon
+```
+
+That stops cache syncing but leaves the cached mail on disk. To remove that too:
+
+```bash
+rm ~/.agent-mail/cache.db
+rm -rf ~/.agent-mail/attachments
 ```
 
 To remove local files after uninstalling the daemon:

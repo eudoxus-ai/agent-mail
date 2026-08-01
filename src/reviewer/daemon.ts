@@ -9,6 +9,9 @@ import { notifyIntent } from './notify.js';
 import { shouldNotify } from './notification-policy.js';
 import { createLogger } from '../logger.js';
 import { ACCOUNTS_YAML_PATH, LEDGER_DB_PATH, DEFAULT_REVIEWER_PORT } from '../config.js';
+import { openCache, CacheUnsupportedError } from '../cache/db.js';
+import { loadCacheConfig } from '../cache/config.js';
+import { SyncLoop } from '../cache/sync-loop.js';
 import type { Intent } from '../types.js';
 import type { Logger } from '../logger.js';
 
@@ -47,7 +50,33 @@ export async function startDaemon(port: number = DEFAULT_REVIEWER_PORT): Promise
   const db = openDatabase();
   const accounts = loadAccounts();
   const pool = new ImapConnectionPool({ accounts, logger });
-  const executor = new Executor({ db, accounts, pool, logger });
+
+  // The daemon is the single writer to the cache. A cache that can't be
+  // opened is logged and skipped — mail operations do not depend on it.
+  const cacheConfig = loadCacheConfig();
+  let cache = null;
+  let syncLoop: SyncLoop | null = null;
+  try {
+    cache = openCache();
+    syncLoop = new SyncLoop({ cache, accounts, pool, logger, config: cacheConfig });
+  } catch (error) {
+    if (error instanceof CacheUnsupportedError) {
+      logger.warn(`Local cache unavailable: ${error.message}`);
+    } else {
+      logger.warn(
+        `Local cache could not be opened: ${error instanceof Error ? error.message : error}`
+      );
+    }
+  }
+
+  const executor = new Executor({
+    db,
+    accounts,
+    pool,
+    logger,
+    cache: cache ?? undefined,
+    cacheConfig,
+  });
   const app = createReviewerApp({ db, executor, logger });
 
   const watcher = new IntentWatcher({
@@ -59,6 +88,7 @@ export async function startDaemon(port: number = DEFAULT_REVIEWER_PORT): Promise
 
   const shutdown = async (code = 0) => {
     watcher.stop();
+    syncLoop?.stop();
     try {
       await pool.closeAll();
     } catch {
@@ -73,5 +103,12 @@ export async function startDaemon(port: number = DEFAULT_REVIEWER_PORT): Promise
     logger.info(`agent-mail daemon running at http://${host}:${port}`);
     logger.info(`Watching for pending intents (polling every 3s)`);
     logger.info(`${accounts.length} account(s) configured`);
+
+    if (syncLoop) {
+      syncLoop.start();
+      logger.info(
+        `Local cache sync every ${cacheConfig.syncIntervalSeconds}s (mode: ${cacheConfig.mode})`
+      );
+    }
   });
 }

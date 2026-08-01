@@ -1,7 +1,7 @@
 # Local Message Cache & Index — Design
 
 **Date:** 2026-07-31
-**Status:** Proposed, awaiting review
+**Status:** Phase 1 implemented. Phases 2–3 not started.
 **Scope:** Replace on-demand IMAP reads with a locally synced, full-text-indexed SQLite mirror of mail, so search and browse are local-disk fast instead of network-round-trip slow.
 
 ## Problem
@@ -442,11 +442,46 @@ Config key `cache.mode`:
 
 Phased:
 
-| Phase | Contents |
+| Phase | Contents | Status |
+|---|---|---|
+| 1 | Schema, ingest, backfill, delta sync, `search_threads` in shadow → on | **Done** |
+| 2 | `get_overview` from cache, sender familiarity, participant graph | Not started |
+| 3 | IDLE push, `sqlite-vec` embeddings + RRF hybrid search | Not started |
+
+Persistent cross-mailbox threading moved from phase 2 into phase 1 — the sync engine has to assign a `thread_id` at ingest anyway, so doing it globally cost nothing extra and retired documented limitation #1 immediately.
+
+### Phase 1, as built
+
+| Module | What it does |
 |---|---|
-| 1 | Schema, ingest, backfill, delta sync, `search_threads` in shadow → on |
-| 2 | `get_overview` from cache, persistent threading, sender familiarity signals |
-| 3 | IDLE push, `sqlite-vec` embeddings + RRF hybrid search |
+| `cache/schema.ts`, `db.ts`, `migrations.ts` | Schema, WAL/pragma setup, FTS5 capability probe |
+| `cache/ingest.ts` | `EmailMessage` → rows (pure) |
+| `cache/store.ts` | Transactional writes keeping row + FTS + thread graph in step |
+| `cache/threading.ts` | Persistent union-find over Message-Ids |
+| `cache/fts-query.ts` | User text → safe FTS5 MATCH expression |
+| `cache/ports.ts` | `SyncProvider` seam |
+| `cache/sync.ts` | Backfill, QRESYNC delta, no-CONDSTORE fallback, body drain |
+| `cache/state.ts` | `mailbox_state` bookkeeping, purge |
+| `cache/query.ts` | Cache-backed reads in the `search_threads` shape |
+| `cache/coverage.ts` | Freshness + per-mailbox coverage |
+| `cache/invalidate.ts` | Post-mutation echo + dirty marking (D2) |
+| `cache/shadow.ts` | Divergence diffing |
+| `cache/config.ts` | `cache.yaml` loading, defaults |
+| `cache/sync-loop.ts` | Daemon-side loop, single writer |
+| `cache/attachment-store.ts` | Sanitized, sandboxed attachment staging + GC |
+| `provider/imap.ts` | `mailboxSnapshot`, `listAllUids`, `fetchSyncEnvelopes`, `fetchTextParts`, `qresyncDelta`, `fetchAttachment`, BODYSTRUCTURE walkers |
+| `provider/imap-sync.ts` | Adapter to the `SyncProvider` port |
+| `tools/get-attachment.ts` | The tool surface |
+
+Wiring: the daemon runs `SyncLoop` as the single writer; MCP servers open the cache read-only; the reviewer opens it read-write so approval-time mutations echo too; `agent-mail status` prints per-mailbox coverage.
+
+### Known gaps
+
+1. **`get_overview` still reads IMAP.** Phase 2. It's the tool that benefits most, since it fires four candidate-set searches per account.
+2. **The `include_snippets` no-op isn't implemented.** The parameter still gates an extra IMAP fetch on the IMAP path. Once `search_threads` runs on the cache, snippets are free and the flag should become a no-op that always populates.
+3. **No cross-account thread merging.** Threading is global within an account, not across them.
+4. **Cursor pagination on the cache path** re-runs the query with a `before` bound rather than a keyset seek. Correct, but O(offset) on deep pages.
+5. **`cache.attachments: full`** is accepted by config but not implemented — payload caching is always off.
 
 ## Error handling
 

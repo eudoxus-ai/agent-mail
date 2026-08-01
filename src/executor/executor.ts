@@ -34,6 +34,13 @@ import { parseTargets, type Target } from '../tools/target.js';
 import { insertIntentTargets, getIntentTargets } from '../ledger/intent-targets.js';
 import { decodeCursor, encodeCursor } from '../lib/search-cursor.js';
 import { projectResult } from '../lib/envelope-projection.js';
+import { searchCache, countByAccount } from '../cache/query.js';
+import { getCoverage, isServable } from '../cache/coverage.js';
+import { diffResults, logDivergence } from '../cache/shadow.js';
+import { invalidate } from '../cache/invalidate.js';
+import { stageAttachment, AttachmentTooLargeError } from '../cache/attachment-store.js';
+import { INLINE_MAX_BYTES } from '../tools/get-attachment.js';
+import { DEFAULT_CACHE_CONFIG, type CacheConfig } from '../cache/config.js';
 
 /**
  * Thrown from `holdBySender` when the replies-present policy gate blocks the
@@ -89,6 +96,15 @@ interface SearchThreadsMultiPayload {
   per_account_counts?: Record<string, number>;
   results: SearchThreadResult[];
   next_cursor?: string;
+  /**
+   * Present only on cache-backed responses. Lets the caller distinguish
+   * "no results" from "no results within the window I have cached locally".
+   */
+  cache?: {
+    state: string;
+    last_synced_at: string | null;
+    coverage: Record<string, Record<string, unknown>>;
+  };
 }
 
 export interface ExecutorDeps {
@@ -96,6 +112,13 @@ export interface ExecutorDeps {
   accounts: AccountConfig[];
   pool: ImapConnectionPool;
   logger: Logger;
+  /**
+   * Local message cache. Optional: when absent (or when its mode is `off`)
+   * every read goes to IMAP exactly as before. The cache is an optimization,
+   * never a dependency.
+   */
+  cache?: Database;
+  cacheConfig?: CacheConfig;
 }
 
 export class Executor {
@@ -109,12 +132,22 @@ export class Executor {
    * reversible IMAP side effect before the DB CAS has a chance to settle.
    */
   private readonly pendingUndos = new Set<string>();
+  private cache: Database | null;
+  private cacheConfig: CacheConfig;
 
   constructor(deps: ExecutorDeps) {
     this.db = deps.db;
     this.accounts = deps.accounts;
     this.pool = deps.pool;
     this.logger = deps.logger;
+    this.cache = deps.cache ?? null;
+    this.cacheConfig = deps.cacheConfig ?? DEFAULT_CACHE_CONFIG;
+  }
+
+  /** Fire-and-forget cache maintenance after a successful IMAP mutation (D2). */
+  private echoToCache(input: Parameters<typeof invalidate>[1]): void {
+    if (!this.cache) return;
+    invalidate(this.cache, input, this.logger);
   }
 
   async executeImmediate(params: {
@@ -559,6 +592,28 @@ export class Executor {
     // at most `limit` rows at the boundary were already returned on page 1.
     const imapFetchLimit = decodedCursor ? limit * 2 : limit;
 
+    // Cache read path. `on` serves from the cache when coverage allows;
+    // `shadow` computes the cache answer but still returns IMAP's, logging any
+    // divergence. Either way a cache failure falls through to IMAP.
+    const cacheAttempt =
+      this.cache && this.cacheConfig.mode !== 'off'
+        ? this.readFromCache({
+            accountIds: targetIds,
+            mailbox,
+            query,
+            from: baseCriteria.from,
+            to: baseCriteria.to,
+            subject: baseCriteria.subject,
+            since: baseCriteria.since,
+            before: baseCriteria.before,
+            limit,
+          })
+        : null;
+
+    if (cacheAttempt && this.cacheConfig.mode === 'on' && cacheAttempt.servable) {
+      return this.buildCachePayload(cacheAttempt, allIds, limit, intent);
+    }
+
     const fanResult = await fanOut({
       pool: this.pool,
       accountIds: targetIds,
@@ -681,7 +736,171 @@ export class Executor {
         boundary_seen,
       });
     }
+
+    // Shadow mode: IMAP's answer is what ships; the cache answer is only
+    // compared against it. This is the gate that has to pass before anyone
+    // flips mode to `on`.
+    if (cacheAttempt && this.cacheConfig.mode === 'shadow') {
+      const diff = diffResults(allResults, cacheAttempt.rows);
+      logDivergence(
+        this.logger,
+        { mailbox, query, account_ids: targetIds, limit, cache_state: cacheAttempt.coverage.state },
+        diff
+      );
+    }
+
     return payload;
+  }
+
+  /** Run the cache-side query, tolerating any failure by returning null. */
+  private readFromCache(params: {
+    accountIds: string[];
+    mailbox: string;
+    query?: string;
+    from?: string;
+    to?: string;
+    subject?: string;
+    since?: Date;
+    before?: Date;
+    limit: number;
+  }): {
+    rows: ReturnType<typeof searchCache>;
+    coverage: ReturnType<typeof getCoverage>;
+    servable: boolean;
+  } | null {
+    if (!this.cache) return null;
+    try {
+      const coverage = getCoverage(this.cache, params.accountIds, {
+        freshnessWindowSeconds: this.cacheConfig.freshnessWindowSeconds,
+      });
+      const rows = searchCache(this.cache, params);
+      return { rows, coverage, servable: isServable(coverage.state) };
+    } catch (error) {
+      this.logger.warn('cache: read failed, falling back to IMAP', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  private buildCachePayload(
+    attempt: NonNullable<ReturnType<Executor['readFromCache']>>,
+    allIds: string[],
+    limit: number,
+    intent: Intent
+  ): SearchThreadsMultiPayload {
+    const fields = intent.params.fields as string[] | undefined;
+    const rows = attempt.rows;
+
+    const payload: SearchThreadsMultiPayload = {
+      accounts_searched: Object.keys(countByAccount(rows)),
+      accounts_available: allIds,
+      per_account_counts: countByAccount(rows),
+      results: rows.map((r) => projectResult(r as never, fields)) as never,
+    };
+
+    // Coverage travels with every cache-backed answer so "no results" can be
+    // distinguished from "no results within what I have locally".
+    payload.cache = {
+      state: attempt.coverage.state,
+      last_synced_at: attempt.coverage.last_synced_at,
+      coverage: attempt.coverage.coverage,
+    };
+
+    if (rows.length >= limit && rows.length > 0) {
+      const oldest = rows[rows.length - 1];
+      const boundaryMs = new Date(oldest.envelope.date).getTime();
+      payload.next_cursor = encodeCursor({
+        before: oldest.envelope.date,
+        boundary_seen: rows
+          .filter((r) => new Date(r.envelope.date).getTime() === boundaryMs)
+          .map((r) => ({
+            account_id: r.account_id,
+            mailbox: r.mailbox,
+            uid: r.uid,
+          })),
+      });
+    }
+
+    return payload;
+  }
+
+  private async fetchAttachment(
+    intent: Intent
+  ): Promise<Array<{ type: 'text'; text: string }>> {
+    const target = intent.params.target as Target;
+    const partId = intent.params.part_id as string;
+    const inline = intent.params.inline === true;
+    const maxBytes = this.cacheConfig.maxAttachmentBytes;
+    // Target.mailbox is optional across the tool surface; INBOX is the
+    // documented default everywhere else, so match it here.
+    const mailbox = target.mailbox ?? 'INBOX';
+
+    const fetched = await this.pool.withConnection(target.account_id, (imap) =>
+      imap.fetchAttachment(mailbox, target.uid, partId, maxBytes)
+    );
+
+    if (!fetched) {
+      throw new Error(
+        `No attachment at part_id "${partId}" on ${mailbox}:${target.uid}`
+      );
+    }
+
+    if (inline) {
+      if (fetched.content.byteLength > INLINE_MAX_BYTES) {
+        throw new Error(
+          `Attachment is ${fetched.content.byteLength} bytes, too large to inline (limit ${INLINE_MAX_BYTES}). Omit "inline" to stage it on disk instead.`
+        );
+      }
+      return [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              filename: fetched.filename,
+              mime_type: fetched.mimeType,
+              size: fetched.content.byteLength,
+              content_base64: fetched.content.toString('base64'),
+            },
+            null,
+            2
+          ),
+        },
+      ];
+    }
+
+    try {
+      const staged = stageAttachment({
+        filename: fetched.filename,
+        partId,
+        content: fetched.content,
+        maxBytes,
+      });
+
+      return [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              filename: staged.filename,
+              mime_type: fetched.mimeType,
+              size: staged.size,
+              path: staged.path,
+              expires_at: staged.expiresAt.toISOString(),
+            },
+            null,
+            2
+          ),
+        },
+      ];
+    } catch (error) {
+      if (error instanceof AttachmentTooLargeError) {
+        throw new Error(
+          `${error.message}. Raise cache.max_attachment_bytes if you need it.`
+        );
+      }
+      throw error;
+    }
   }
 
   private async listSendersMulti(intent: Intent): Promise<{
@@ -835,6 +1054,10 @@ export class Executor {
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
 
+    if (intent.tool === 'get_attachment') {
+      return this.fetchAttachment(intent);
+    }
+
     // Multi-account label: group targets by account, fan out per-account
     if (intent.tool === 'label_thread') {
       const targets = intent.params.targets as Target[];
@@ -864,6 +1087,16 @@ export class Executor {
             } else {
               await imap.removeFlags(uids, [label], mailbox);
             }
+            // IMAP has already accepted the change; echo it locally so a
+            // follow-up search doesn't show the old flags (design D2).
+            this.echoToCache({
+              accountId,
+              mailbox,
+              uids,
+              effect: 'flags_changed',
+              detail:
+                action === 'add' ? { flagsAdded: [label] } : { flagsRemoved: [label] },
+            });
           }
           return { uids: grouped[accountId].map((t) => t.uid) };
         },
@@ -956,6 +1189,13 @@ export class Executor {
             const holdingUid = entry.destination_uid ?? t.uid;
             if (!dryRun) {
               const { uidMap } = await imap.moveMessages([holdingUid], holding, entry.original_mailbox);
+              this.echoToCache({
+                accountId,
+                mailbox: holding,
+                uids: [holdingUid],
+                effect: 'moved',
+                detail: { toMailbox: entry.original_mailbox },
+              });
               // Map the restored-to UID back under the source uid key for persistence
               const restoredUid = uidMap.get(holdingUid) ?? holdingUid;
               acctUidMap.set(t.uid, restoredUid);
@@ -1168,6 +1408,17 @@ export class Executor {
             for (const [src, dst] of uidMap) {
               combinedUidMap.set(src, dst);
             }
+            // Drop the source rows immediately so held messages stop showing
+            // up in searches of their original mailbox. The destination copy
+            // has a server-assigned UID we don't know, so the holding mailbox
+            // is only marked dirty — the next sync discovers it.
+            this.echoToCache({
+              accountId,
+              mailbox,
+              uids,
+              effect: 'moved',
+              detail: { toMailbox: holding },
+            });
           }
           perMailbox.push({ mailbox, message_count: uids.length, uids });
         }
@@ -1481,6 +1732,13 @@ export class Executor {
             return destUid ?? t.uid;
           });
           await imap.moveMessages(holdingUids, holding, inbox);
+          this.echoToCache({
+            accountId,
+            mailbox: holding,
+            uids: holdingUids,
+            effect: 'moved',
+            detail: { toMailbox: inbox },
+          });
         });
       }
       return;
@@ -1507,6 +1765,13 @@ export class Executor {
           const holding = await imap.getMailboxPath('holding');
           for (const { uid, currentMailbox } of list) {
             await imap.moveMessages([uid], currentMailbox, holding);
+            this.echoToCache({
+              accountId,
+              mailbox: currentMailbox,
+              uids: [uid],
+              effect: 'moved',
+              detail: { toMailbox: holding },
+            });
           }
         });
       }

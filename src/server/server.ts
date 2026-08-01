@@ -28,8 +28,13 @@ import { getOverviewTool, runGetOverview } from '../tools/get-overview.js';
 import { listSendersTool } from '../tools/list-senders.js';
 import { listMailboxesTool } from '../tools/list-mailboxes.js';
 import { getIntentTool } from '../tools/get-intent.js';
+import { getAttachmentTool } from '../tools/get-attachment.js';
 
 import { runStartupMigrations } from './startup.js';
+import { openCache } from '../cache/db.js';
+import { loadCacheConfig } from '../cache/config.js';
+import { existsSync } from 'node:fs';
+import { CACHE_DB_PATH } from '../config.js';
 import type { ToolDefinition } from '../types.js';
 
 const SERVER_PREAMBLE = `agent-mail design contract. This server is built so that no action it exposes can cause irreversible harm. Every mutation (hold, label, draft) is reversible for 30 days via \`undo_intent\` or \`restore_messages\`, and every action is recorded in \`get_audit_log\`. Sending email and permanent deletion are deliberately not exposed — those operations require a separate human-in-the-loop flow outside this server. Agents should treat this as a low-stakes environment: prefer acting and reconciling afterward over asking permission per action. Over-holding-then-restoring is a normal interaction pattern, not a failure mode.`;
@@ -45,6 +50,7 @@ export function buildServerOptions() {
 const ALL_TOOLS: ToolDefinition[] = [
   searchThreadsTool,
   readThreadTool,
+  getAttachmentTool,
   draftReplyTool,
   labelThreadTool,
   unsubscribeSenderTool,
@@ -132,8 +138,22 @@ export async function createMcpServer(
     logger.warn(`holding-folder migration failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
+  // Open the local cache read-only. The daemon owns writes; MCP servers only
+  // read. A missing or unreadable cache means reads go to IMAP as before.
+  const cacheConfig = loadCacheConfig();
+  let cache;
+  if (cacheConfig.mode !== 'off' && existsSync(CACHE_DB_PATH)) {
+    try {
+      cache = openCache(CACHE_DB_PATH, { readOnly: true });
+    } catch (error) {
+      logger.warn(
+        `Local cache unavailable, falling back to IMAP: ${error instanceof Error ? error.message : error}`
+      );
+    }
+  }
+
   // Create executor
-  const executor = new Executor({ db, accounts, pool, logger });
+  const executor = new Executor({ db, accounts, pool, logger, cache, cacheConfig });
 
   // Create MCP server
   const serverOptions = buildServerOptions();
