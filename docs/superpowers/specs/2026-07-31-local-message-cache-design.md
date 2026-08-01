@@ -117,6 +117,8 @@ src/
     ingest.ts       # NEW: EmailMessage -> rows + FTS (pure, testable)
     store.ts        # NEW: transactional writes — messages + FTS + threads
     fts-query.ts    # NEW: user text -> safe FTS5 MATCH expression
+    ports.ts        # NEW: SyncProvider seam — the interface sync.ts depends on
+    state.ts        # NEW: mailbox_state bookkeeping, purge, coverage helpers
     sync.ts         # NEW: SyncEngine — backfill, delta, uidvalidity handling
     query.ts        # NEW: cache-backed search/overview reads
     coverage.ts     # NEW: what's cached, how fresh
@@ -125,8 +127,10 @@ src/
   executor/
     executor.ts     # MODIFIED: route reads to cache, call invalidate after writes
   provider/
-    imap.ts         # MODIFIED: add fetchRange/fetchBodies for bulk ingest,
+    imap.ts         # MODIFIED: mailboxSnapshot / listAllUids / fetchSyncEnvelopes
+                    #           / fetchTextParts / qresyncDelta for sync,
                     #           plus fetchAttachment for on-demand payloads
+    imap-sync.ts    # NEW: adapts ImapProvider to the SyncProvider port
   tools/
     get-attachment.ts  # NEW: on-demand attachment payload fetch
   cli/

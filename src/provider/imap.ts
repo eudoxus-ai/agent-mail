@@ -528,6 +528,249 @@ export class ImapProvider {
     }
   }
 
+  // === Local cache sync ===================================================
+  // These back src/provider/imap-sync.ts, which adapts them to the cache's
+  // SyncProvider port. They live here because this class owns the ImapFlow
+  // client; the cache layer stays free of any imapflow dependency.
+
+  /** UIDVALIDITY / UIDNEXT / HIGHESTMODSEQ for a mailbox. */
+  async mailboxSnapshot(mailbox: string): Promise<{
+    uidValidity: number;
+    uidNext: number;
+    highestModseq: number | null;
+    exists: number;
+  }> {
+    const status = await this.client.status(mailbox, {
+      uidNext: true,
+      uidValidity: true,
+      highestModseq: true,
+      messages: true,
+    });
+
+    return {
+      uidValidity: Number(status.uidValidity ?? 0),
+      uidNext: Number(status.uidNext ?? 0),
+      // A server without CONDSTORE simply omits HIGHESTMODSEQ. Reporting null
+      // rather than 0 is what routes the sync engine to its fallback path.
+      highestModseq:
+        status.highestModseq == null ? null : Number(status.highestModseq),
+      exists: Number(status.messages ?? 0),
+    };
+  }
+
+  /** Every UID in a mailbox, ascending, optionally bounded by date. */
+  async listAllUids(mailbox: string, since?: Date): Promise<number[]> {
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      const query = since ? { since } : { all: true };
+      const result = await this.client.search(query as any, { uid: true });
+      return Array.isArray(result) ? [...result].sort((a, b) => a - b) : [];
+    } finally {
+      lock.release();
+    }
+  }
+
+  /**
+   * Envelope-level fetch for the cache: everything needed to build a row
+   * except the body. Includes BODYSTRUCTURE so attachment metadata is recorded
+   * without downloading any payloads (design D1).
+   */
+  async fetchSyncEnvelopes(
+    mailbox: string,
+    uids: number[]
+  ): Promise<
+    Array<{
+      uid: number;
+      modseq: number | null;
+      internalDate: Date | null;
+      size: number | null;
+      listId: string | null;
+      snippet: string;
+      attachments: Array<{
+        part_id: string;
+        filename: string | null;
+        mime_type: string | null;
+        size: number | null;
+      }>;
+      message: EmailMessage;
+    }>
+  > {
+    if (uids.length === 0) return [];
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      const results = [];
+      for await (const msg of this.client.fetch(
+        uids.join(','),
+        {
+          uid: true,
+          envelope: true,
+          flags: true,
+          internalDate: true,
+          size: true,
+          bodyStructure: true,
+          source: { start: 0, maxLength: 2048 },
+        },
+        { uid: true }
+      )) {
+        const source = msg.source?.toString('utf-8') ?? '';
+        const { listId, listUnsubscribe } = extractListHeadersFromSource(source);
+        const listUnsubscribePost = extractHeader(source, 'List-Unsubscribe-Post');
+        const references =
+          extractHeader(source, 'References')?.split(/\s+/).filter(Boolean) ?? [];
+
+        const message: EmailMessage = {
+          uid: msg.uid,
+          // Unlike the search path, a missing Message-Id is NOT synthesized
+          // here. ingest.ts needs to see it as absent so the message gets a
+          // synthetic thread instead of joining every other id-less message.
+          messageId: msg.envelope?.messageId ?? '',
+          from: toParticipant(msg.envelope?.from?.[0]),
+          to: toParticipants(msg.envelope?.to),
+          cc: toParticipants(msg.envelope?.cc),
+          date: msg.envelope?.date?.toISOString() ?? '',
+          subject: msg.envelope?.subject ?? '',
+          bodyText: '',
+          inReplyTo: extractHeader(source, 'In-Reply-To') ?? undefined,
+          references,
+          flags: Array.from(msg.flags ?? []),
+          listUnsubscribe:
+            listUnsubscribe != null
+              ? parseListUnsubscribe(listUnsubscribe, listUnsubscribePost ?? undefined)
+              : undefined,
+          mailbox,
+        };
+
+        results.push({
+          uid: msg.uid,
+          modseq: msg.modseq == null ? null : Number(msg.modseq),
+          // imapflow types this as string | Date depending on server response.
+          internalDate: toDate(msg.internalDate),
+          size: msg.size ?? null,
+          listId,
+          snippet: extractSnippet(msg.source ?? Buffer.alloc(0)),
+          attachments: collectAttachments(msg.bodyStructure),
+          message,
+        });
+      }
+      return results;
+    } finally {
+      lock.release();
+    }
+  }
+
+  /**
+   * Download the text/plain and text/html parts of each message.
+   *
+   * Deliberately not the full RFC822 source: attachment payloads are what turn
+   * a ~300 MB cache into a multi-GB one, and they're rarely the search target.
+   */
+  async fetchTextParts(
+    mailbox: string,
+    uids: number[]
+  ): Promise<
+    Array<{ uid: number; text: string | null; html: string | null; charset: string | null }>
+  > {
+    if (uids.length === 0) return [];
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      const structures = new Map<number, unknown>();
+      for await (const msg of this.client.fetch(
+        uids.join(','),
+        { uid: true, bodyStructure: true },
+        { uid: true }
+      )) {
+        structures.set(msg.uid, msg.bodyStructure);
+      }
+
+      const results = [];
+      for (const uid of uids) {
+        const structure = structures.get(uid);
+        if (!structure) continue;
+
+        const parts = collectTextParts(structure);
+        if (parts.plain === null && parts.html === null) continue;
+
+        const [text, html] = await Promise.all([
+          parts.plain ? this.downloadPart(uid, parts.plain) : Promise.resolve(null),
+          parts.html ? this.downloadPart(uid, parts.html) : Promise.resolve(null),
+        ]);
+
+        results.push({ uid, text, html, charset: parts.charset });
+      }
+      return results;
+    } finally {
+      lock.release();
+    }
+  }
+
+  private async downloadPart(uid: number, partId: string): Promise<string | null> {
+    try {
+      const downloaded = await this.client.download(String(uid), partId, { uid: true });
+      if (!downloaded?.content) return null;
+      return await streamToString(downloaded.content);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * QRESYNC delta: everything that changed since a known MODSEQ, in one round
+   * trip. Returns null when the server can't serve one, which routes the sync
+   * engine to its UIDNEXT-scan fallback.
+   */
+  async qresyncDelta(
+    mailbox: string,
+    known: { uidValidity: number; highestModseq: number }
+  ): Promise<{
+    uidValidity: number;
+    highestModseq: number | null;
+    vanished: number[];
+    changed: number[];
+  } | null> {
+    if (!this.client.capabilities.has('CONDSTORE') && !this.client.capabilities.has('QRESYNC')) {
+      return null;
+    }
+
+    const vanished: number[] = [];
+    const onExpunge = (payload: { uid?: number; vanished?: boolean }) => {
+      if (payload?.uid != null) vanished.push(payload.uid);
+    };
+
+    this.client.on('expunge', onExpunge);
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      const box = this.client.mailbox;
+      const uidValidity = Number(
+        (box && typeof box !== 'boolean' ? box.uidValidity : undefined) ?? 0
+      );
+
+      // A UIDVALIDITY change invalidates the caller's whole view; hand it back
+      // so the engine purges rather than merging two UID generations.
+      if (uidValidity !== known.uidValidity) {
+        return { uidValidity, highestModseq: null, vanished: [], changed: [] };
+      }
+
+      const changed: number[] = [];
+      for await (const msg of this.client.fetch(
+        '1:*',
+        { uid: true },
+        { uid: true, changedSince: BigInt(known.highestModseq) }
+      )) {
+        changed.push(msg.uid);
+      }
+
+      const highestModseq =
+        box && typeof box !== 'boolean' && box.highestModseq != null
+          ? Number(box.highestModseq)
+          : null;
+
+      return { uidValidity, highestModseq, vanished, changed };
+    } finally {
+      lock.release();
+      this.client.off('expunge', onExpunge);
+    }
+  }
+
   async getMailboxPath(
     name: 'inbox' | 'drafts' | 'sent' | 'trash' | 'holding'
   ): Promise<string> {
@@ -554,6 +797,120 @@ export class ImapProvider {
     };
     return fallbacks[name] ?? name;
   }
+}
+
+function toDate(value: string | Date | null | undefined): Date | null {
+  if (!value) return null;
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+interface BodyNode {
+  type?: string;
+  part?: string;
+  disposition?: string;
+  dispositionParameters?: Record<string, string>;
+  parameters?: Record<string, string>;
+  size?: number;
+  childNodes?: unknown[];
+}
+
+/**
+ * Walk a BODYSTRUCTURE collecting attachment metadata — never payloads.
+ *
+ * A part counts as an attachment when it is explicitly dispositioned as one, or
+ * when it carries a filename and isn't one of the text parts we cache inline.
+ * Inline images with filenames are included deliberately: a user looking for
+ * "the screenshot Bob sent" should find it.
+ */
+export function collectAttachments(structure: unknown): Array<{
+  part_id: string;
+  filename: string | null;
+  mime_type: string | null;
+  size: number | null;
+}> {
+  const found: Array<{
+    part_id: string;
+    filename: string | null;
+    mime_type: string | null;
+    size: number | null;
+  }> = [];
+
+  const walk = (node: BodyNode | null | undefined): void => {
+    if (!node || typeof node !== 'object') return;
+
+    const type = (node.type ?? '').toLowerCase();
+    const disposition = (node.disposition ?? '').toLowerCase();
+    const filename =
+      node.dispositionParameters?.filename ?? node.parameters?.name ?? null;
+
+    const isMultipart = type.startsWith('multipart/');
+    const isCachedText = type === 'text/plain' || type === 'text/html';
+
+    if (
+      !isMultipart &&
+      node.part &&
+      (disposition === 'attachment' || (filename && !isCachedText))
+    ) {
+      found.push({
+        part_id: node.part,
+        filename: filename ?? null,
+        mime_type: node.type ?? null,
+        size: node.size ?? null,
+      });
+    }
+
+    for (const child of node.childNodes ?? []) {
+      walk(child as BodyNode);
+    }
+  };
+
+  walk(structure as BodyNode);
+  return found;
+}
+
+/**
+ * Locate the text/plain and text/html parts to cache.
+ *
+ * Both are kept when present: plain text is what gets indexed and searched,
+ * HTML is what read_thread renders. A single-part text message has no `part`
+ * identifier, so it falls back to '1' — the whole body.
+ */
+export function collectTextParts(structure: unknown): {
+  plain: string | null;
+  html: string | null;
+  charset: string | null;
+} {
+  let plain: string | null = null;
+  let html: string | null = null;
+  let charset: string | null = null;
+
+  const walk = (node: BodyNode | null | undefined): void => {
+    if (!node || typeof node !== 'object') return;
+
+    const type = (node.type ?? '').toLowerCase();
+    const disposition = (node.disposition ?? '').toLowerCase();
+
+    // A text part dispositioned as an attachment (a .txt someone sent) is not
+    // the message body and must not be indexed as one.
+    if (disposition !== 'attachment') {
+      if (type === 'text/plain' && plain === null) {
+        plain = node.part ?? '1';
+        charset ??= node.parameters?.charset ?? null;
+      } else if (type === 'text/html' && html === null) {
+        html = node.part ?? '1';
+        charset ??= node.parameters?.charset ?? null;
+      }
+    }
+
+    for (const child of node.childNodes ?? []) {
+      walk(child as BodyNode);
+    }
+  };
+
+  walk(structure as BodyNode);
+  return { plain, html, charset };
 }
 
 function extractHeader(source: string, name: string): string | null {
