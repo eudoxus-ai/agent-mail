@@ -113,6 +113,55 @@ interface SearchThreadsMultiPayload {
   };
 }
 
+/**
+ * Raised when too much background work is already outstanding.
+ *
+ * Queued background jobs are not durable: the pool queue is a promise chain in
+ * process memory and nothing records "waiting to run". A restart therefore
+ * vaporizes everything queued while leaving each intent marked `executing`
+ * forever. Capping the depth bounds how much can be lost that way — it is not
+ * a throughput control, since per-account serialization means the queue drains
+ * at the same rate however fast it is filled.
+ */
+export class BackgroundQueueFullError extends Error {
+  constructor(
+    readonly inFlight: number,
+    readonly limit: number
+  ) {
+    super(
+      `${inFlight} background action(s) already outstanding (limit ${limit}). ` +
+        'Poll the ones you have with get_intent until they report "executed", then queue more.'
+    );
+    this.name = 'BackgroundQueueFullError';
+  }
+}
+
+/**
+ * Tools that change mail. Only these can be meaningfully orphaned by a restart
+ * — a read that died with the process changed nothing.
+ */
+const MUTATING_TOOLS = new Set([
+  'hold_messages',
+  'hold_by_sender',
+  'restore_messages',
+  'label_thread',
+  'queue_send',
+  'draft_reply',
+  'unsubscribe_sender',
+  'undo_intent',
+]);
+
+/** Exported for tests: only mutations can be orphaned by a restart. */
+export function isMutatingTool(tool: string): boolean {
+  return MUTATING_TOOLS.has(tool);
+}
+
+function maxBackgroundJobs(): number {
+  const raw = process.env.AGENT_MAIL_MAX_BACKGROUND;
+  const parsed = raw ? Number.parseInt(raw, 10) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 8;
+}
+
 export interface ExecutorDeps {
   db: Database;
   accounts: AccountConfig[];
@@ -140,6 +189,8 @@ export class Executor {
   private readonly pendingUndos = new Set<string>();
   private cache: Database | null;
   private cacheConfig: CacheConfig;
+  /** Background actions started but not yet settled. */
+  private backgroundInFlight = 0;
 
   constructor(deps: ExecutorDeps) {
     this.db = deps.db;
@@ -148,6 +199,11 @@ export class Executor {
     this.logger = deps.logger;
     this.cache = deps.cache ?? null;
     this.cacheConfig = deps.cacheConfig ?? DEFAULT_CACHE_CONFIG;
+  }
+
+  /** Outstanding background actions and the cap on them. */
+  backgroundLoad(): { in_flight: number; limit: number } {
+    return { in_flight: this.backgroundInFlight, limit: maxBackgroundJobs() };
   }
 
   /** Fire-and-forget cache maintenance after a successful IMAP mutation (D2). */
@@ -263,6 +319,13 @@ export class Executor {
     agentId: string;
     risk: RiskLevel;
   }): Promise<Intent> {
+    const limit = maxBackgroundJobs();
+    if (this.backgroundInFlight >= limit) {
+      // Reject before creating an intent, so a refused request leaves no
+      // record stuck at `executing`.
+      throw new BackgroundQueueFullError(this.backgroundInFlight, limit);
+    }
+
     const intent = createIntent(this.db, {
       account_id: params.accountId,
       tool: params.tool,
@@ -294,6 +357,7 @@ export class Executor {
     // and the catch-all guarantees no unhandled rejection can reach the top
     // level — an unhandled rejection here would kill the server, which is the
     // failure this whole change exists to make survivable.
+    this.backgroundInFlight += 1;
     void (async () => {
       try {
         await this.performAction(running);
@@ -330,6 +394,8 @@ export class Executor {
           tool: params.tool,
           error: errorDetail.message,
         });
+      } finally {
+        this.backgroundInFlight -= 1;
       }
     })();
 
@@ -936,21 +1002,31 @@ export class Executor {
   private collectDiagnostics(): Record<string, unknown> {
     const pool = this.pool.diagnostics();
 
-    const stuck = checkStuckExecuting(this.db).map((intent) => {
-      const targets = getIntentTargets(this.db, intent.id);
-      return {
-        intent_id: intent.id,
-        tool: intent.tool,
-        account_id: intent.account_id,
-        created_at: intent.created_at,
-        age_seconds: Math.round(
-          (Date.now() - new Date(`${intent.created_at}Z`).getTime()) / 1000
-        ),
-        progress: getIntentProgress(this.db, intent.id),
-        targets_recorded: targets.length,
-        targets_unconfirmed: targets.filter((t) => t.destination_uid === null).length,
-      };
-    });
+    // Exclude the diagnostics call itself, and every other read-only tool.
+    //
+    // Reads are recorded as intents too and are `executing` for the duration,
+    // so an unfiltered list always contains at least this call observing
+    // itself — reported as an orphan, on an idle server, which is precisely
+    // when someone reaches for this. Only mutations can be meaningfully
+    // orphaned: a read that vanished with the process changed nothing and has
+    // nothing to re-run.
+    const stuck = checkStuckExecuting(this.db)
+      .filter((intent) => MUTATING_TOOLS.has(intent.tool))
+      .map((intent) => {
+        const targets = getIntentTargets(this.db, intent.id);
+        return {
+          intent_id: intent.id,
+          tool: intent.tool,
+          account_id: intent.account_id,
+          created_at: intent.created_at,
+          age_seconds: Math.round(
+            (Date.now() - new Date(`${intent.created_at}Z`).getTime()) / 1000
+          ),
+          progress: getIntentProgress(this.db, intent.id),
+          targets_recorded: targets.length,
+          targets_unconfirmed: targets.filter((t) => t.destination_uid === null).length,
+        };
+      });
 
     const busy = pool.accounts.filter((a) => a.in_flight !== null);
     const queued = pool.accounts.filter((a) => a.queue_depth > 0);
@@ -973,6 +1049,9 @@ export class Executor {
       },
       accounts: pool.accounts,
       operation_timeout_ms: pool.operation_timeout_ms,
+      // Queued background work is NOT durable — it lives in process memory.
+      // A restart orphans all of it, which is why the depth is capped.
+      background: this.backgroundLoad(),
       executing_intents: stuck,
       interpretation: buildInterpretation({
         busyCount: busy.length,
@@ -2008,9 +2087,11 @@ function buildInterpretation(input: {
   }
   if (input.busyCount === 0 && input.stuckCount > 0) {
     return (
-      `${input.stuckCount} intent(s) are marked executing but no IMAP operation is running. ` +
-      'That means the process restarted while they were in flight — they will never ' +
-      'complete on their own. Re-run them; hold_by_sender is idempotent.'
+      `${input.stuckCount} mutating action(s) are marked executing with no IMAP operation ` +
+      'running. That means the process restarted while they were in flight — they will ' +
+      'never complete on their own. Re-run them; hold_by_sender is idempotent. ' +
+      '(Read-only calls, including this one, are excluded — they change nothing and ' +
+      'cannot be orphaned.)'
     );
   }
   const seconds = Math.round(input.longestElapsedMs / 1000);

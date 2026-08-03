@@ -181,3 +181,49 @@ describe('intent progress', () => {
     expect(getIntentProgress(db, 'no-such-intent')).toBeNull();
   });
 });
+
+describe('diagnostics must not report on itself', () => {
+  /**
+   * Reads are recorded as intents and sit at `executing` while they run, so an
+   * unfiltered stuck-intent list always contains the diagnostics call
+   * observing itself. On an idle server — the most likely moment to reach for
+   * it — that produced a confident report of a phantom orphan, with advice to
+   * re-run a get_diagnostics intent, which means nothing.
+   */
+  const MUTATING = [
+    'hold_messages',
+    'hold_by_sender',
+    'restore_messages',
+    'label_thread',
+    'queue_send',
+    'draft_reply',
+    'unsubscribe_sender',
+    'undo_intent',
+  ];
+  const READ_ONLY = [
+    'get_diagnostics',
+    'search_threads',
+    'read_thread',
+    'get_overview',
+    'get_intent',
+    'list_senders',
+    'list_mailboxes',
+    'get_audit_log',
+    'get_pending_actions',
+    'get_attachment',
+  ];
+
+  it('classifies every mutating tool as orphanable', async () => {
+    const { isMutatingTool } = await import('../../src/executor/executor.js');
+    for (const tool of MUTATING) {
+      expect(isMutatingTool(tool), tool).toBe(true);
+    }
+  });
+
+  it('classifies reads as not orphanable, including get_diagnostics itself', async () => {
+    const { isMutatingTool } = await import('../../src/executor/executor.js');
+    for (const tool of READ_ONLY) {
+      expect(isMutatingTool(tool), tool).toBe(false);
+    }
+  });
+});

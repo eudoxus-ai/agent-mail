@@ -311,6 +311,14 @@ It distinguishes the three cases that look identical from outside:
 
 `get_intent` also reports a `progress` field for running actions (`searching`, then `moving` with a message count), so a long job is distinguishable from one that never started.
 
+### Pacing a large batch
+
+Background actions are capped at **8 outstanding** (`AGENT_MAIL_MAX_BACKGROUND` to change). Past that, the call is refused with `status: "queue_full"` and `nothing_happened: true` — no intent is created, so there is nothing to reconcile or undo. Poll your outstanding ids, then retry the identical call.
+
+The cap is not a throughput control. Work is serialized per account, so a queue of 50 drains at exactly the same rate as a queue of 8 — the cap exists because **queued background work is not durable**. The pool queue is a promise chain in process memory; nothing records "waiting to run". If the server restarts, everything queued is lost while each intent stays marked `executing` forever. Capping the depth bounds how much a restart can strand.
+
+So: work through a long list in batches of about eight, polling between. Firing everything at once is no faster and risks far more.
+
 ### Long bulk sweeps
 
 `hold_messages` and `hold_by_sender` accept `background: true`. The call returns an `intent_id` right away and the move runs in the background:
