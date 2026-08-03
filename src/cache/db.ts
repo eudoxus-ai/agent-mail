@@ -1,3 +1,4 @@
+import { chmodSync, existsSync } from 'node:fs';
 import { DatabaseSync, type Database } from '../ledger/sqlite.js';
 import { CACHE_DB_PATH } from '../config.js';
 import { CACHE_SCHEMA } from './schema.js';
@@ -47,11 +48,29 @@ export interface OpenCacheOptions {
   readOnly?: boolean;
 }
 
+/**
+ * SQLite creates database files with the process umask, typically 0644. This
+ * one holds full message bodies, so tighten it — and the WAL/SHM sidecars,
+ * which hold recently written pages and are just as sensitive.
+ */
+function restrictPermissions(dbPath: string): void {
+  if (dbPath === ':memory:' || dbPath.startsWith('file::memory:')) return;
+  for (const path of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+    try {
+      if (existsSync(path)) chmodSync(path, 0o600);
+    } catch {
+      // Best-effort: a cache we can't chmod is still a usable cache, and the
+      // parent directory is already 0700.
+    }
+  }
+}
+
 export function openCache(
   dbPath: string = CACHE_DB_PATH,
   options: OpenCacheOptions = {}
 ): Database {
   const db = new DatabaseSync(dbPath);
+  restrictPermissions(dbPath);
 
   // Same durability posture as the ledger: WAL so readers never block the
   // daemon's writes, and a bounded busy timeout so a mid-sync batch doesn't
@@ -66,5 +85,8 @@ export function openCache(
   assertFts5Support(db);
   db.exec(CACHE_SCHEMA);
   runCacheMigrations(db);
+  // WAL/SHM sidecars only appear once the journal is active, so tighten again
+  // after the first writes.
+  restrictPermissions(dbPath);
   return db;
 }

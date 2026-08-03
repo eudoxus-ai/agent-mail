@@ -31,6 +31,12 @@ export class ImapProvider {
         pass: account.auth.pass,
       },
       logger: false,
+      // Required for the local cache's delta sync. Without it, EXPUNGE
+      // notifications carry sequence numbers instead of UIDs, so
+      // qresyncDelta() cannot tell which cached message was deleted and
+      // deletions would never propagate — messages removed in another client
+      // would linger in the cache indefinitely.
+      qresync: true,
     });
   }
 
@@ -792,10 +798,17 @@ export class ImapProvider {
     highestModseq: number | null;
     vanished: number[];
     changed: number[];
+    vanishedReliable: boolean;
   } | null> {
     if (!this.client.capabilities.has('CONDSTORE') && !this.client.capabilities.has('QRESYNC')) {
       return null;
     }
+
+    // The `qresync: true` constructor option only takes effect if the server
+    // actually advertises QRESYNC. On a CONDSTORE-only server, expunges still
+    // arrive as sequence numbers — useless for identifying a cached row — so
+    // the caller must reconcile deletions a different way.
+    const vanishedReliable = this.client.capabilities.has('QRESYNC');
 
     const vanished: number[] = [];
     const onExpunge = (payload: { uid?: number; vanished?: boolean }) => {
@@ -813,7 +826,13 @@ export class ImapProvider {
       // A UIDVALIDITY change invalidates the caller's whole view; hand it back
       // so the engine purges rather than merging two UID generations.
       if (uidValidity !== known.uidValidity) {
-        return { uidValidity, highestModseq: null, vanished: [], changed: [] };
+        return {
+          uidValidity,
+          highestModseq: null,
+          vanished: [],
+          changed: [],
+          vanishedReliable,
+        };
       }
 
       const changed: number[] = [];
@@ -830,7 +849,7 @@ export class ImapProvider {
           ? Number(box.highestModseq)
           : null;
 
-      return { uidValidity, highestModseq, vanished, changed };
+      return { uidValidity, highestModseq, vanished, changed, vanishedReliable };
     } finally {
       lock.release();
       this.client.off('expunge', onExpunge);

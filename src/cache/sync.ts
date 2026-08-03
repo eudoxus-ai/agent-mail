@@ -330,14 +330,23 @@ async function runDelta(
     return { mode: 'backfill', purged: true, ingested: 0, vanished: 0 };
   }
 
+  // On a CONDSTORE-only server, expunges arrive as sequence numbers and
+  // `vanished` is unusable. Fall back to diffing cached UIDs against the
+  // server's list — one extra UID SEARCH, and the only way deletions
+  // propagate at all on those servers.
+  const goneUids =
+    delta.vanishedReliable === false
+      ? await reconcileDeletions(db, options, mailbox, uidvalidity)
+      : delta.vanished;
+
   let vanished = 0;
-  if (delta.vanished.length > 0) {
+  if (goneUids.length > 0) {
     withTransaction(db, () => {
       vanished = deleteMessages(db, {
         accountId,
         mailbox,
         uidvalidity,
-        uids: delta.vanished,
+        uids: goneUids,
       });
     });
   }
@@ -349,6 +358,29 @@ async function runDelta(
   }
 
   return { mode: 'delta', ingested: delta.changed.length, vanished };
+}
+
+/**
+ * Which cached UIDs the server no longer lists.
+ *
+ * Used when a delta response can't be trusted to report deletions. Costs one
+ * UID SEARCH, which is cheap — the server returns bare numbers, no envelopes.
+ */
+async function reconcileDeletions(
+  db: Database,
+  options: SyncOptions,
+  mailbox: string,
+  uidvalidity: number
+): Promise<number[]> {
+  const now = options.now ?? Date.now;
+  const serverUids = new Set(
+    await options.provider.listUids(mailbox, {
+      since: backfillSince(options.backfillDays, now()),
+    })
+  );
+  return cachedUids(db, options.accountId, mailbox, uidvalidity).filter(
+    (uid) => !serverUids.has(uid)
+  );
 }
 
 /**

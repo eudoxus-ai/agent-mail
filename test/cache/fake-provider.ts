@@ -46,6 +46,11 @@ export class FakeSyncProvider implements SyncProvider {
   mailboxes: FakeMailbox[];
   /** Set true to simulate a server with no CONDSTORE/QRESYNC. */
   supportsCondstore = true;
+  /**
+   * Set false to simulate a CONDSTORE-only server: modseq deltas work, but
+   * expunges arrive as sequence numbers so `vanished` is never populated.
+   */
+  supportsQresync = true;
   /** Call counters, so tests can assert sync isn't refetching the world. */
   calls = { listUids: 0, fetchEnvelopes: 0, fetchBodies: 0, delta: 0 };
   failOn: { fetchBodies?: boolean } = {};
@@ -123,15 +128,19 @@ export class FakeSyncProvider implements SyncProvider {
         highestModseq: mb.highestModseq,
         vanished: [],
         changed: [],
+        vanishedReliable: this.supportsQresync,
       };
     }
 
     return {
       uidValidity: mb.uidValidity,
       highestModseq: mb.highestModseq,
-      vanished: mb.vanished
-        .filter((v) => v.modseq > known.highestModseq)
-        .map((v) => v.uid),
+      // A CONDSTORE-only server reports expunges by sequence number, which
+      // the adapter cannot map to a UID — so nothing lands here.
+      vanished: this.supportsQresync
+        ? mb.vanished.filter((v) => v.modseq > known.highestModseq).map((v) => v.uid)
+        : [],
+      vanishedReliable: this.supportsQresync,
       changed: mb.messages
         .filter((m) => m.modseq > known.highestModseq)
         .map((m) => toEnvelope(m, mailbox)),

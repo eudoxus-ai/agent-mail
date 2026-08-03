@@ -215,6 +215,40 @@ describe('delta sync', () => {
     expect(uidsInCache()).toEqual([2]);
   });
 
+  it('reconciles deletions on a CONDSTORE-only server, where vanished is empty', async () => {
+    // Regression: the ImapFlow client was originally constructed without
+    // qresync, so EXPUNGE carried sequence numbers and `vanished` was always
+    // empty. Deleted mail would have lingered in the cache forever, surfacing
+    // in searches long after it was gone from the server.
+    const provider = new FakeSyncProvider([
+      mailbox('INBOX', [message(1), message(2)]),
+    ]);
+    provider.supportsQresync = false;
+    await syncMailbox(db, opts(provider), 'INBOX');
+    expect(uidsInCache()).toEqual([1, 2]);
+
+    provider.expunge('INBOX', 1);
+    const result = await syncMailbox(db, opts(provider), 'INBOX');
+
+    expect(result.vanished).toBe(1);
+    expect(uidsInCache()).toEqual([2]);
+  });
+
+  it('trusts vanished and skips the extra UID listing when QRESYNC is available', async () => {
+    const provider = new FakeSyncProvider([
+      mailbox('INBOX', [message(1), message(2)]),
+    ]);
+    await syncMailbox(db, opts(provider), 'INBOX');
+    const before = provider.calls.listUids;
+
+    provider.expunge('INBOX', 1);
+    await syncMailbox(db, opts(provider), 'INBOX');
+
+    expect(uidsInCache()).toEqual([2]);
+    // No reconciliation scan needed — that's what QRESYNC buys.
+    expect(provider.calls.listUids).toBe(before);
+  });
+
   it('does not re-ingest unchanged messages', async () => {
     const provider = await backfilled();
     const before = provider.calls.fetchEnvelopes;

@@ -50,6 +50,15 @@ export interface DeltaChanges {
   vanished: number[];
   /** Messages whose MODSEQ advanced — new arrivals and flag changes alike. */
   changed: SyncEnvelope[];
+  /**
+   * Whether `vanished` can be trusted to list every deletion.
+   *
+   * False on servers that support CONDSTORE but not QRESYNC: they report
+   * expunges as sequence numbers, which are useless for identifying a cached
+   * row. The engine reconciles deletions with a UID diff instead. Defaults to
+   * true when omitted.
+   */
+  vanishedReliable?: boolean;
 }
 
 export interface SyncProvider {
