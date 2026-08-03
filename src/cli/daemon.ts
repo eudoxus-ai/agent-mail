@@ -1,4 +1,4 @@
-import { writeFileSync, unlinkSync, existsSync, readdirSync, statSync } from 'node:fs';
+import { writeFileSync, readFileSync, unlinkSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -11,9 +11,14 @@ const LOG_PATH = join(homedir(), '.agent-mail', 'daemon.log');
 const ERR_LOG_PATH = join(homedir(), '.agent-mail', 'daemon-error.log');
 
 export interface RunnerResolution {
+  /** Absolute path to the Node binary. Never a shim. */
   bin: string;
+  /** Full argument vector after `bin`, excluding the subcommand. */
+  args: string[];
   script: string;
   mode: 'built' | 'tsx';
+  /** Node version the daemon will run under. */
+  nodeVersion: string;
   /** Non-fatal advisory, e.g. "dist is older than src". */
   warning?: string;
 }
@@ -65,10 +70,24 @@ function newestSourceMtime(srcDir: string): number {
  * already uses.
  */
 export function resolveRunner(rootDir: string = packageRoot()): RunnerResolution {
+  // process.execPath, never `which node`.
+  //
+  // Under a version manager (asdf, nvm, volta) `which node` returns a *shim* —
+  // a script that picks a version at runtime from .tool-versions and the
+  // manager's environment variables. launchd provides neither: it runs the
+  // daemon with a stripped PATH and none of the shell's env. The shim then
+  // falls through to whatever `node` it can find on that PATH, typically
+  // Homebrew's, which tracks current rather than LTS. The result is a daemon
+  // silently running a Node major the user never installed and cannot see.
+  //
+  // process.execPath is the fully-resolved real binary of the Node running
+  // this install command, so the daemon gets exactly the version the user was
+  // using when they installed it.
+  const nodePath = process.execPath;
+  const nodeVersion = process.version;
+
   const builtScript = join(rootDir, 'dist', 'index.js');
   if (existsSync(builtScript)) {
-    const nodePath = execSync('which node', { encoding: 'utf-8' }).trim();
-
     // A stale dist means the daemon silently runs old code after an edit —
     // confusing enough to be worth calling out rather than guessing.
     const srcMtime = newestSourceMtime(join(rootDir, 'src'));
@@ -78,38 +97,59 @@ export function resolveRunner(rootDir: string = packageRoot()): RunnerResolution
         ? 'dist/ is older than src/ — run "npm run build" to pick up recent changes'
         : undefined;
 
-    return { bin: nodePath, script: builtScript, mode: 'built', warning };
+    return {
+      bin: nodePath,
+      args: [builtScript],
+      script: builtScript,
+      mode: 'built',
+      nodeVersion,
+      warning,
+    };
   }
 
   const tsScript = join(rootDir, 'src', 'index.ts');
-  const localTsx = join(rootDir, 'node_modules', '.bin', 'tsx');
-  if (existsSync(localTsx)) {
-    return { bin: localTsx, script: tsScript, mode: 'tsx' };
-  }
 
-  try {
-    const tsxPath = execSync('which tsx', { encoding: 'utf-8' }).trim();
-    if (tsxPath) return { bin: tsxPath, script: tsScript, mode: 'tsx' };
-  } catch {
-    // fall through to the error below
+  // Resolve tsx to its real entry module and invoke it as an argument to Node
+  // rather than executing it directly. The .bin entry is a symlink to a file
+  // whose shebang is `#!/usr/bin/env node`, which would re-resolve node from
+  // launchd's stripped PATH and reintroduce the exact problem above.
+  const tsxCandidates = [
+    join(rootDir, 'node_modules', 'tsx', 'dist', 'cli.mjs'),
+    join(rootDir, 'node_modules', '.bin', 'tsx'),
+  ];
+  const tsxEntry = tsxCandidates.find((p) => existsSync(p));
+
+  if (tsxEntry) {
+    return {
+      bin: nodePath,
+      args: [tsxEntry, tsScript],
+      script: tsScript,
+      mode: 'tsx',
+      nodeVersion,
+    };
   }
 
   throw new Error(
     'Cannot resolve a way to run the daemon. Looked for:\n' +
       `  built output: ${builtScript}\n` +
-      `  local tsx:    ${localTsx}\n` +
-      '  global tsx:   (not on PATH)\n' +
+      `  tsx entry:    ${tsxCandidates.join('\n                ')}\n` +
       'Run "npm run build", or "npm install" to restore the local tsx.'
   );
 }
 
 export function installDaemon(): void {
-  const { bin, script, mode, warning } = resolveRunner();
+  const { bin, args, script, mode, nodeVersion, warning } = resolveRunner();
 
-  // Which code the daemon will actually run is the thing people get wrong, so
-  // say it out loud rather than leaving it to be inferred from a plist.
+  // Which code and which runtime the daemon will actually use are both things
+  // people get wrong, so say them out loud rather than leaving them to be
+  // inferred from a plist.
   console.log(`Runner: ${mode === 'built' ? 'compiled dist/' : 'tsx over src/'} (${script})`);
+  console.log(`Node:   ${nodeVersion} (${bin})`);
   if (warning) console.warn(`Warning: ${warning}`);
+
+  const programArguments = [bin, ...args, 'daemon']
+    .map((a) => `    <string>${a}</string>`)
+    .join('\n');
 
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -119,9 +159,7 @@ export function installDaemon(): void {
   <string>${PLIST_NAME}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${bin}</string>
-    <string>${script}</string>
-    <string>daemon</string>
+${programArguments}
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -189,6 +227,8 @@ export async function daemonStatus(): Promise<void> {
     console.log('Daemon: installed but not running');
   }
 
+  reportRuntime();
+
   if (existsSync(LEDGER_DB_PATH)) {
     try {
       const { openDatabase } = await import('../ledger/db.js');
@@ -225,6 +265,57 @@ export async function daemonStatus(): Promise<void> {
   }
 
   await printCacheStatus();
+}
+
+/**
+ * Compare the Node the installed daemon uses against the one running this
+ * command. A version-manager shim baked into the plist resolves differently
+ * under launchd, so these can silently diverge — and node:sqlite is
+ * experimental, so a major-version gap can mean the two processes disagree
+ * about whether FTS5 exists at all.
+ */
+function reportRuntime(): void {
+  console.log(`This CLI: Node ${process.version} (${process.execPath})`);
+
+  if (!existsSync(PLIST_PATH)) return;
+
+  try {
+    const plist = readFileSync(PLIST_PATH, 'utf-8');
+    const first = plist.match(/<array>\s*<string>([^<]+)<\/string>/);
+    const daemonBin = first?.[1];
+    if (!daemonBin) return;
+
+    if (/\/(shims|\.nvm|\.volta)\//.test(daemonBin)) {
+      console.log(`Daemon Node: ${daemonBin}`);
+      console.log(
+        '  WARNING: that is a version-manager shim. Under launchd it resolves\n' +
+          '  with a stripped PATH and may pick a different Node than you expect.\n' +
+          '  Re-run install-daemon to pin the real binary.'
+      );
+      return;
+    }
+
+    let daemonVersion = '(could not determine)';
+    try {
+      daemonVersion = execSync(`${JSON.stringify(daemonBin)} --version`, {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+    } catch {
+      // Binary may have been removed by a version manager since install.
+    }
+
+    console.log(`Daemon:   Node ${daemonVersion} (${daemonBin})`);
+
+    if (daemonVersion !== '(could not determine)' && daemonVersion !== process.version) {
+      console.log(
+        `  NOTE: the daemon runs Node ${daemonVersion} but this CLI is ${process.version}.\n` +
+          '  Re-run install-daemon to align them.'
+      );
+    }
+  } catch {
+    // Status output is best-effort.
+  }
 }
 
 /**

@@ -329,6 +329,16 @@ hold_messages:
   gate: always_gated
 ```
 
+### A note on Node versions
+
+`install-daemon` pins the daemon to the exact Node binary you ran the install with (`process.execPath`), not to whatever `node` resolves to later.
+
+This matters if you use a version manager. `which node` under asdf, nvm, or volta returns a *shim* — a script that picks a version at runtime from `.tool-versions` and the manager's environment variables. launchd provides neither: it starts the daemon with a stripped `PATH` and none of your shell's environment. The shim then falls through to whatever `node` it can find, usually Homebrew's, which tracks *current* rather than LTS. The result is a daemon quietly running a Node major you never installed.
+
+That's not cosmetic here: `node:sqlite` is still experimental, and its feature set — FTS5 support in particular — varies between majors. The daemon and the MCP server disagreeing about the runtime can mean they disagree about whether the local cache works at all.
+
+`agent-mail status` prints both versions and flags a mismatch. If you switch Node versions, re-run `install-daemon` to re-pin.
+
 ## Local cache
 
 By default agent-mail reads everything over IMAP, live. That is correct but slow: IMAP has no aggregate operations, so a broad question ("what's still unanswered from June") costs one network round trip per account per query, and body search is either unavailable or unrankable.

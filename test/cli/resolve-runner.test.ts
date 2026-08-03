@@ -41,12 +41,42 @@ function makeLocalTsx(): string {
 }
 
 describe('resolveRunner', () => {
+  it('pins the real Node binary, never a version-manager shim', () => {
+    makeDist();
+    const resolved = resolveRunner(root);
+
+    // `which node` under asdf/nvm/volta returns a shim that re-resolves the
+    // version at runtime. launchd runs with a stripped PATH and none of the
+    // manager's env, so the shim silently falls through to whatever node is on
+    // that PATH — typically Homebrew's, which tracks current rather than LTS.
+    expect(resolved.bin).toBe(process.execPath);
+    expect(resolved.bin).not.toMatch(/\/shims\//);
+    expect(resolved.nodeVersion).toBe(process.version);
+  });
+
+  it('invokes tsx through Node rather than relying on its shebang', () => {
+    // node_modules/.bin/tsx is a symlink to a file with a
+    // `#!/usr/bin/env node` shebang, which would re-resolve node from
+    // launchd's PATH and reintroduce the same problem.
+    mkdirSync(join(root, 'node_modules', 'tsx', 'dist'), { recursive: true });
+    const cli = join(root, 'node_modules', 'tsx', 'dist', 'cli.mjs');
+    writeFileSync(cli, '// tsx');
+
+    const resolved = resolveRunner(root);
+
+    expect(resolved.mode).toBe('tsx');
+    expect(resolved.bin).toBe(process.execPath);
+    expect(resolved.args[0]).toBe(cli);
+    expect(resolved.args[1]).toBe(join(root, 'src', 'index.ts'));
+  });
+
   it('finds the built entrypoint in dist/, not src/', () => {
     const built = makeDist();
     const resolved = resolveRunner(root);
 
     expect(resolved.mode).toBe('built');
     expect(resolved.script).toBe(built);
+    expect(resolved.args).toEqual([built]);
     expect(resolved.script).not.toContain(join('src', 'index.js'));
   });
 
@@ -62,8 +92,8 @@ describe('resolveRunner', () => {
     const resolved = resolveRunner(root);
 
     expect(resolved.mode).toBe('tsx');
-    expect(resolved.bin).toBe(tsx);
-    expect(resolved.script).toBe(join(root, 'src', 'index.ts'));
+    expect(resolved.bin).toBe(process.execPath);
+    expect(resolved.args).toEqual([tsx, join(root, 'src', 'index.ts')]);
   });
 
   it('warns when dist is older than src instead of silently running stale code', () => {
@@ -96,7 +126,7 @@ describe('resolveRunner', () => {
 
     if (error) {
       expect(error.message).toContain(join(root, 'dist', 'index.js'));
-      expect(error.message).toContain(join(root, 'node_modules', '.bin', 'tsx'));
+      expect(error.message).toContain(join(root, 'node_modules', 'tsx', 'dist', 'cli.mjs'));
       // The old message claimed a build would fix it while looking in the
       // wrong place; the new one shows the paths so it can be verified.
       expect(error.message).not.toBe(

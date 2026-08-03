@@ -37,6 +37,15 @@ export async function startDaemon(port: number = DEFAULT_REVIEWER_PORT): Promise
   const logger = createLogger('cli');
   const host = '127.0.0.1';
 
+  // Stamp the runtime on every start. launchd runs with a stripped PATH and
+  // none of the shell's environment, so the daemon can silently end up on a
+  // different Node than the CLI — which matters because node:sqlite is
+  // experimental and its feature set (FTS5 in particular) varies by major.
+  logger.info(`agent-mail daemon starting on Node ${process.version}`, {
+    exec_path: process.execPath,
+    pid: process.pid,
+  });
+
   if (!existsSync(ACCOUNTS_YAML_PATH)) {
     logger.error("No accounts configured. Run 'npx agent-mail add-account' first.");
     process.exit(1);
