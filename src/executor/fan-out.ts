@@ -10,14 +10,16 @@ export interface FanOutResult<T> {
 export async function fanOut<T>(opts: {
   pool: ImapConnectionPool;
   accountIds: string[];
+  /** Shown in pool diagnostics so a stuck borrow names the operation. */
+  label?: string;
   fn: (accountId: string, imap: ImapProvider) => Promise<T>;
 }): Promise<FanOutResult<T>> {
-  const { pool, accountIds, fn } = opts;
+  const { pool, accountIds, fn, label } = opts;
 
   const settled = await Promise.allSettled(
     accountIds.map(async (accountId) => ({
       accountId,
-      value: await pool.withConnection(accountId, (imap) => fn(accountId, imap)),
+      value: await pool.withConnection(accountId, (imap) => fn(accountId, imap), label),
     }))
   );
 

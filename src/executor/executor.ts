@@ -36,6 +36,8 @@ import {
   getIntentTargets,
   updateIntentTargetDestinations,
 } from '../ledger/intent-targets.js';
+import { updateIntentProgress, getIntentProgress } from '../ledger/intents.js';
+import { checkStuckExecuting } from '../ledger/db.js';
 import { decodeCursor, encodeCursor } from '../lib/search-cursor.js';
 import { projectResult } from '../lib/envelope-projection.js';
 import { searchCache, countByAccount } from '../cache/query.js';
@@ -715,6 +717,7 @@ export class Executor {
     const fanResult = await fanOut({
       pool: this.pool,
       accountIds: targetIds,
+      label: 'search_threads',
       fn: async (accountId, imap) => {
         const resultSets = query
           ? await Promise.all([
@@ -921,6 +924,64 @@ export class Executor {
     }
 
     return payload;
+  }
+
+  /**
+   * A snapshot of everything that explains a hang.
+   *
+   * The connection pool lives in this process and nowhere else, so a separate
+   * CLI cannot observe it. Without this, a stalled background action is
+   * indistinguishable from one that was never picked up.
+   */
+  private collectDiagnostics(): Record<string, unknown> {
+    const pool = this.pool.diagnostics();
+
+    const stuck = checkStuckExecuting(this.db).map((intent) => {
+      const targets = getIntentTargets(this.db, intent.id);
+      return {
+        intent_id: intent.id,
+        tool: intent.tool,
+        account_id: intent.account_id,
+        created_at: intent.created_at,
+        age_seconds: Math.round(
+          (Date.now() - new Date(`${intent.created_at}Z`).getTime()) / 1000
+        ),
+        progress: getIntentProgress(this.db, intent.id),
+        targets_recorded: targets.length,
+        targets_unconfirmed: targets.filter((t) => t.destination_uid === null).length,
+      };
+    });
+
+    const busy = pool.accounts.filter((a) => a.in_flight !== null);
+    const queued = pool.accounts.filter((a) => a.queue_depth > 0);
+
+    return {
+      generated_at: new Date().toISOString(),
+      runtime: {
+        node: process.version,
+        pid: process.pid,
+        uptime_seconds: Math.round(process.uptime()),
+      },
+      // Leak tell: opened minus closed should equal live, and live should
+      // never exceed the number of configured accounts.
+      connections: {
+        opened: pool.opened,
+        closed: pool.closed,
+        live: pool.live,
+        accounts_configured: this.accounts.length,
+        leaked: pool.opened - pool.closed !== pool.live || pool.live > this.accounts.length,
+      },
+      accounts: pool.accounts,
+      operation_timeout_ms: pool.operation_timeout_ms,
+      executing_intents: stuck,
+      interpretation: buildInterpretation({
+        busyCount: busy.length,
+        queuedCount: queued.length,
+        stuckCount: stuck.length,
+        longestElapsedMs: Math.max(0, ...busy.map((a) => a.in_flight!.elapsed_ms)),
+        timeoutMs: pool.operation_timeout_ms,
+      }),
+    };
   }
 
   private async fetchAttachment(
@@ -1156,6 +1217,10 @@ export class Executor {
       return this.fetchAttachment(intent);
     }
 
+    if (intent.tool === 'get_diagnostics') {
+      return [{ type: 'text', text: JSON.stringify(this.collectDiagnostics(), null, 2) }];
+    }
+
     // Multi-account label: group targets by account, fan out per-account
     if (intent.tool === 'label_thread') {
       const targets = intent.params.targets as Target[];
@@ -1172,6 +1237,7 @@ export class Executor {
       const fanResult = await fanOut({
         pool: this.pool,
         accountIds,
+        label: 'label_thread',
         fn: async (accountId, imap) => {
           const byMailbox = new Map<string, number[]>();
           for (const t of grouped[accountId]) {
@@ -1366,6 +1432,10 @@ export class Executor {
         created_at: row.created_at,
         account_id: row.account_id,
         status: row.status,
+        // What it is doing right now. Without this, a long-running action
+        // reports only status: "executing" with an empty targets array, which
+        // is indistinguishable from one that was never picked up.
+        progress: getIntentProgress(this.db, id),
         targets,
       };
       if (links.reverses.length > 0) payload.reverses_intent_id = links.reverses;
@@ -1527,6 +1597,12 @@ export class Executor {
                 }))
             );
 
+            updateIntentProgress(this.db, intent.id, 'moving', {
+              account_id: accountId,
+              mailbox,
+              messages: uids.length,
+            });
+
             const { uidMap } = await imap.moveMessages(uids, mailbox, holding);
             for (const [src, dst] of uidMap) {
               combinedUidMap.set(src, dst);
@@ -1672,9 +1748,16 @@ export class Executor {
       before: before ? new Date(before) : undefined,
     };
 
+    updateIntentProgress(this.db, intent.id, 'searching', {
+      from,
+      accounts: targetIds,
+      mailbox,
+    });
+
     const searchResult = await fanOut({
       pool: this.pool,
       accountIds: targetIds,
+      label: 'hold_by_sender:search',
       fn: async (_accountId, imap) => {
         const rows = await imap.search(mailbox, criteria, limit);
         return rows.map((r) => r.uid);
@@ -1909,4 +1992,33 @@ export class Executor {
 
     throw new Error(`Unknown undo action: ${undoOp.reverseAction}`);
   }
+}
+
+
+/** Turn the raw counters into the sentence a reader actually needs. */
+function buildInterpretation(input: {
+  busyCount: number;
+  queuedCount: number;
+  stuckCount: number;
+  longestElapsedMs: number;
+  timeoutMs: number;
+}): string {
+  if (input.busyCount === 0 && input.stuckCount === 0) {
+    return 'Idle. No IMAP operation in flight and nothing mid-execution.';
+  }
+  if (input.busyCount === 0 && input.stuckCount > 0) {
+    return (
+      `${input.stuckCount} intent(s) are marked executing but no IMAP operation is running. ` +
+      'That means the process restarted while they were in flight — they will never ' +
+      'complete on their own. Re-run them; hold_by_sender is idempotent.'
+    );
+  }
+  const seconds = Math.round(input.longestElapsedMs / 1000);
+  const timeoutSeconds = Math.round(input.timeoutMs / 1000);
+  return (
+    `${input.busyCount} IMAP operation(s) in flight, longest running ${seconds}s ` +
+    `(abandoned at ${timeoutSeconds}s). ${input.queuedCount} account(s) have queued work. ` +
+    'Borrows are serialized per account, so anything queued behind a slow operation ' +
+    'waits for it — a small job sitting at "executing" is usually queued, not stuck.'
+  );
 }

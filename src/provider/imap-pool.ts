@@ -27,6 +27,13 @@ interface PoolDeps {
   logoutGraceMs?: number;
 }
 
+function envTimeoutMs(): number | null {
+  const raw = process.env.AGENT_MAIL_IMAP_TIMEOUT_MS;
+  if (!raw) return null;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
 export class ImapOperationTimeoutError extends Error {
   constructor(accountId: string, ms: number) {
     super(
@@ -42,6 +49,25 @@ interface PoolEntry {
   provider: ImapProvider | null;
   queue: Promise<void>;
   keepaliveTimer: NodeJS.Timeout | null;
+  /** Borrows waiting on this account, including the one running. */
+  queueDepth: number;
+  /** The borrow currently executing, if any. */
+  inFlight: { label: string; startedAt: number } | null;
+}
+
+export interface AccountDiagnostics {
+  account_id: string;
+  connected: boolean;
+  queue_depth: number;
+  in_flight: { label: string; elapsed_ms: number } | null;
+}
+
+export interface PoolDiagnostics {
+  opened: number;
+  closed: number;
+  live: number;
+  operation_timeout_ms: number;
+  accounts: AccountDiagnostics[];
 }
 
 /**
@@ -68,13 +94,19 @@ export class ImapConnectionPool {
     this.accounts = deps.accounts;
     this.logger = deps.logger;
     this.keepaliveIntervalMs = deps.keepaliveIntervalMs ?? 60_000;
-    this.operationTimeoutMs = deps.operationTimeoutMs ?? 10 * 60_000;
+    // 5 minutes, not 10: borrows serialize per account, so several queued
+    // background sweeps each waiting out a long timeout turn one slow
+    // operation into many minutes of apparent silence. Override with
+    // AGENT_MAIL_IMAP_TIMEOUT_MS when a legitimately huge sweep needs longer.
+    this.operationTimeoutMs =
+      deps.operationTimeoutMs ?? envTimeoutMs() ?? 5 * 60_000;
     this.logoutGraceMs = deps.logoutGraceMs ?? 3_000;
   }
 
   async withConnection<T>(
     accountId: string,
-    fn: (imap: ImapProvider) => Promise<T>
+    fn: (imap: ImapProvider) => Promise<T>,
+    label = 'operation'
   ): Promise<T> {
     if (this.closed) {
       throw new Error('ImapConnectionPool is closed');
@@ -83,13 +115,20 @@ export class ImapConnectionPool {
     getAccount(this.accounts, accountId);
 
     const entry = this.getOrCreateEntry(accountId);
+    entry.queueDepth += 1;
 
     // Chain this borrow onto the per-account queue so concurrent calls serialize.
     // The task resolves/rejects with the fn result; the queue uses a swallowed
     // copy so a single failing task never poisons subsequent calls.
-    const task: Promise<T> = entry.queue.then(() =>
-      this.withTimeout(accountId, this.runWithRetry(accountId, entry, fn))
-    );
+    const task: Promise<T> = entry.queue.then(() => {
+      entry.inFlight = { label, startedAt: Date.now() };
+      return this.withTimeout(accountId, this.runWithRetry(accountId, entry, fn)).finally(
+        () => {
+          entry.inFlight = null;
+          entry.queueDepth -= 1;
+        }
+      );
+    });
     entry.queue = task.then(
       () => undefined,
       () => undefined
@@ -131,7 +170,13 @@ export class ImapConnectionPool {
   private getOrCreateEntry(accountId: string): PoolEntry {
     let entry = this.entries.get(accountId);
     if (!entry) {
-      entry = { provider: null, queue: Promise.resolve(), keepaliveTimer: null };
+      entry = {
+        provider: null,
+        queue: Promise.resolve(),
+        keepaliveTimer: null,
+        queueDepth: 0,
+        inFlight: null,
+      };
       this.entries.set(accountId, entry);
     }
     return entry;
@@ -306,6 +351,31 @@ export class ImapConnectionPool {
       if (entry.provider) live += 1;
     }
     return { opened: this.openedConnections, closed: this.closedConnections, live };
+  }
+
+  /**
+   * Live pool state. The pool exists only inside this process, so a separate
+   * CLI can never observe it — this is the only way to see whether an account
+   * is wedged, how deep its queue is, and how long the current operation has
+   * been running.
+   */
+  diagnostics(): PoolDiagnostics {
+    const now = Date.now();
+    return {
+      ...this.stats(),
+      operation_timeout_ms: this.operationTimeoutMs,
+      accounts: [...this.entries.entries()].map(([account_id, entry]) => ({
+        account_id,
+        connected: entry.provider != null && !entry.provider.isDead(),
+        queue_depth: entry.queueDepth,
+        in_flight: entry.inFlight
+          ? {
+              label: entry.inFlight.label,
+              elapsed_ms: now - entry.inFlight.startedAt,
+            }
+          : null,
+      })),
+    };
   }
 }
 

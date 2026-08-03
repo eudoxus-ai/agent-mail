@@ -32,6 +32,16 @@ export function runMigrations(db: Database): void {
     WHERE tool IN ('quarantine_thread', 'quarantine_messages')
   `);
 
+  // Migration 5: add progress column to intents.
+  //
+  // A long-running background action previously reported only
+  // status: "executing" with an empty targets array, which is
+  // indistinguishable from "queued and never started". Progress records the
+  // phase so a poller can tell the difference.
+  if (!intentColNames.includes('progress')) {
+    db.exec(`ALTER TABLE intents ADD COLUMN progress JSON`);
+  }
+
   // Migration 4: add destination_uid column to intent_targets
   const targetCols = db.prepare(`PRAGMA table_info(intent_targets)`).all() as Array<{ name: string }>;
   const targetColNames = targetCols.map((c) => c.name);

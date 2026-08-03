@@ -247,6 +247,7 @@ Notifications are posted with `osascript` instead of `node-notifier`/`terminal-n
 | `queue_send` | Queue an email for sending | High | **Always requires approval** |
 | `hold_messages` | Move targets to `agent-mail-holding`; reversible for 30 days; supports `dry_run: true`, `include_summary: true`, `background: true` | Medium | Configurable |
 | `restore_messages` | Move held messages back to their original mailbox using the ledger snapshot captured at hold time | Low | Immediate |
+| `get_diagnostics` | Live server state: connection pool health, per-account queue depth, in-flight operation and its elapsed time, actions stuck mid-execution | None | Immediate |
 | `get_intent` | Return the full record of a past intent: targets with captured subject/from, status, and reversal links; useful for partial-restore workflows | None | Immediate |
 | `undo_intent` | Reverse a previous action | Low | Immediate |
 
@@ -295,6 +296,20 @@ After a `hold_messages` call you can restore just a subset of the held messages 
 3. Call `restore_messages` with only those targets. The response includes `reversible: true` and `undo_hint.method === 'undo_intent'`.
 
 `get_intent` also surfaces `reversed_by_intent_id` once a restore intent links back to the hold, so you can track the full reversal chain.
+
+### When something hangs
+
+Call `get_diagnostics`. The IMAP connection pool lives inside the MCP server process, so no CLI command can see it — this tool is the only window in.
+
+It distinguishes the three cases that look identical from outside:
+
+- **Queued.** `queue_depth` above 1 on an account with an `in_flight` operation. Borrows serialize per account, so a one-message job behind a full-history sweep waits for it. Not stuck — just behind something.
+- **Wedged.** An `in_flight` operation whose `elapsed_ms` is climbing toward `operation_timeout_ms`. It will be abandoned at that point and the account will recover.
+- **Orphaned.** Intents at `executing` with *no* operation in flight. The process restarted mid-action; they will never finish on their own. Re-run them — `hold_by_sender` is idempotent.
+
+`connections.leaked` is a computed check: `opened - closed` should equal `live`, and `live` should never exceed the number of configured accounts.
+
+`get_intent` also reports a `progress` field for running actions (`searching`, then `moving` with a message count), so a long job is distinguishable from one that never started.
 
 ### Long bulk sweeps
 

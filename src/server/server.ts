@@ -29,6 +29,7 @@ import { listSendersTool } from '../tools/list-senders.js';
 import { listMailboxesTool } from '../tools/list-mailboxes.js';
 import { getIntentTool } from '../tools/get-intent.js';
 import { getAttachmentTool } from '../tools/get-attachment.js';
+import { getDiagnosticsTool } from '../tools/get-diagnostics.js';
 
 import { runStartupMigrations } from './startup.js';
 import { openCache } from '../cache/db.js';
@@ -52,6 +53,7 @@ const ALL_TOOLS: ToolDefinition[] = [
   searchThreadsTool,
   readThreadTool,
   getAttachmentTool,
+  getDiagnosticsTool,
   draftReplyTool,
   labelThreadTool,
   unsubscribeSenderTool,
