@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { wrapToolHandler } from '../../src/server/middleware.js';
 import { openDatabase } from '../../src/ledger/db.js';
 import type { Database } from '../../src/ledger/sqlite.js';
@@ -179,13 +179,16 @@ describe('background queue cap', () => {
    * It is not a throughput control: per-account serialization means the queue
    * drains at the same rate however fast it is filled.
    */
-  function realExecutorHarness(limit?: number) {
-    if (limit === undefined) delete process.env.AGENT_MAIL_MAX_BACKGROUND;
-    else process.env.AGENT_MAIL_MAX_BACKGROUND = String(limit);
-  }
+  const savedLimit = process.env.AGENT_MAIL_MAX_BACKGROUND;
+  afterEach(() => {
+    // Restore rather than delete: leaking this into later tests would change
+    // the cap out from under them and fail somewhere unrelated.
+    if (savedLimit === undefined) delete process.env.AGENT_MAIL_MAX_BACKGROUND;
+    else process.env.AGENT_MAIL_MAX_BACKGROUND = savedLimit;
+  });
 
   it('refuses once too much is outstanding, without creating an intent', async () => {
-    realExecutorHarness(2);
+    process.env.AGENT_MAIL_MAX_BACKGROUND = '2';
 
     let inFlight = 0;
     const executor = {
