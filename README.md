@@ -337,6 +337,8 @@ hold_messages:
 asdf install    # or: nvm use
 ```
 
+Any 24.x works. If `asdf list all nodejs` shows an older ceiling than you expect, its version index is cached — refresh it with `asdf plugin update nodejs`.
+
 Node 22 also works and remains the `engines` floor — the full test suite passes on both. Node 24 is the better target for two reasons:
 
 - **`node:sqlite` is stable there.** On Node 22 it still emits an experimental warning; on 24 it does not. Given the intent ledger and the local message cache both sit on `node:sqlite`, that matters more here than in most projects.
