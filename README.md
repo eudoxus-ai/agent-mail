@@ -245,7 +245,7 @@ Notifications are posted with `osascript` instead of `node-notifier`/`terminal-n
 | `get_pending_actions` | Check the approval queue (cross-account) | None | Immediate |
 | `get_audit_log` | View action history (cross-account) | None | Immediate |
 | `queue_send` | Queue an email for sending | High | **Always requires approval** |
-| `hold_messages` | Move targets to `agent-mail-holding`; reversible for 30 days; supports `dry_run: true` and `include_summary: true` | Medium | Configurable |
+| `hold_messages` | Move targets to `agent-mail-holding`; reversible for 30 days; supports `dry_run: true`, `include_summary: true`, `background: true` | Medium | Configurable |
 | `restore_messages` | Move held messages back to their original mailbox using the ledger snapshot captured at hold time | Low | Immediate |
 | `get_intent` | Return the full record of a past intent: targets with captured subject/from, status, and reversal links; useful for partial-restore workflows | None | Immediate |
 | `undo_intent` | Reverse a previous action | Low | Immediate |
@@ -295,6 +295,23 @@ After a `hold_messages` call you can restore just a subset of the held messages 
 3. Call `restore_messages` with only those targets. The response includes `reversible: true` and `undo_hint.method === 'undo_intent'`.
 
 `get_intent` also surfaces `reversed_by_intent_id` once a restore intent links back to the hold, so you can track the full reversal chain.
+
+### Long bulk sweeps
+
+`hold_messages` and `hold_by_sender` accept `background: true`. The call returns an `intent_id` right away and the move runs in the background:
+
+```json
+{
+  "status": "executing",
+  "intent_id": "3f9a…",
+  "how_to_check": "Poll get_intent with intent_id \"3f9a…\" until status is \"executed\" or \"failed\".",
+  "how_to_undo": "undo_intent with intent_id \"3f9a…\" once it reports \"executed\"."
+}
+```
+
+Use it for full-history sweeps — anything with no `since` floor over a large mailbox, especially on iCloud. A synchronous call that outruns the client's patience gives you a timeout, and a timeout tells you nothing: the move may have completed with the response lost, or never have run at all. Worse, you get no `intent_id`, so the batch can't be undone. With `background: true` the id exists before any mail moves, so the outcome is always knowable and always reversible.
+
+Targets are recorded in the ledger *before* each move and confirmed after, so even a sweep interrupted partway leaves a restorable record. `agent-mail status` lists any actions that died mid-execution, with the intent id to undo them.
 
 ## Policy
 

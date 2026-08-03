@@ -36,6 +36,12 @@ const inputSchema = z.object({
     .max(1000)
     .optional()
     .describe('Safety cap per account. Default 500.'),
+  background: z
+    .boolean()
+    .optional()
+    .describe(
+      'Return an intent_id immediately and perform the move in the background instead of waiting for it to finish. Strongly recommended for large sweeps: a client-side timeout on a synchronous call tells you nothing about whether the move happened, and leaves you with no intent_id to undo. Poll get_intent(intent_id) until status is "executed" or "failed". Default false.'
+    ),
 });
 
 export const holdBySenderTool: ToolDefinition = {

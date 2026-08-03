@@ -31,7 +31,11 @@ import { generateUndoToken, getUndoExpiry, parseUndoToken } from './undo.js';
 import { buildUndoHint } from '../lib/undo-hint.js';
 import { fanOut } from './fan-out.js';
 import { parseTargets, type Target } from '../tools/target.js';
-import { insertIntentTargets, getIntentTargets } from '../ledger/intent-targets.js';
+import {
+  insertIntentTargets,
+  getIntentTargets,
+  updateIntentTargetDestinations,
+} from '../ledger/intent-targets.js';
 import { decodeCursor, encodeCursor } from '../lib/search-cursor.js';
 import { projectResult } from '../lib/envelope-projection.js';
 import { searchCache, countByAccount } from '../cache/query.js';
@@ -234,6 +238,100 @@ export class Executor {
       }
       throw error;
     }
+  }
+
+  /**
+   * Create the intent, hand back its id, then run the action in the background.
+   *
+   * Bulk mailbox sweeps over a slow provider can outlast any client's patience,
+   * and a client-side timeout is not a signal about what happened on the
+   * server — the same timeout can mean "finished, response lost" or "never
+   * ran". Either way the caller was left with no intent id, so the batch could
+   * not be undone and the only recovery was to re-run and compare.
+   *
+   * Returning the id first makes the outcome knowable regardless: poll
+   * `get_intent` for the terminal status. It also survives a process death,
+   * because the intent is already on disk in `executing` — which is exactly
+   * what distinguishes a crash from a slow provider after the fact.
+   */
+  async executeInBackground(params: {
+    tool: string;
+    toolParams: Record<string, unknown>;
+    accountId: string;
+    agentId: string;
+    risk: RiskLevel;
+  }): Promise<Intent> {
+    const intent = createIntent(this.db, {
+      account_id: params.accountId,
+      tool: params.tool,
+      params: params.toolParams,
+      risk: params.risk,
+      agent_id: params.agentId,
+    });
+
+    logAudit(this.db, {
+      intent_id: intent.id,
+      account_id: params.accountId,
+      action: 'created',
+      actor: params.agentId,
+      detail: buildAuditSummary(params.tool, 'created', params.toolParams),
+    });
+
+    updateIntentStatus(this.db, intent.id, 'executing');
+    logAudit(this.db, {
+      intent_id: intent.id,
+      account_id: params.accountId,
+      action: 'executing',
+      actor: 'policy',
+      detail: buildAuditSummary(params.tool, 'executing', params.toolParams),
+    });
+
+    const running = getIntent(this.db, intent.id)!;
+
+    // Deliberately not awaited. Every path inside settles the intent status,
+    // and the catch-all guarantees no unhandled rejection can reach the top
+    // level — an unhandled rejection here would kill the server, which is the
+    // failure this whole change exists to make survivable.
+    void (async () => {
+      try {
+        await this.performAction(running);
+        const isDryRun = params.toolParams.dry_run === true;
+        updateIntentStatus(this.db, running.id, 'executed', {
+          resolved_by: 'policy',
+          undo_token: isDryRun
+            ? undefined
+            : (generateUndoToken(params.tool, params.toolParams) ?? undefined),
+          undo_expires_at: isDryRun ? undefined : (getUndoExpiry(params.tool) ?? undefined),
+        });
+        logAudit(this.db, {
+          intent_id: running.id,
+          account_id: params.accountId,
+          action: 'executed',
+          actor: 'policy',
+          detail: buildAuditSummary(params.tool, 'executed', params.toolParams),
+        });
+      } catch (error) {
+        const errorDetail =
+          error instanceof HoldBySenderBlockedError
+            ? error.errorDetail
+            : { message: error instanceof Error ? error.message : String(error) };
+        updateIntentStatus(this.db, running.id, 'failed', { error_detail: errorDetail });
+        logAudit(this.db, {
+          intent_id: running.id,
+          account_id: params.accountId,
+          action: 'failed',
+          actor: 'policy',
+          detail: buildAuditSummary(params.tool, 'failed', params.toolParams, errorDetail),
+        });
+        this.logger.warn('Background execution failed', {
+          intent_id: running.id,
+          tool: params.tool,
+          error: errorDetail.message,
+        });
+      }
+    })();
+
+    return running;
   }
 
   async createGatedIntent(params: {
@@ -1404,10 +1502,40 @@ export class Executor {
             }
           }
           if (!dryRun) {
+            // Write the restorable record BEFORE touching mail.
+            //
+            // Previously targets were persisted only after every account's
+            // moves finished, so a process death mid-sweep left messages in
+            // holding with no envelope snapshot and no original_mailbox —
+            // restore_messages could not put them back. Writing first costs a
+            // row that may turn out to be unused (see the dangling-target
+            // cleanup below); getting it backwards costs recoverability.
+            insertIntentTargets(
+              this.db,
+              intent.id,
+              envelopeSnapshots
+                .filter((e) => e.mailbox === mailbox)
+                .map((e) => ({
+                  account_id: e.account_id,
+                  uid: e.uid,
+                  mailbox: e.mailbox,
+                  envelope_snapshot: {
+                    subject: e.subject,
+                    from: e.from,
+                    original_mailbox: e.mailbox,
+                  },
+                }))
+            );
+
             const { uidMap } = await imap.moveMessages(uids, mailbox, holding);
             for (const [src, dst] of uidMap) {
               combinedUidMap.set(src, dst);
             }
+
+            // Confirm where they landed. A target still lacking a
+            // destination_uid after the fact is the fingerprint of an
+            // interrupted run.
+            updateIntentTargetDestinations(this.db, intent.id, accountId, uidMap);
             // Drop the source rows immediately so held messages stop showing
             // up in searches of their original mailbox. The destination copy
             // has a server-assigned UID we don't know, so the holding mailbox
@@ -1446,27 +1574,15 @@ export class Executor {
       }
     }
 
-    // Persist targets to ledger on real (non-dry) runs
+    // Targets were already written inside the fan-out, before each move, and
+    // their destination UIDs confirmed immediately after. This pass only
+    // reconciles anything the per-mailbox path missed — a server that reports
+    // no UID mapping, or an account whose fan-out leg failed after the ledger
+    // write. Upsert semantics make it safe to repeat.
     if (!dryRun && allEnvelopes.length > 0) {
-      insertIntentTargets(
-        this.db,
-        intent.id,
-        allEnvelopes.map((e: any) => {
-          const acctUidMap = allUidMaps.get(e.account_id);
-          const destinationUid = acctUidMap?.get(e.uid) ?? null;
-          return {
-            account_id: e.account_id,
-            uid: e.uid,
-            mailbox: e.mailbox,
-            envelope_snapshot: {
-              subject: e.subject,
-              from: e.from,
-              original_mailbox: e.mailbox,
-            },
-            destination_uid: destinationUid ?? undefined,
-          };
-        })
-      );
+      for (const [accountId, uidMap] of allUidMaps) {
+        updateIntentTargetDestinations(this.db, intent.id, accountId, uidMap);
+      }
     }
 
     // Strip internal `envelopes` and `uidMap` fields before building the public payload

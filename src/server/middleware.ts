@@ -8,6 +8,14 @@ import { describeIntent } from '../ledger/audit-summary.js';
 import { DEFAULT_REVIEWER_PORT } from '../config.js';
 import { buildApprovalUrl } from '../reviewer/urls.js';
 
+/**
+ * Tools that accept `background: true`.
+ *
+ * Only the bulk mutations. Read tools are bounded and cheap enough to await,
+ * and queue_send is always gated — it already returns an intent id up front.
+ */
+const BACKGROUNDABLE_TOOLS = new Set(['hold_messages', 'hold_by_sender']);
+
 export interface MiddlewareDeps {
   db: Database;
   executor: Executor;
@@ -115,6 +123,35 @@ export function wrapToolHandler(
                 human_summary: humanSummary,
                 message: `Action queued for approval: ${toolDef.name}`,
                 reason: policyResult.reason,
+              }),
+            },
+          ],
+        };
+      }
+
+      // Opt-in background execution for long bulk sweeps. Only honored for
+      // tools that declare support: returning an id before the work happens is
+      // only useful when the caller can poll for the outcome, and only safe
+      // when the action records enough to be undone.
+      if (params.background === true && BACKGROUNDABLE_TOOLS.has(canonicalToolName)) {
+        const intent = await deps.executor.executeInBackground({
+          tool: canonicalToolName,
+          toolParams: params,
+          accountId: resolvedAccountId,
+          agentId: deps.agentId,
+          risk: policyResult.risk,
+        });
+
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                status: 'executing',
+                intent_id: intent.id,
+                message: `${toolDef.name} started in the background.`,
+                how_to_check: `Poll get_intent with intent_id "${intent.id}" until status is "executed" or "failed".`,
+                how_to_undo: `undo_intent with intent_id "${intent.id}" once it reports "executed".`,
               }),
             },
           ],

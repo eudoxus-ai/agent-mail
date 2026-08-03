@@ -193,9 +193,32 @@ export async function daemonStatus(): Promise<void> {
     try {
       const { openDatabase } = await import('../ledger/db.js');
       const { getPendingIntents } = await import('../ledger/intents.js');
+      const { checkStuckExecuting } = await import('../ledger/db.js');
+      const { getIntentTargets } = await import('../ledger/intent-targets.js');
       const db = openDatabase();
       const pending = getPendingIntents(db);
       console.log(`Pending intents: ${pending.length}`);
+
+      // An intent left in 'executing' means the process died mid-action —
+      // nothing else can produce that state, since both the success and
+      // failure paths move it on. This is the difference between "the server
+      // crashed" and "the provider was slow and the client gave up".
+      const stuck = checkStuckExecuting(db);
+      if (stuck.length > 0) {
+        console.log(`\nInterrupted actions: ${stuck.length}`);
+        console.log('  (these died mid-execution — the process stopped before finishing)');
+        for (const intent of stuck) {
+          const targets = getIntentTargets(db, intent.id);
+          const unconfirmed = targets.filter((t) => t.destination_uid === null).length;
+          console.log(
+            `  ${intent.id}  ${intent.tool}  started ${intent.created_at}\n` +
+              `    ${targets.length} target(s) recorded, ${unconfirmed} unconfirmed` +
+              (targets.length > 0
+                ? `\n    restore with: undo_intent ${intent.id}`
+                : '\n    no targets recorded — nothing to restore from')
+          );
+        }
+      }
     } catch {
       // DB might be locked
     }
