@@ -117,11 +117,21 @@ export async function startDaemon(port: number = DEFAULT_REVIEWER_PORT): Promise
     logger.info(`Watching for pending intents (polling every 3s)`);
     logger.info(`${accounts.length} account(s) configured`);
 
-    if (syncLoop) {
+    // Only sync when the cache is actually in use.
+    //
+    // Syncing while mode is `off` was meant to warm the cache ahead of time,
+    // but it makes the daemon a second heavy IMAP consumer on every account —
+    // competing with the MCP server for the provider's per-account connection
+    // and throughput budget — to populate a database nothing reads. On a large
+    // iCloud mailbox that is hours of continuous SEARCH and FETCH. Opt in with
+    // `mode: shadow` when you want the cache warmed.
+    if (syncLoop && cacheConfig.mode !== 'off') {
       syncLoop.start();
       logger.info(
         `Local cache sync every ${cacheConfig.syncIntervalSeconds}s (mode: ${cacheConfig.mode})`
       );
+    } else if (syncLoop) {
+      logger.info('Local cache sync disabled (cache.mode is off)');
     }
   });
 }

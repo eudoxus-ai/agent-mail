@@ -39,8 +39,9 @@ const inputSchema = z.object({
   background: z
     .boolean()
     .optional()
+    .default(true)
     .describe(
-      'Return an intent_id immediately and perform the move in the background instead of waiting for it to finish. Strongly recommended for large sweeps: a client-side timeout on a synchronous call tells you nothing about whether the move happened, and leaves you with no intent_id to undo. Poll get_intent(intent_id) until status is "executed" or "failed". Default false.'
+      'Default TRUE for this tool. Returns an intent_id immediately and performs the move in the background; poll get_intent(intent_id) until status is "executed" or "failed". This is the default because a sender sweep has no upper bound on size — a synchronous call can outrun the client timeout, and that timeout tells you nothing about whether the move happened while leaving you no intent_id to undo with. Pass false only for senders you know are small and you want the moved-message list inline.'
     ),
 });
 

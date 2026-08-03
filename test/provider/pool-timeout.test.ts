@@ -17,6 +17,7 @@ const instances: Array<{
   disconnect: ReturnType<typeof vi.fn>;
   noop: ReturnType<typeof vi.fn>;
   isDead: ReturnType<typeof vi.fn>;
+  destroy: ReturnType<typeof vi.fn>;
   getLastError: ReturnType<typeof vi.fn>;
   connected: boolean;
   dead: boolean;
@@ -32,6 +33,7 @@ vi.mock('../../src/provider/imap.js', () => ({
       disconnect: vi.fn(async function (this: typeof inst) { this.connected = false; }),
       noop: vi.fn().mockResolvedValue(undefined),
       isDead: vi.fn(function (this: typeof inst) { return this.dead; }),
+      destroy: vi.fn(function (this: typeof inst) { this.connected = false; this.dead = true; }),
       getLastError: vi.fn().mockReturnValue(null),
       connected: false,
       dead: false,
@@ -70,6 +72,7 @@ beforeEach(() => {
     logger: createLogger('cli', { minLevel: 'error' }),
     keepaliveIntervalMs: 0,
     operationTimeoutMs: 50,
+    logoutGraceMs: 5,
   });
 });
 
@@ -152,5 +155,42 @@ describe('operation timeout', () => {
 
     expect(result).toBe('ok');
     await unbounded.closeAll();
+  });
+});
+
+describe('connection lifecycle accounting', () => {
+  it('closes a connection for every one it opens', async () => {
+    // The tell for a leak: opened climbing while closed lags behind, and live
+    // exceeding the number of accounts.
+    for (let i = 0; i < 5; i += 1) {
+      await expect(pool.withConnection('icloud', hangForever)).rejects.toThrow();
+      await pool.withConnection('icloud', async () => 'ok');
+    }
+
+    const stats = pool.stats();
+    expect(stats.opened - stats.closed).toBe(stats.live);
+    expect(stats.live).toBeLessThanOrEqual(accounts.length);
+  });
+
+  it('does not accumulate connections across many successful calls', async () => {
+    for (let i = 0; i < 20; i += 1) {
+      await pool.withConnection('icloud', async () => i);
+    }
+
+    // One pooled connection, reused — not twenty.
+    expect(pool.stats().opened).toBe(1);
+    expect(pool.stats().live).toBe(1);
+  });
+
+  it('destroys the socket even when a graceful logout hangs', async () => {
+    await pool.withConnection('icloud', async () => 'ok');
+    // A wedged connection never answers LOGOUT; teardown must not wait on it.
+    instances[0].disconnect.mockImplementation(() => new Promise(() => {}));
+
+    instances[0].dead = true;
+    const result = await pool.withConnection('icloud', async () => 'recovered');
+
+    expect(result).toBe('recovered');
+    expect(instances[0].destroy).toHaveBeenCalled();
   });
 });

@@ -8,6 +8,7 @@ const instances: Array<{
   disconnect: ReturnType<typeof vi.fn>;
   noop: ReturnType<typeof vi.fn>;
   isDead: ReturnType<typeof vi.fn>;
+  destroy: ReturnType<typeof vi.fn>;
   getLastError: ReturnType<typeof vi.fn>;
   connected: boolean;
   dead: boolean;
@@ -25,6 +26,9 @@ vi.mock('../../src/provider/imap.js', () => ({
       // The pool checks these before reusing a pooled connection; a socket
       // that died asynchronously must not be handed out again.
       isDead: vi.fn(function (this: typeof inst) { return this.dead; }),
+      // Teardown always destroys the socket, so a hung LOGOUT cannot leave an
+      // orphaned connection behind.
+      destroy: vi.fn(function (this: typeof inst) { this.connected = false; this.dead = true; }),
       getLastError: vi.fn().mockReturnValue(null),
       connected: false,
       dead: false,

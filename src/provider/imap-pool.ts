@@ -19,6 +19,12 @@ interface PoolDeps {
    * error handler will ever see.
    */
   operationTimeoutMs?: number;
+  /**
+   * How long to wait for a graceful LOGOUT before destroying the socket.
+   * Default 3s. Counts against operationTimeoutMs when a teardown happens
+   * mid-borrow, so keep it small relative to that.
+   */
+  logoutGraceMs?: number;
 }
 
 export class ImapOperationTimeoutError extends Error {
@@ -52,14 +58,18 @@ export class ImapConnectionPool {
   private readonly logger: Logger;
   private readonly keepaliveIntervalMs: number;
   private readonly operationTimeoutMs: number;
+  private readonly logoutGraceMs: number;
   private readonly entries = new Map<string, PoolEntry>();
   private closed = false;
+  private openedConnections = 0;
+  private closedConnections = 0;
 
   constructor(deps: PoolDeps) {
     this.accounts = deps.accounts;
     this.logger = deps.logger;
     this.keepaliveIntervalMs = deps.keepaliveIntervalMs ?? 60_000;
     this.operationTimeoutMs = deps.operationTimeoutMs ?? 10 * 60_000;
+    this.logoutGraceMs = deps.logoutGraceMs ?? 3_000;
   }
 
   async withConnection<T>(
@@ -217,8 +227,18 @@ export class ImapConnectionPool {
       },
     });
     await provider.connect();
+    this.openedConnections += 1;
     entry.provider = provider;
     this.startKeepalive(accountId, entry);
+
+    // Opened-vs-closed makes a leak visible instead of inferred: these should
+    // stay within one of each other, and `live` should never exceed the
+    // account count.
+    this.logger.debug('IMAP connection opened', {
+      account_id: accountId,
+      ...this.stats(),
+    });
+
     return provider;
   }
 
@@ -242,6 +262,15 @@ export class ImapConnectionPool {
     entry.keepaliveTimer.unref?.();
   }
 
+  /**
+   * Drop a connection, guaranteed to complete.
+   *
+   * Teardown runs on the timeout path, so it must never be the thing that
+   * hangs. A graceful LOGOUT is attempted briefly because it is politer to the
+   * server, but a hung connection will never answer it — so the socket is
+   * destroyed outright once that window passes. Skipping the destroy is how
+   * orphaned sockets pile up against the provider's connection cap.
+   */
   private async teardown(entry: PoolEntry): Promise<void> {
     if (entry.keepaliveTimer) {
       clearInterval(entry.keepaliveTimer);
@@ -249,13 +278,34 @@ export class ImapConnectionPool {
     }
     const p = entry.provider;
     entry.provider = null;
-    if (p) {
-      try {
-        await p.disconnect();
-      } catch {
-        // best-effort
-      }
+    if (!p) return;
+
+    this.closedConnections += 1;
+
+    try {
+      await Promise.race([
+        p.disconnect(),
+        new Promise((resolve) => {
+          const t = setTimeout(resolve, this.logoutGraceMs);
+          t.unref?.();
+        }),
+      ]);
+    } catch {
+      // best-effort
+    } finally {
+      // Unconditional: after a graceful logout this is a no-op, and after a
+      // hung one it is the only thing that actually frees the socket.
+      p.destroy();
     }
+  }
+
+  /** Connection lifecycle counters, for diagnosing suspected leaks. */
+  stats(): { opened: number; closed: number; live: number } {
+    let live = 0;
+    for (const entry of this.entries.values()) {
+      if (entry.provider) live += 1;
+    }
+    return { opened: this.openedConnections, closed: this.closedConnections, live };
   }
 }
 

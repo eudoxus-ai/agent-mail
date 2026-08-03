@@ -92,14 +92,35 @@ describe('background execution', () => {
     expect(payload.how_to_undo).toContain('undo_intent');
   });
 
-  it('stays synchronous by default', async () => {
+  it('backgrounds a sender sweep by default', async () => {
+    const executor = {
+      executeInBackground: vi.fn().mockResolvedValue({ id: 'intent-default' }),
+      executeImmediate: vi.fn(),
+      threadHasReplies: vi.fn().mockResolvedValue(false),
+    };
+
+    // Parsed params, as the server passes them after inputSchema.parse().
+    const params = holdBySenderTool.inputSchema.parse({ from: 'news@example.com' });
+    await handlerFor(holdBySenderTool, executor)(params);
+
+    // A sender sweep has no upper bound on size, and relying on the tool
+    // description to get background requested did not work in practice.
+    expect(executor.executeInBackground).toHaveBeenCalledTimes(1);
+    expect(executor.executeImmediate).not.toHaveBeenCalled();
+  });
+
+  it('still runs synchronously when explicitly asked to', async () => {
     const executor = {
       executeInBackground: vi.fn(),
       executeImmediate: vi.fn().mockResolvedValue({ result: [{ type: 'text', text: '{}' }] }),
       threadHasReplies: vi.fn().mockResolvedValue(false),
     };
 
-    await handlerFor(holdBySenderTool, executor)({ from: 'news@example.com' });
+    const params = holdBySenderTool.inputSchema.parse({
+      from: 'news@example.com',
+      background: false,
+    });
+    await handlerFor(holdBySenderTool, executor)(params);
 
     expect(executor.executeImmediate).toHaveBeenCalledTimes(1);
     expect(executor.executeInBackground).not.toHaveBeenCalled();
@@ -130,8 +151,16 @@ describe('hold tool schemas', () => {
     expect(parsed.background).toBe(true);
   });
 
-  it('leaves background optional', () => {
+  it('defaults background to true when omitted', () => {
     const parsed = holdBySenderTool.inputSchema.parse({ from: 'news@example.com' });
-    expect(parsed.background).toBeUndefined();
+    expect(parsed.background).toBe(true);
+  });
+
+  it('honors an explicit false', () => {
+    const parsed = holdBySenderTool.inputSchema.parse({
+      from: 'news@example.com',
+      background: false,
+    });
+    expect(parsed.background).toBe(false);
   });
 });

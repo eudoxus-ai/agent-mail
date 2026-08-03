@@ -97,6 +97,26 @@ export class ImapProvider {
     await this.client.logout();
   }
 
+  /**
+   * Drop the connection without a protocol round-trip.
+   *
+   * `logout()` sends LOGOUT and waits for the server to answer — which a hung
+   * connection never will, so tearing one down with logout() hangs the
+   * teardown itself. The socket then stays open while a replacement is
+   * created, and those orphans accumulate against the provider's per-account
+   * connection cap until it refuses or stalls new ones.
+   *
+   * `close()` destroys the socket locally, so it always completes.
+   */
+  destroy(): void {
+    this.dead = true;
+    try {
+      this.client.close();
+    } catch {
+      // Already closed; nothing to do.
+    }
+  }
+
   async noop(): Promise<void> {
     await this.client.noop();
   }
