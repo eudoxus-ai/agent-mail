@@ -12,6 +12,7 @@ import { ACCOUNTS_YAML_PATH, LEDGER_DB_PATH, DEFAULT_REVIEWER_PORT } from '../co
 import { openCache, CacheUnsupportedError } from '../cache/db.js';
 import { loadCacheConfig } from '../cache/config.js';
 import { SyncLoop } from '../cache/sync-loop.js';
+import { checkNodeRuntime } from '../lib/node-runtime.js';
 import type { Intent } from '../types.js';
 import type { Logger } from '../logger.js';
 
@@ -45,6 +46,9 @@ export async function startDaemon(port: number = DEFAULT_REVIEWER_PORT): Promise
     exec_path: process.execPath,
     pid: process.pid,
   });
+
+  const runtime = checkNodeRuntime();
+  if (runtime.warning) logger.warn(runtime.warning);
 
   if (!existsSync(ACCOUNTS_YAML_PATH)) {
     logger.error("No accounts configured. Run 'npx agent-mail add-account' first.");

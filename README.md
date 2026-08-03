@@ -329,7 +329,22 @@ hold_messages:
   gate: always_gated
 ```
 
-### A note on Node versions
+## Node version
+
+**Use Node 24 (Active LTS).** The repo pins it in `.tool-versions` and `.nvmrc`:
+
+```bash
+asdf install    # or: nvm use
+```
+
+Node 22 also works and remains the `engines` floor — the full test suite passes on both. Node 24 is the better target for two reasons:
+
+- **`node:sqlite` is stable there.** On Node 22 it still emits an experimental warning; on 24 it does not. Given the intent ledger and the local message cache both sit on `node:sqlite`, that matters more here than in most projects.
+- **Longer support runway.** Node 22 is the older LTS line; 24 is Active LTS.
+
+Do not run this on an odd-numbered release (23, 25, …). Those never become LTS and stop receiving security fixes after roughly six months — Node 25 reached end-of-life in March 2026. The daemon and MCP server both warn at startup if they find themselves on one.
+
+### How the daemon picks its Node
 
 `install-daemon` pins the daemon to the exact Node binary you ran the install with (`process.execPath`), not to whatever `node` resolves to later.
 

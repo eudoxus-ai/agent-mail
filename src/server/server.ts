@@ -32,6 +32,7 @@ import { getAttachmentTool } from '../tools/get-attachment.js';
 
 import { runStartupMigrations } from './startup.js';
 import { openCache } from '../cache/db.js';
+import { checkNodeRuntime } from '../lib/node-runtime.js';
 import { loadCacheConfig } from '../cache/config.js';
 import { existsSync } from 'node:fs';
 import { CACHE_DB_PATH } from '../config.js';
@@ -109,6 +110,9 @@ export async function createMcpServer(
     );
     process.exit(1);
   }
+
+  const runtime = checkNodeRuntime();
+  if (runtime.warning) logger.warn(runtime.warning);
 
   // Open database
   const db = openDatabase();
