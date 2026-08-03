@@ -44,6 +44,16 @@ export class ImapProvider {
       // deletions would never propagate — messages removed in another client
       // would linger in the cache indefinitely.
       qresync: true,
+      // Bound the wait for a server that stops responding. Without these a
+      // half-open connection produces no error and no data — the operation
+      // just never settles, and because pool borrows are serialized that
+      // wedges the whole account. These make it surface as an error the pool
+      // can act on.
+      connectionTimeout: 30_000,
+      greetingTimeout: 30_000,
+      // Generous: a large SEARCH or MOVE on a slow provider is legitimately
+      // quiet for a while, so this is only meant to catch a truly dead socket.
+      socketTimeout: 5 * 60_000,
     });
 
     // ImapFlow is an EventEmitter, and Node throws on an 'error' event with no

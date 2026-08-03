@@ -9,6 +9,27 @@ interface PoolDeps {
   logger: Logger;
   /** Interval in ms for keepalive NOOPs. Default 60_000. Pass 0 to disable. */
   keepaliveIntervalMs?: number;
+  /**
+   * Ceiling on a single borrow. Default 10 minutes. Pass 0 to disable.
+   *
+   * Not a latency target — an escape hatch. Borrows are serialized per account,
+   * so an operation that never settles wedges that account permanently: every
+   * later call queues behind it and waits forever. A server can produce that by
+   * accepting a command and going silent, with no FIN and no RST, which no
+   * error handler will ever see.
+   */
+  operationTimeoutMs?: number;
+}
+
+export class ImapOperationTimeoutError extends Error {
+  constructor(accountId: string, ms: number) {
+    super(
+      `IMAP operation on account "${accountId}" exceeded ${Math.round(ms / 1000)}s and was abandoned. ` +
+        'The connection has been torn down; the next call will reconnect. ' +
+        'If this was a large sweep, re-run it with background: true.'
+    );
+    this.name = 'ImapOperationTimeoutError';
+  }
 }
 
 interface PoolEntry {
@@ -30,6 +51,7 @@ export class ImapConnectionPool {
   private readonly accounts: AccountConfig[];
   private readonly logger: Logger;
   private readonly keepaliveIntervalMs: number;
+  private readonly operationTimeoutMs: number;
   private readonly entries = new Map<string, PoolEntry>();
   private closed = false;
 
@@ -37,6 +59,7 @@ export class ImapConnectionPool {
     this.accounts = deps.accounts;
     this.logger = deps.logger;
     this.keepaliveIntervalMs = deps.keepaliveIntervalMs ?? 60_000;
+    this.operationTimeoutMs = deps.operationTimeoutMs ?? 10 * 60_000;
   }
 
   async withConnection<T>(
@@ -55,7 +78,7 @@ export class ImapConnectionPool {
     // The task resolves/rejects with the fn result; the queue uses a swallowed
     // copy so a single failing task never poisons subsequent calls.
     const task: Promise<T> = entry.queue.then(() =>
-      this.runWithRetry(accountId, entry, fn)
+      this.withTimeout(accountId, this.runWithRetry(accountId, entry, fn))
     );
     entry.queue = task.then(
       () => undefined,
@@ -102,6 +125,46 @@ export class ImapConnectionPool {
       this.entries.set(accountId, entry);
     }
     return entry;
+  }
+
+  /**
+   * Bound a borrow so a silently-hung operation cannot wedge the account.
+   *
+   * On timeout the connection is torn down: the operation is still running on
+   * it as far as the server is concerned, so it must not be reused. Rejecting
+   * also lets the per-account queue advance, which is the part that actually
+   * unblocks everything else.
+   */
+  private async withTimeout<T>(accountId: string, work: Promise<T>): Promise<T> {
+    if (this.operationTimeoutMs <= 0) return work;
+
+    let timer: NodeJS.Timeout | undefined;
+    const started = Date.now();
+
+    try {
+      return await Promise.race([
+        work,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () => reject(new ImapOperationTimeoutError(accountId, this.operationTimeoutMs)),
+            this.operationTimeoutMs
+          );
+          timer.unref?.();
+        }),
+      ]);
+    } catch (error) {
+      if (error instanceof ImapOperationTimeoutError) {
+        this.logger.error('IMAP operation timed out; tearing down connection', {
+          account_id: accountId,
+          elapsed_ms: Date.now() - started,
+        });
+        const entry = this.entries.get(accountId);
+        if (entry) await this.teardown(entry);
+      }
+      throw error;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private async runWithRetry<T>(
