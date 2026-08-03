@@ -129,10 +129,30 @@ export class ImapConnectionPool {
     accountId: string,
     entry: PoolEntry
   ): Promise<ImapProvider> {
+    // A provider whose socket died asynchronously is still sitting in the
+    // entry. Handing it out again produces a confusing mid-operation failure,
+    // so replace it here instead.
+    if (entry.provider && entry.provider.isDead()) {
+      this.logger.warn(`Discarding dead IMAP connection for ${accountId}`, {
+        error: entry.provider.getLastError()?.message,
+      });
+      await this.teardown(entry);
+    }
     if (entry.provider) return entry.provider;
+
     const account = getAccount(this.accounts, accountId);
     const resolved = resolveCredentials(account);
-    const provider = new ImapProvider(resolved);
+    const provider = new ImapProvider(resolved, {
+      onError: (error) => {
+        // Log only. Throwing or rethrowing here would land back on the
+        // unhandled-'error' path this listener exists to prevent; the next
+        // borrow sees isDead() and reconnects.
+        this.logger.warn(`IMAP connection error for ${accountId}`, {
+          error: error.message,
+          code: (error as Error & { code?: string }).code,
+        });
+      },
+    });
     await provider.connect();
     entry.provider = provider;
     this.startKeepalive(accountId, entry);
@@ -176,14 +196,23 @@ export class ImapConnectionPool {
   }
 }
 
-function isConnectionDropError(err: unknown): boolean {
+export function isConnectionDropError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   const code = (err as Error & { code?: string }).code ?? '';
   const msg = err.message ?? '';
   return (
     code === 'NoConnection' ||
+    // Socket-level codes. ECONNRESET is the common one on iCloud, and its
+    // message ("read ECONNRESET") matches none of the patterns below, so
+    // without the code check it was treated as a fatal application error.
+    code === 'ECONNRESET' ||
+    code === 'EPIPE' ||
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNABORTED' ||
+    code === 'ENOTCONN' ||
     /socket\s*closed/i.test(msg) ||
     /connection\s*(reset|lost|closed|ended)/i.test(msg) ||
+    /ECONNRESET|EPIPE|ETIMEDOUT/i.test(msg) ||
     /BYE/i.test(msg)
   );
 }

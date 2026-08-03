@@ -16,11 +16,18 @@ function toParticipants(addrs: Array<{ name?: string | null; address?: string | 
   return (addrs ?? []).map(toParticipant);
 }
 
+export interface ImapProviderOptions {
+  /** Called when the connection dies asynchronously, outside any awaited call. */
+  onError?: (error: Error) => void;
+}
+
 export class ImapProvider {
   private client: ImapFlow;
   private account: ResolvedAccount;
+  private dead = false;
+  private lastError: Error | null = null;
 
-  constructor(account: ResolvedAccount) {
+  constructor(account: ResolvedAccount, options: ImapProviderOptions = {}) {
     this.account = account;
     this.client = new ImapFlow({
       host: account.imap.host,
@@ -38,10 +45,42 @@ export class ImapProvider {
       // would linger in the cache indefinitely.
       qresync: true,
     });
+
+    // ImapFlow is an EventEmitter, and Node throws on an 'error' event with no
+    // registered listener — an uncaught exception that kills the process.
+    //
+    // A pooled connection sitting idle gets its TLS socket reset routinely
+    // (iCloud in particular). That arrives asynchronously, outside any awaited
+    // call, so withConnection's try/catch never sees it. Without this listener
+    // a routine ECONNRESET takes down the whole MCP server mid-request: the
+    // client waits forever for a response that no longer has a process to come
+    // from, and any IMAP work already committed stays committed.
+    this.client.on('error', (error: Error) => {
+      this.dead = true;
+      this.lastError = error;
+      options.onError?.(error);
+    });
+
+    // A clean server-side close is equally fatal to reuse, just not an error.
+    this.client.on('close', () => {
+      this.dead = true;
+    });
+  }
+
+  /** True once the connection has errored or closed; the pool must not reuse it. */
+  isDead(): boolean {
+    return this.dead;
+  }
+
+  /** The error that killed the connection, for logging. */
+  getLastError(): Error | null {
+    return this.lastError;
   }
 
   async connect(): Promise<void> {
     await this.client.connect();
+    this.dead = false;
+    this.lastError = null;
   }
 
   async disconnect(): Promise<void> {
