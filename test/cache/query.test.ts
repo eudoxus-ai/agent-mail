@@ -306,3 +306,54 @@ describe('getCoverage', () => {
     expect(isServable('unavailable')).toBe(false);
   });
 });
+
+describe('coverage must match the scope actually being searched', () => {
+  const NOW = Date.UTC(2026, 6, 31, 12, 0, 0);
+  const opts = (mailbox?: string) => ({
+    freshnessWindowSeconds: 300,
+    now: NOW,
+    mailbox,
+  });
+
+  function synced(accountId: string, mailbox: string) {
+    upsertMailboxState(db, accountId, mailbox, {
+      backfill_complete: 1,
+      last_delta_at: NOW - 1000,
+      oldest_date: Date.UTC(2026, 0, 1),
+    });
+  }
+
+  it('is unavailable for a mailbox that has never been synced', () => {
+    synced('work', 'INBOX');
+
+    // Serving Drafts from INBOX's freshness would return an empty result
+    // while suppressing the IMAP fallback — silently missing mail.
+    expect(getCoverage(db, ['work'], opts('Drafts')).state).toBe('unavailable');
+    expect(getCoverage(db, ['work'], opts('INBOX')).state).toBe('fresh');
+  });
+
+  it('is unavailable when only some requested accounts have synced', () => {
+    synced('work', 'INBOX');
+
+    // A two-account search must not quietly return one account's results.
+    expect(getCoverage(db, ['work', 'personal'], opts('INBOX')).state).toBe('unavailable');
+    expect(getCoverage(db, ['work'], opts('INBOX')).state).toBe('fresh');
+  });
+
+  it('serves once every requested account has that mailbox', () => {
+    synced('work', 'INBOX');
+    synced('personal', 'INBOX');
+
+    expect(getCoverage(db, ['work', 'personal'], opts('INBOX')).state).toBe('fresh');
+  });
+
+  it('is unavailable when a mailbox is known but has never completed a sync', () => {
+    upsertMailboxState(db, 'work', 'INBOX', {
+      backfill_complete: 0,
+      last_delta_at: null,
+    });
+
+    // The mailbox is registered but nothing has been read from it yet.
+    expect(getCoverage(db, ['work'], opts('INBOX')).state).toBe('unavailable');
+  });
+});

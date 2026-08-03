@@ -38,7 +38,7 @@ import {
 } from '../ledger/intent-targets.js';
 import { updateIntentProgress, getIntentProgress } from '../ledger/intents.js';
 import { checkStuckExecuting } from '../ledger/db.js';
-import { decodeCursor, encodeCursor } from '../lib/search-cursor.js';
+import { decodeCursor, encodeCursor, type SearchCursor } from '../lib/search-cursor.js';
 import { projectResult } from '../lib/envelope-projection.js';
 import { searchCache, countByAccount } from '../cache/query.js';
 import { getCoverage, isServable } from '../cache/coverage.js';
@@ -777,7 +777,7 @@ export class Executor {
         : null;
 
     if (cacheAttempt && this.cacheConfig.mode === 'on' && cacheAttempt.servable) {
-      return this.buildCachePayload(cacheAttempt, allIds, limit, intent);
+      return this.buildCachePayload(cacheAttempt, allIds, limit, intent, decodedCursor);
     }
 
     const fanResult = await fanOut({
@@ -939,6 +939,8 @@ export class Executor {
     try {
       const coverage = getCoverage(this.cache, params.accountIds, {
         freshnessWindowSeconds: this.cacheConfig.freshnessWindowSeconds,
+        // Coverage must be judged for the mailbox actually being searched.
+        mailbox: params.mailbox,
       });
       const rows = searchCache(this.cache, params);
       return { rows, coverage, servable: isServable(coverage.state) };
@@ -954,10 +956,17 @@ export class Executor {
     attempt: NonNullable<ReturnType<Executor['readFromCache']>>,
     allIds: string[],
     limit: number,
-    intent: Intent
+    intent: Intent,
+    cursor: SearchCursor | null
   ): SearchThreadsMultiPayload {
     const fields = intent.params.fields as string[] | undefined;
-    const rows = attempt.rows;
+
+    // `before` was padded by 1 ms so rows sharing the previous page's boundary
+    // timestamp come back rather than being skipped. They must then be
+    // filtered by the tuple already emitted, exactly as the IMAP path does —
+    // otherwise page two repeats page one and, when enough messages share a
+    // timestamp, the cursor stops advancing.
+    const rows = cursor ? applyCursorBoundary(attempt.rows, cursor) : attempt.rows;
 
     const payload: SearchThreadsMultiPayload = {
       accounts_searched: Object.keys(countByAccount(rows)),
@@ -1690,7 +1699,7 @@ export class Executor {
             // Confirm where they landed. A target still lacking a
             // destination_uid after the fact is the fingerprint of an
             // interrupted run.
-            updateIntentTargetDestinations(this.db, intent.id, accountId, uidMap);
+            updateIntentTargetDestinations(this.db, intent.id, accountId, uidMap, mailbox);
             // Drop the source rows immediately so held messages stop showing
             // up in searches of their original mailbox. The destination copy
             // has a server-assigned UID we don't know, so the holding mailbox
@@ -2102,4 +2111,31 @@ function buildInterpretation(input: {
     'Borrows are serialized per account, so anything queued behind a slow operation ' +
     'waits for it — a small job sitting at "executing" is usually queued, not stuck.'
   );
+}
+
+
+/**
+ * Drop rows already emitted at the previous page's boundary timestamp.
+ *
+ * Mirrors the IMAP path: keep anything strictly older than the boundary, plus
+ * boundary-timestamp rows whose (account_id, mailbox, uid) triple was not
+ * already returned. UIDs are unique only per account/mailbox, so a scalar
+ * comparison would drop cross-account rows that merely share a UID.
+ */
+export function applyCursorBoundary<
+  T extends { account_id: string; mailbox: string; uid: number; envelope: { date: string } },
+>(rows: T[], cursor: SearchCursor): T[] {
+  const boundaryMs = new Date(cursor.before).getTime();
+  const seen = new Set(
+    cursor.boundary_seen.map((r) => `${r.account_id}\u0000${r.mailbox}\u0000${r.uid}`)
+  );
+
+  return rows.filter((row) => {
+    const rowMs = new Date(row.envelope.date).getTime();
+    if (rowMs < boundaryMs) return true;
+    if (rowMs === boundaryMs) {
+      return !seen.has(`${row.account_id}\u0000${row.mailbox}\u0000${row.uid}`);
+    }
+    return false;
+  });
 }

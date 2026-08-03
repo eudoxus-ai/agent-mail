@@ -33,10 +33,13 @@ export function insertIntentTargets(
   // destination UID is filled in afterwards. A retry of the same batch must
   // not collide on the primary key.
   const stmt = db.prepare(
+    // Conflict key includes mailbox: IMAP UIDs are unique only within a
+    // mailbox, so INBOX uid 123 and Archive uid 123 are different messages.
+    // Keying without it silently overwrote one snapshot with the other and
+    // left a moved message unrestorable.
     `INSERT INTO intent_targets (intent_id, account_id, uid, mailbox, envelope_snapshot, destination_uid)
      VALUES (?, ?, ?, ?, ?, ?)
-     ON CONFLICT(intent_id, account_id, uid) DO UPDATE SET
-       mailbox = excluded.mailbox,
+     ON CONFLICT(intent_id, account_id, mailbox, uid) DO UPDATE SET
        envelope_snapshot = COALESCE(excluded.envelope_snapshot, intent_targets.envelope_snapshot),
        destination_uid = COALESCE(excluded.destination_uid, intent_targets.destination_uid)`
   );
@@ -61,15 +64,27 @@ export function updateIntentTargetDestinations(
   db: Database,
   intentId: string,
   accountId: string,
-  uidMap: Map<number, number>
+  uidMap: Map<number, number>,
+  mailbox?: string
 ): void {
   if (uidMap.size === 0) return;
-  const stmt = db.prepare(
-    `UPDATE intent_targets SET destination_uid = ?
-     WHERE intent_id = ? AND account_id = ? AND uid = ?`
-  );
+
+  // Scoped by mailbox when the caller knows it, for the same reason the
+  // conflict key includes it: the same UID in two mailboxes is two messages,
+  // and an unscoped update would stamp the wrong destination on one of them.
+  const stmt = mailbox
+    ? db.prepare(
+        `UPDATE intent_targets SET destination_uid = ?
+         WHERE intent_id = ? AND account_id = ? AND mailbox = ? AND uid = ?`
+      )
+    : db.prepare(
+        `UPDATE intent_targets SET destination_uid = ?
+         WHERE intent_id = ? AND account_id = ? AND uid = ?`
+      );
+
   for (const [sourceUid, destinationUid] of uidMap) {
-    stmt.run(destinationUid, intentId, accountId, sourceUid);
+    if (mailbox) stmt.run(destinationUid, intentId, accountId, mailbox, sourceUid);
+    else stmt.run(destinationUid, intentId, accountId, sourceUid);
   }
 }
 

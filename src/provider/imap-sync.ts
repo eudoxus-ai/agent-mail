@@ -54,6 +54,7 @@ export class ImapSyncProvider implements SyncProvider {
         highestModseq: raw.highestModseq,
         vanished: [],
         changed: [],
+        vanishedReliable: raw.vanishedReliable,
       };
     }
 
@@ -68,6 +69,11 @@ export class ImapSyncProvider implements SyncProvider {
       uidValidity: raw.uidValidity,
       highestModseq: raw.highestModseq,
       vanished: raw.vanished,
+      // Must be forwarded. DeltaChanges.vanishedReliable is optional and the
+      // engine treats `undefined` as reliable, so dropping it here silently
+      // disables the UID reconciliation that is the only way deletions
+      // propagate on a CONDSTORE-only server.
+      vanishedReliable: raw.vanishedReliable,
       changed: await this.imap.fetchSyncEnvelopes(mailbox, toFetch),
     };
   }

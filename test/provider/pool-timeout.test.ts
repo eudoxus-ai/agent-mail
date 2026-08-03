@@ -194,3 +194,56 @@ describe('connection lifecycle accounting', () => {
     expect(instances[0].destroy).toHaveBeenCalled();
   });
 });
+
+describe('no retry after the timeout has fired', () => {
+  /**
+   * The timed-out work keeps running. Tearing down its provider makes it
+   * reject with a connection-drop error, which runWithRetry would otherwise
+   * treat as transient and retry — re-invoking the callback on a fresh
+   * connection after the caller already received a timeout and the intent may
+   * already be marked failed. For a move or a flag change that is a duplicate
+   * mutation nobody is waiting for.
+   */
+  it('does not re-invoke the callback when teardown makes the work reject', async () => {
+    let calls = 0;
+    const started: Array<() => void> = [];
+
+    await expect(
+      pool.withConnection('icloud', async () => {
+        calls += 1;
+        // Rejects with a connection-drop error shortly after the timeout, the
+        // way a destroyed socket does.
+        return new Promise((_resolve, reject) => {
+          const t = setTimeout(() => {
+            const err = new Error('socket closed') as Error & { code?: string };
+            err.code = 'NoConnection';
+            reject(err);
+          }, 80);
+          started.push(() => clearTimeout(t));
+        });
+      })
+    ).rejects.toThrow(ImapOperationTimeoutError);
+
+    await new Promise((r) => setTimeout(r, 120));
+    started.forEach((cancel) => cancel());
+
+    // Exactly once. A second invocation would be a duplicate mutation.
+    expect(calls).toBe(1);
+  });
+
+  it('still retries a connection drop when no timeout fired', async () => {
+    let calls = 0;
+    const result = await pool.withConnection('icloud', async () => {
+      calls += 1;
+      if (calls === 1) {
+        const err = new Error('socket closed') as Error & { code?: string };
+        err.code = 'NoConnection';
+        throw err;
+      }
+      return 'recovered';
+    });
+
+    expect(result).toBe('recovered');
+    expect(calls).toBe(2);
+  });
+});

@@ -35,7 +35,7 @@ interface CoverageRow {
 export function getCoverage(
   db: Database,
   accountIds: string[],
-  options: { freshnessWindowSeconds: number; now?: number }
+  options: { freshnessWindowSeconds: number; now?: number; mailbox?: string }
 ): CacheCoverage {
   const now = options.now ?? Date.now();
 
@@ -44,17 +44,33 @@ export function getCoverage(
   }
 
   const placeholders = accountIds.map(() => '?').join(', ');
+  // Scoped to the mailbox actually being searched. Without this, state for any
+  // synced mailbox made an unsynced one (Drafts, say) look servable, and the
+  // cache would answer with an empty result while suppressing the IMAP
+  // fallback — silently missing mail, which is the failure this whole design
+  // exists to avoid.
+  const mailboxClause = options.mailbox ? ' AND s.mailbox = ?' : '';
+  const args = options.mailbox ? [...accountIds, options.mailbox] : accountIds;
+
   const rows = db
     .prepare(
       `SELECT s.account_id, s.mailbox, s.backfill_complete, s.oldest_date, s.last_delta_at,
               (SELECT COUNT(*) FROM messages m
                WHERE m.account_id = s.account_id AND m.mailbox = s.mailbox) AS messages
        FROM mailbox_state s
-       WHERE s.account_id IN (${placeholders})`
+       WHERE s.account_id IN (${placeholders})${mailboxClause}`
     )
-    .all(...accountIds) as unknown as Array<CoverageRow & { messages: number }>;
+    .all(...args) as unknown as Array<CoverageRow & { messages: number }>;
 
   if (rows.length === 0) {
+    return { state: 'unavailable', last_synced_at: null, coverage: {} };
+  }
+
+  // Every requested account must have state for that scope. A multi-account
+  // search where only one account has synced would otherwise report `fresh`
+  // and quietly return that account's results alone.
+  const covered = new Set(rows.map((r) => r.account_id));
+  if (accountIds.some((id) => !covered.has(id))) {
     return { state: 'unavailable', last_synced_at: null, coverage: {} };
   }
 
@@ -85,7 +101,9 @@ export function getCoverage(
   }, null);
 
   let state: CacheState;
-  if (oldestDelta === null) {
+  // A state row with no successful sync yet is not servable: the mailbox is
+  // known but nothing has been read from it.
+  if (oldestDelta === null || rows.some((r) => r.last_delta_at == null)) {
     state = 'unavailable';
   } else if (now - oldestDelta > options.freshnessWindowSeconds * 1000) {
     // The daemon is probably not running.

@@ -45,6 +45,11 @@ export class ImapOperationTimeoutError extends Error {
   }
 }
 
+/** Cancellation signal for a single borrow, set when its timeout fires. */
+interface BorrowToken {
+  aborted: boolean;
+}
+
 interface PoolEntry {
   provider: ImapProvider | null;
   queue: Promise<void>;
@@ -122,12 +127,15 @@ export class ImapConnectionPool {
     // copy so a single failing task never poisons subsequent calls.
     const task: Promise<T> = entry.queue.then(() => {
       entry.inFlight = { label, startedAt: Date.now() };
-      return this.withTimeout(accountId, this.runWithRetry(accountId, entry, fn)).finally(
-        () => {
-          entry.inFlight = null;
-          entry.queueDepth -= 1;
-        }
-      );
+      const token: BorrowToken = { aborted: false };
+      return this.withTimeout(
+        accountId,
+        this.runWithRetry(accountId, entry, fn, token),
+        token
+      ).finally(() => {
+        entry.inFlight = null;
+        entry.queueDepth -= 1;
+      });
     });
     entry.queue = task.then(
       () => undefined,
@@ -190,7 +198,11 @@ export class ImapConnectionPool {
    * also lets the per-account queue advance, which is the part that actually
    * unblocks everything else.
    */
-  private async withTimeout<T>(accountId: string, work: Promise<T>): Promise<T> {
+  private async withTimeout<T>(
+    accountId: string,
+    work: Promise<T>,
+    token: BorrowToken
+  ): Promise<T> {
     if (this.operationTimeoutMs <= 0) return work;
 
     let timer: NodeJS.Timeout | undefined;
@@ -209,6 +221,13 @@ export class ImapConnectionPool {
       ]);
     } catch (error) {
       if (error instanceof ImapOperationTimeoutError) {
+        // Mark the borrow abandoned BEFORE tearing down. The underlying work
+        // is still running; destroying its socket will make it reject with a
+        // connection-drop error, which runWithRetry would otherwise treat as
+        // a transient failure and retry — re-executing a move on a fresh
+        // connection after the caller was already told it timed out.
+        token.aborted = true;
+
         this.logger.error('IMAP operation timed out; tearing down connection', {
           account_id: accountId,
           elapsed_ms: Date.now() - started,
@@ -225,12 +244,17 @@ export class ImapConnectionPool {
   private async runWithRetry<T>(
     accountId: string,
     entry: PoolEntry,
-    fn: (imap: ImapProvider) => Promise<T>
+    fn: (imap: ImapProvider) => Promise<T>,
+    token: BorrowToken
   ): Promise<T> {
     const provider = await this.ensureConnected(accountId, entry);
     try {
       return await fn(provider);
     } catch (err) {
+      // The caller has already given up and may have recorded a failure.
+      // Retrying now would run the callback a second time — for a move or a
+      // flag change, that is a duplicate mutation nobody is waiting for.
+      if (token.aborted) throw err;
       if (!isConnectionDropError(err)) throw err;
       this.logger.warn(`IMAP connection dropped for ${accountId}, reconnecting`, {
         error: err instanceof Error ? err.message : String(err),

@@ -152,3 +152,69 @@ describe('interrupted bulk hold', () => {
     expect(gmail.destination_uid).toBeNull();
   });
 });
+
+describe('targets spanning mailboxes', () => {
+  /**
+   * IMAP UIDs are unique only within a mailbox. With a primary key of
+   * (intent_id, account_id, uid), a single hold_messages call covering INBOX
+   * uid 123 and Archive uid 123 collided — and once inserts became upserts the
+   * collision silently overwrote the first envelope snapshot. Both messages
+   * moved; only one could be restored.
+   */
+  const sameUidTwoMailboxes = [
+    {
+      account_id: 'icloud',
+      uid: 123,
+      mailbox: 'INBOX',
+      envelope_snapshot: {
+        subject: 'From the inbox',
+        from: 'a@example.com',
+        original_mailbox: 'INBOX',
+      },
+    },
+    {
+      account_id: 'icloud',
+      uid: 123,
+      mailbox: 'Archive',
+      envelope_snapshot: {
+        subject: 'From the archive',
+        from: 'b@example.com',
+        original_mailbox: 'Archive',
+      },
+    },
+  ];
+
+  it('keeps both records rather than collapsing them', () => {
+    const id = intentId();
+    insertIntentTargets(db, id, sameUidTwoMailboxes);
+
+    const rows = getIntentTargets(db, id);
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.mailbox).sort()).toEqual(['Archive', 'INBOX']);
+  });
+
+  it('keeps each snapshot intact, so both stay restorable', () => {
+    const id = intentId();
+    insertIntentTargets(db, id, sameUidTwoMailboxes);
+
+    const rows = getIntentTargets(db, id);
+    const inbox = rows.find((r) => r.mailbox === 'INBOX')!;
+    const archive = rows.find((r) => r.mailbox === 'Archive')!;
+
+    expect(inbox.envelope_snapshot?.original_mailbox).toBe('INBOX');
+    expect(archive.envelope_snapshot?.original_mailbox).toBe('Archive');
+  });
+
+  it('scopes destination updates to one mailbox', () => {
+    const id = intentId();
+    insertIntentTargets(db, id, sameUidTwoMailboxes);
+
+    updateIntentTargetDestinations(db, id, 'icloud', new Map([[123, 9001]]), 'INBOX');
+
+    const rows = getIntentTargets(db, id);
+    expect(rows.find((r) => r.mailbox === 'INBOX')!.destination_uid).toBe(9001);
+    // The Archive message has not moved; stamping it would send undo to the
+    // wrong message.
+    expect(rows.find((r) => r.mailbox === 'Archive')!.destination_uid).toBeNull();
+  });
+});
