@@ -1,6 +1,7 @@
-import { writeFileSync, unlinkSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { writeFileSync, unlinkSync, existsSync, readdirSync, statSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
 import { LEDGER_DB_PATH } from '../config.js';
 
@@ -9,29 +10,106 @@ const PLIST_PATH = join(homedir(), 'Library', 'LaunchAgents', `${PLIST_NAME}.pli
 const LOG_PATH = join(homedir(), '.agent-mail', 'daemon.log');
 const ERR_LOG_PATH = join(homedir(), '.agent-mail', 'daemon-error.log');
 
-function resolveRunner(): { bin: string; script: string } {
-  const builtScript = join(import.meta.dirname, '..', 'index.js');
+export interface RunnerResolution {
+  bin: string;
+  script: string;
+  mode: 'built' | 'tsx';
+  /** Non-fatal advisory, e.g. "dist is older than src". */
+  warning?: string;
+}
+
+/**
+ * Package root, whether this file is running from `src/cli` (via tsx) or
+ * `dist/cli` (built). Both are two levels below the root.
+ *
+ * Resolving from the file's own location rather than cwd matters: launchd runs
+ * the daemon with an unrelated working directory.
+ */
+function packageRoot(): string {
+  // `import.meta.dirname` is undefined when a loader transpiles this module to
+  // CJS. That doesn't happen on the normal path (the package is type: module),
+  // but resolveRunner throwing would block daemon installation outright, so
+  // derive it from import.meta.url when the shortcut isn't available.
+  const here = import.meta.dirname ?? dirname(fileURLToPath(import.meta.url));
+  return join(here, '..', '..');
+}
+
+/** Newest mtime among the TypeScript sources, for staleness detection. */
+function newestSourceMtime(srcDir: string): number {
+  let newest = 0;
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (entry.name.endsWith('.ts')) {
+        newest = Math.max(newest, statSync(full).mtimeMs);
+      }
+    }
+  };
+  try {
+    walk(srcDir);
+  } catch {
+    return 0;
+  }
+  return newest;
+}
+
+/**
+ * Pick the command launchd should run.
+ *
+ * Prefers the compiled output: a long-lived background process shouldn't
+ * depend on tsx being resolvable years later. Falls back to tsx over the
+ * TypeScript sources, checking the local `node_modules/.bin` before any global
+ * install — the local copy is a devDependency and is what `bin/agent-mail.mjs`
+ * already uses.
+ */
+export function resolveRunner(rootDir: string = packageRoot()): RunnerResolution {
+  const builtScript = join(rootDir, 'dist', 'index.js');
   if (existsSync(builtScript)) {
-    // Built project — use plain node
     const nodePath = execSync('which node', { encoding: 'utf-8' }).trim();
-    return { bin: nodePath, script: builtScript };
+
+    // A stale dist means the daemon silently runs old code after an edit —
+    // confusing enough to be worth calling out rather than guessing.
+    const srcMtime = newestSourceMtime(join(rootDir, 'src'));
+    const builtMtime = statSync(builtScript).mtimeMs;
+    const warning =
+      srcMtime > builtMtime
+        ? 'dist/ is older than src/ — run "npm run build" to pick up recent changes'
+        : undefined;
+
+    return { bin: nodePath, script: builtScript, mode: 'built', warning };
   }
 
-  // Unbuilt source checkout — must use tsx to run TypeScript
-  const tsScript = join(import.meta.dirname, '..', 'index.ts');
+  const tsScript = join(rootDir, 'src', 'index.ts');
+  const localTsx = join(rootDir, 'node_modules', '.bin', 'tsx');
+  if (existsSync(localTsx)) {
+    return { bin: localTsx, script: tsScript, mode: 'tsx' };
+  }
+
   try {
     const tsxPath = execSync('which tsx', { encoding: 'utf-8' }).trim();
-    return { bin: tsxPath, script: tsScript };
+    if (tsxPath) return { bin: tsxPath, script: tsScript, mode: 'tsx' };
   } catch {
-    throw new Error(
-      'Cannot install daemon from unbuilt source without tsx. ' +
-      'Either run "npm run build" first, or install tsx globally: npm i -g tsx'
-    );
+    // fall through to the error below
   }
+
+  throw new Error(
+    'Cannot resolve a way to run the daemon. Looked for:\n' +
+      `  built output: ${builtScript}\n` +
+      `  local tsx:    ${localTsx}\n` +
+      '  global tsx:   (not on PATH)\n' +
+      'Run "npm run build", or "npm install" to restore the local tsx.'
+  );
 }
 
 export function installDaemon(): void {
-  const { bin, script } = resolveRunner();
+  const { bin, script, mode, warning } = resolveRunner();
+
+  // Which code the daemon will actually run is the thing people get wrong, so
+  // say it out loud rather than leaving it to be inferred from a plist.
+  console.log(`Runner: ${mode === 'built' ? 'compiled dist/' : 'tsx over src/'} (${script})`);
+  if (warning) console.warn(`Warning: ${warning}`);
 
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
