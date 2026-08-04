@@ -25,6 +25,18 @@ export interface QueueWorkerDeps {
 
 /** Long enough to outlive the pool's 5-minute default with room to spare. */
 const DEFAULT_LEASE_MS = 15 * 60_000;
+
+/**
+ * A lease that safely covers the given operation timeout.
+ *
+ * Derived rather than constant: `AGENT_MAIL_IMAP_TIMEOUT_MS` exists so a
+ * legitimately huge sweep can be given longer, and a fixed lease would either
+ * stop the daemon booting once the timeout passed it, or — worse — invite
+ * someone to weaken the constructor's assertion to match.
+ */
+export function leaseForTimeout(operationTimeoutMs: number): number {
+  return Math.max(DEFAULT_LEASE_MS, operationTimeoutMs * 3);
+}
 const DEFAULT_TICK_MS = 1_000;
 /**
  * Per-account serialization is the real limit — this only bounds how many
@@ -46,7 +58,7 @@ export class QueueWorker {
   private readonly db: Database;
   private readonly executor: Executor;
   private readonly logger: Logger;
-  private readonly leaseMs: number;
+  readonly leaseMs: number;
   private readonly operationTimeoutMs: number;
   private readonly tickMs: number;
   private readonly maxConcurrent: number;

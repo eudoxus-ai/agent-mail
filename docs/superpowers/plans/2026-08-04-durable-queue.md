@@ -222,35 +222,50 @@ This is already latent — `undo_intent` and `restore_messages` replay recorded 
 
 ## Phase 3 — The worker
 
-### Task 3.1: Drain loop
+### Task 3.1: Drain loop — **done**
 
-- [ ] **Step 1: Write the failing test** — `test/daemon/worker.test.ts`, executor stubbed
+- [x] **Step 1: Write the failing test** — `test/daemon/worker.test.ts`, executor stubbed
   - A queued intent is claimed, executed, and ends `executed`.
   - A failing intent ends `failed` with `error_detail`, and the loop continues.
   - Two accounts progress concurrently; one account's queue is FIFO.
   - `stop()` finishes the in-flight job and claims nothing further.
-- [ ] **Step 2: Verify it fails**
-- [ ] **Step 3: Implement** — `src/daemon/worker.ts`. Tick on an interval; per tick, claim while capacity remains (one per account), run `executor.performQueued(intent)`, heartbeat on a timer for the duration, settle status. Never let a rejection escape — an unhandled rejection here kills the daemon.
-- [ ] **Step 4: Verify PASS**
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Verify it fails**
+- [x] **Step 3: Implement** — `src/daemon/worker.ts`. Tick on an interval; per tick, claim while capacity remains (one per account), run `executor.performQueued(intent)`, heartbeat on a timer for the duration, settle status. Never let a rejection escape — an unhandled rejection here kills the daemon.
+- [x] **Step 4: Verify PASS**
+- [x] **Step 5: Commit**
 
-### Task 3.2: Crash recovery end to end
+### Task 3.2: Crash recovery end to end — **done**
 
-- [ ] **Step 1: Write the failing test**
+> No red phase: `tick()` already reclaimed as of 3.1, so these tests verify
+> rather than drive. Confirmed they discriminate — dropping the reclaim call
+> fails two, and widening reclaim to take live leases fails three. Run against
+> the **real** executor rather than a stub, because the worker's own tests stub
+> `performQueued` and that is exactly where a fake would drift.
+
+- [x] **Step 1: Write the failing test**
   - Claim an intent, then simulate the worker vanishing (stop heartbeating, do not settle). After the lease expires, `reclaimExpired` requeues it and a second worker completes it.
   - Assert `attempts` is 2 and the terminal status is `executed`.
-- [ ] **Step 2: Verify it fails**
-- [ ] **Step 3: Implement** — call `reclaimExpired` at daemon startup and on each tick.
-- [ ] **Step 4: Verify PASS**
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Verify it fails**
+- [x] **Step 3: Implement** — call `reclaimExpired` at daemon startup and on each tick.
+- [x] **Step 4: Verify PASS**
+- [x] **Step 5: Commit**
 
-### Task 3.3: Wire into the daemon
+### Task 3.3: Wire into the daemon — **done**
 
-- [ ] **Step 1: Write the failing test** — worker starts with the daemon and stops on shutdown.
-- [ ] **Step 2: Verify it fails**
-- [ ] **Step 3: Implement** — construct in `src/reviewer/daemon.ts` alongside `SyncLoop`; add to the shutdown path.
-- [ ] **Step 4: Verify PASS**
-- [ ] **Step 5: Commit**
+> Two testable seams instead of poking at `startDaemon`: `createQueueWorker`
+> (derives the lease from the pool's real operation timeout — a hardcoded lease
+> trips the constructor's own assertion once `AGENT_MAIL_IMAP_TIMEOUT_MS` passes
+> it) and `createShutdown` (stops the worker, waits for the job in hand, *then*
+> closes the pool; closing first would pull connections out from under a
+> mutation in progress).
+>
+> `leaseForTimeout()` lives next to the assertion it exists to satisfy.
+
+- [x] **Step 1: Write the failing test** — worker starts with the daemon and stops on shutdown.
+- [x] **Step 2: Verify it fails**
+- [x] **Step 3: Implement** — construct in `src/reviewer/daemon.ts` alongside `SyncLoop`; add to the shutdown path.
+- [x] **Step 4: Verify PASS**
+- [x] **Step 5: Commit**
 
 ---
 
