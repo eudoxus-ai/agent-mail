@@ -102,30 +102,37 @@ This is already latent — `undo_intent` and `restore_messages` replay recorded 
 
 ## Phase 2 — Queue schema and claim protocol
 
-### Task 2.1: `queued` status and claim columns
+### Task 2.1: `queued` status and claim columns — **done**
 
-- [ ] **Step 1: Write the failing test** — `test/ledger/queue.test.ts`
+- [x] **Step 1: Write the failing test** — `test/ledger/queue.test.ts`
   - An intent can be created with status `queued`.
   - The CHECK constraint rejects a nonsense status.
   - `claimed_by` / `claimed_at` / `lease_expires_at` / `attempts` round-trip.
-- [ ] **Step 2: Verify it fails**
-- [ ] **Step 3: Implement**
+- [x] **Step 2: Verify it fails**
+- [x] **Step 3: Implement**
   - Migration 9: SQLite cannot ALTER a CHECK constraint, so rebuild `intents` the way migration 6 rebuilt `intent_targets` — create `intents_v2` with the widened CHECK and the four new columns, `INSERT … SELECT`, drop, rename. Preserve every existing column including `progress`, `reverses_intent_id`, `reversed_by_intent_id`.
   - Index: `CREATE INDEX idx_intents_queued ON intents(status, created_at) WHERE status IN ('queued','executing')`.
-- [ ] **Step 4: Verify PASS** — plus a test that an existing populated ledger survives the rebuild with all rows and columns intact.
-- [ ] **Step 5: Commit**
+- [x] **Step 4: Verify PASS** — plus a test that an existing populated ledger survives the rebuild with all rows and columns intact.
+- [x] **Step 5: Commit**
 
 > **Care:** this migration rewrites the ledger's primary table. Test it against a database populated with rows in every status, not an empty one.
 
-### Task 2.2: The claim CAS
+### Task 2.2: The claim CAS — **done**
 
-- [ ] **Step 1: Write the failing test** — `test/ledger/queue.test.ts`
+> Implemented "one in-flight job per account" rather than the plan's "per
+> caller": the IMAP pool serializes per account, so a second concurrent claim on
+> one account could not make progress anyway — it would sit blocked while its
+> own lease ran down and then be reclaimed for being slow. Scoped to *live*
+> claims, so intents left `executing` by the old in-process path (no
+> `claimed_by`, no lease) cannot wedge an account's queue forever.
+
+- [x] **Step 1: Write the failing test** — `test/ledger/queue.test.ts`
   - `claimNext(db, workerId, leaseMs)` returns the oldest `queued` intent and flips it to `executing`.
   - It sets `claimed_by`, `lease_expires_at`, and increments `attempts`.
   - It returns `null` when nothing is queued.
   - It skips accounts already claimed by the caller (one in-flight claim per account).
-- [ ] **Step 2: Verify it fails**
-- [ ] **Step 3: Implement** — `src/ledger/queue.ts`, single statement, guard-as-CAS:
+- [x] **Step 2: Verify it fails**
+- [x] **Step 3: Implement** — `src/ledger/queue.ts`, single statement, guard-as-CAS:
   ```sql
   UPDATE intents
      SET status='executing', claimed_by=?, claimed_at=CURRENT_TIMESTAMP,
@@ -137,20 +144,50 @@ This is already latent — `undo_intent` and `restore_messages` replay recorded 
   RETURNING *
   ```
   `RETURNING` needs SQLite ≥ 3.35; the pinned runtime has 3.51. Verified working.
-- [ ] **Step 4: Verify PASS**
-- [ ] **Step 5: Commit**
+- [x] **Step 4: Verify PASS**
+- [x] **Step 5: Commit**
 
-### Task 2.3: Concurrent claim safety — against a real file
+### Task 2.3: Concurrent claim safety — against a real file — **done**
 
-- [ ] **Step 1: Write the failing test** — `test/ledger/queue-concurrency.test.ts`
-  - Two `DatabaseSync` connections to the **same temp file**, one queued intent, both call `claimNext`. Exactly one gets it; the other gets `null`.
-  - Repeat across ~50 intents and two claimers: every intent claimed exactly once, no duplicates, no drops.
-- [ ] **Step 2: Verify it fails** (it will pass trivially if you forget the CAS guard — delete the `AND status='queued'` line and confirm the test then fails, so you know it is actually testing something)
-- [ ] **Step 3: Implement** — no new code expected; this proves 2.2.
-- [ ] **Step 4: Verify PASS**
-- [ ] **Step 5: Commit**
+> **Two corrections found while implementing.**
+>
+> **1. Two connections on one thread cannot race.** Each `claimNext` call
+> returns before the next begins, so a single-threaded test passes against a
+> read-then-write claim — the exact bug it is meant to catch. Real overlap needs
+> real parallelism, so the test spawns racer *processes* (`fixtures/claim-racer.ts`),
+> released together by a stdin handshake. Confirmed by mutation: a
+> SELECT-then-UPDATE claim produces 18-77 duplicate claims on every run, while
+> every single-threaded test in the file passes against it.
+>
+> **2. Deleting `AND status='queued'` fails nothing.** The step below predicted
+> it would. It does not, and the reason matters: with the claim as a single
+> UPDATE, SQLite serializes writers and re-evaluates the subquery against
+> committed state, so the guard is genuinely redundant. It stays as
+> defense-in-depth for anyone who later splits the statement — but no test can
+> justify it, and pretending otherwise would be theatre.
+>
+> **Flakiness, and what fixed it.** Pre-seeding the whole queue let whichever
+> racer woke first drain it while its sibling was still being scheduled — an
+> 800/0 split that proves nothing, failing roughly 1 run in 5 under full-suite
+> load on 4 cores. Feeding work in *during* the race fixed it: both racers stay
+> busy however the scheduler treats them. The participation assertion is
+> deliberately a low absolute floor rather than a percentage — the scheduler
+> decides the split, and pinning a percentage to it just fails on busy machines
+> without finding bugs. `retry: 1` covers a run where the second racer never got
+> scheduled at all; it cannot mask a real defect, because the mutant fails both
+> the attempt and the retry every time. Verified over 20 consecutive full-suite
+> runs.
 
-> Two real connections on one file, deliberately. A mocked database cannot exhibit the race this is guarding.
+- [x] **Step 1: Write the test** — `test/ledger/queue-concurrency.test.ts`
+  - Two connections to the same temp file, one queued intent, both call `claimNext`. Exactly one gets it; the other gets `null`.
+  - 50 intents across two claimers: every intent claimed exactly once, `attempts` is 1 everywhere.
+  - Separate processes racing on one file: no duplicates, nothing dropped, and both racers demonstrably in it.
+- [x] **Step 2: Verify it fails** — via the read-then-write mutant, which is the failure mode that actually exists.
+- [x] **Step 3: Implement** — no new code; this proves 2.2.
+- [x] **Step 4: Verify PASS**
+- [x] **Step 5: Commit**
+
+> Real processes on one file, deliberately. Neither a mocked database nor two connections on one thread can exhibit the race this is guarding.
 
 ### Task 2.4: Lease, heartbeat, reclaim
 
