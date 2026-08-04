@@ -10,12 +10,14 @@ const EXPLANATIONS: Record<CacheMode, string> = {
     'The cache is neither read nor written, and the daemon does not sync it. ' +
     'Nothing warms up in the background — there is no local cache until you pick another mode.',
   shadow:
-    'The daemon syncs, and every search runs against both the cache and IMAP. IMAP still ' +
-    'gives you the answer; differences are logged as "cache: shadow divergence". Sender ' +
-    'sweeps already use the cache to catch messages the server search missed.',
+    'The daemon syncs and every search runs against both the cache and IMAP, but nothing ' +
+    'the cache says changes what happens. IMAP gives you the answer; differences are ' +
+    'logged as "cache: shadow divergence", and sender sweeps report what the cache would ' +
+    'have recovered without holding it. Measure here first, then switch to on.',
   on:
     'Searches are served from the cache, falling back to IMAP when it is stale or a mailbox ' +
-    'is still backfilling. Sender sweeps cross-check it for messages the server search missed.',
+    'is still backfilling. Sender sweeps hold the messages the server search missed, and ' +
+    'say how many they recovered.',
 };
 
 export interface CacheModeReport {

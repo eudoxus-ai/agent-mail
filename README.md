@@ -422,7 +422,7 @@ cache:
 ```
 
 - **`off`** (default) — the cache is neither read nor written. The daemon does **not** sync it, so nothing warms up in the background; there is no cache until you pick another mode.
-- **`shadow`** — the daemon syncs, and every search runs against both the cache and IMAP. IMAP's answer is what you get; the two are compared and any difference is logged to `~/.agent-mail/agent-mail.log`. Run here for a few days first.
+- **`shadow`** — the daemon syncs, and every search runs against both the cache and IMAP. IMAP's answer is what you get; the two are compared and any difference is logged to `~/.agent-mail/agent-mail.log`. Sender sweeps report what the cache would have recovered without holding it. **Nothing the cache says changes what happens.** Run here for a few days first.
 - **`on`** — searches are served from the cache, falling back to IMAP when the cache is stale or a mailbox hasn't finished backfilling.
 
 Shadow mode exists because the failure that matters for a mail cache is silently *missing* a message. Watch the log for `cache: shadow divergence` before switching to `on`.
@@ -443,6 +443,8 @@ Either way, restart the daemon afterwards — the mode is read once at startup, 
   "warning": "The IMAP server's FROM search missed 10 message(s) that the local cache found; they were included in this hold."
 }
 ```
+
+In `shadow` the cross-check runs but does **not** hold anything — it reports `applied: false` and tells you what it would have caught. That is the point of running shadow first: measure how badly the server's search actually misses across your real senders, then switch to `on` knowing the number.
 
 The relationship is one-way on purpose. The cache has a backfill floor and a sync interval, so it under-reports in its own way — a cache hit the server missed is evidence, but a cache miss proves nothing. So it only ever *adds* messages to a sweep, never removes them, and cached UIDs from a stale `UIDVALIDITY` are discarded rather than acted on. With the cache off, sweeps behave exactly as before and the response carries no `cache_cross_check` at all.
 

@@ -119,7 +119,11 @@ function fakeImap(imapUids: number[], generation = GENERATION) {
   };
 }
 
-function makeExecutor(imap: ReturnType<typeof fakeImap>, withCache = true) {
+function makeExecutor(
+  imap: ReturnType<typeof fakeImap>,
+  withCache = true,
+  mode: 'on' | 'shadow' = 'on'
+) {
   return new Executor({
     db,
     accounts,
@@ -128,16 +132,17 @@ function makeExecutor(imap: ReturnType<typeof fakeImap>, withCache = true) {
     } as never,
     logger: createLogger('cli', { minLevel: 'error' }),
     cache: withCache ? cache : undefined,
-    cacheConfig: { mode: 'on', freshnessWindowSeconds: 3600 } as never,
+    cacheConfig: { mode, freshnessWindowSeconds: 3600 } as never,
   });
 }
 
 async function sweep(
   imap: ReturnType<typeof fakeImap>,
   params: Record<string, unknown> = {},
-  withCache = true
+  withCache = true,
+  mode: 'on' | 'shadow' = 'on'
 ) {
-  const { intent, result } = await makeExecutor(imap, withCache).executeImmediate({
+  const { intent, result } = await makeExecutor(imap, withCache, mode).executeImmediate({
     tool: 'hold_by_sender',
     toolParams: { from: 'store@a.fanaticscommerce.com', include_summary: false, ...params },
     accountId: 'work',
@@ -244,6 +249,16 @@ describe('the cache catches what the server search missed', () => {
     expect(payload.cache_cross_check).toBeUndefined();
   });
 
+  it('marks recovered messages as actually applied', async () => {
+    cacheMessage(101, 'store@a.fanaticscommerce.com');
+
+    const { payload } = await sweep(fakeImap([]));
+
+    // One shape for both modes: `recovered` is what the server missed,
+    // `applied` is whether anything was done about it.
+    expect(payload.cache_cross_check).toMatchObject({ recovered: 1, applied: true });
+  });
+
   it('says the cross-check did not run when the cache is unusable', async () => {
     // An empty, never-synced cache is not evidence of anything. Reporting
     // "0 recovered" would read as "the server search was verified complete".
@@ -252,5 +267,66 @@ describe('the cache catches what the server search missed', () => {
 
     expect(payload.cache_cross_check?.checked).toBe(false);
     expect(payload.diagnosis).toMatch(/cache/i);
+  });
+});
+
+/**
+ * Shadow mode's contract is that the cache changes nothing.
+ *
+ * Reads already honour it — searches are served from the cache only in `on`,
+ * and shadow merely compares and logs. A cross-check that quietly held extra
+ * messages in shadow would be an undocumented exception to that, and the next
+ * person to reason about shadow would be wrong. So shadow measures and reports;
+ * `on` acts.
+ */
+describe('shadow mode measures without acting', () => {
+  it('does not hold what the server missed', async () => {
+    cacheMessage(101, 'store@a.fanaticscommerce.com');
+    cacheMessage(102, 'store@a.fanaticscommerce.com');
+
+    const { payload, intent } = await sweep(fakeImap([101]), {}, true, 'shadow');
+
+    expect(payload.total_messages).toBe(1);
+    expect(getIntentTargets(db, intent.id).map((t) => t.uid)).toEqual([101]);
+  });
+
+  it('still reports what it found, and how to act on it', async () => {
+    cacheMessage(101, 'store@a.fanaticscommerce.com');
+    cacheMessage(102, 'store@a.fanaticscommerce.com');
+
+    const { payload } = await sweep(fakeImap([101]), {}, true, 'shadow');
+
+    // The measurement is the entire point of running shadow: how badly does
+    // the server's FROM search actually miss, across real senders, before
+    // trusting the cache enough to act on it.
+    expect(payload.cache_cross_check).toMatchObject({
+      checked: true,
+      recovered: 1,
+      applied: false,
+    });
+    expect(payload.warning).toMatch(/shadow/i);
+    expect(payload.warning).toMatch(/cache on/i);
+  });
+
+  it('does not let a shadow no-match read as an empty inbox', async () => {
+    // Nothing was held, so this is a no_match — but the cache says the server
+    // is wrong, and that is the one thing the caller must not miss here.
+    cacheMessage(101, 'store@a.fanaticscommerce.com');
+
+    const { payload, intent } = await sweep(fakeImap([]), {}, true, 'shadow');
+
+    expect(payload.status).toBe('no_match');
+    expect(getIntentTargets(db, intent.id)).toHaveLength(0);
+    expect(payload.diagnosis).toMatch(/1 message/i);
+    expect(payload.diagnosis).toMatch(/shadow/i);
+  });
+
+  it('is silent when the server and the cache agree', async () => {
+    cacheMessage(101, 'store@a.fanaticscommerce.com');
+
+    const { payload } = await sweep(fakeImap([101]), {}, true, 'shadow');
+
+    expect(payload.cache_cross_check).toMatchObject({ recovered: 0, applied: false });
+    expect(payload.warning).toBeUndefined();
   });
 });

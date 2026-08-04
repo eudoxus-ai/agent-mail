@@ -2136,7 +2136,12 @@ export class Executor {
     });
 
     const expandedTargets: Target[] = [];
-    let crossCheck: { checked: boolean; recovered: number; reason?: string } | undefined;
+    // `recovered` is what the server's search missed; `applied` is whether
+    // anything was done about it. One shape for both modes.
+    let crossCheck:
+      | { checked: boolean; recovered: number; applied: boolean; reason?: string }
+      | undefined;
+    const applyRecovered = this.cacheConfig.mode === 'on';
 
     for (const accountId of searchResult.accounts_searched) {
       const leg = searchResult.per_account[accountId] as
@@ -2150,14 +2155,23 @@ export class Executor {
       // Recovered UIDs are added, never substituted. The cache can only ever
       // grow a sweep — see recoverMissedBySender for why that direction is the
       // only safe one.
-      for (const uid of leg.recovered.uids) {
-        expandedTargets.push({ account_id: accountId, uid, mailbox });
+      //
+      // ...and only in `on`. Shadow's contract is that the cache changes
+      // nothing: reads are served from it only in `on`, and quietly holding
+      // extra messages here would be an undocumented exception that the next
+      // person to reason about shadow would get wrong. Shadow measures and
+      // reports; `on` acts.
+      if (applyRecovered) {
+        for (const uid of leg.recovered.uids) {
+          expandedTargets.push({ account_id: accountId, uid, mailbox });
+        }
       }
 
       if (leg.recovered.reason !== 'no cache') {
         crossCheck = {
           checked: (crossCheck?.checked ?? false) || leg.recovered.checked,
           recovered: (crossCheck?.recovered ?? 0) + leg.recovered.uids.length,
+          applied: applyRecovered,
           reason: crossCheck?.reason ?? leg.recovered.reason,
         };
         if (crossCheck.checked) delete crossCheck.reason;
@@ -2254,12 +2268,20 @@ export class Executor {
       // very different claims.
       const cacheNote = !crossCheck
         ? ''
-        : crossCheck.checked
-          ? ' The local cache was cross-checked and found nothing either, so this is a ' +
-            'real zero rather than a search that missed.'
-          : ` The local cache could NOT be cross-checked (${crossCheck.reason}), so a ` +
-            'server-side search miss has not been ruled out. Enabling the cache would ' +
-            'settle it.';
+        : crossCheck.recovered > 0
+          ? // Nothing was held, so this is a no_match — but the cache says the
+            // server is wrong, and that is the one thing the caller must not
+            // miss. Reading this as "the inbox is clean" is the exact failure
+            // the whole no_match change exists to prevent.
+            ` The local cache found ${crossCheck.recovered} message(s) from this sender ` +
+            'that the server\'s search missed, and they were NOT held because cache.mode ' +
+            "is shadow. Run 'agent-mail cache on' to have sweeps include them."
+          : crossCheck.checked
+            ? ' The local cache was cross-checked and found nothing either, so this is a ' +
+              'real zero rather than a search that missed.'
+            : ` The local cache could NOT be cross-checked (${crossCheck.reason}), so a ` +
+              'server-side search miss has not been ruled out. Enabling the cache would ' +
+              'settle it.';
 
       const diagnosis =
         (unfilteredCount && unfilteredCount > 0
@@ -2288,7 +2310,12 @@ export class Executor {
         matched: 0;
         searched: { from: string; mailbox: string; before?: string };
         diagnosis: string;
-        cache_cross_check?: { checked: boolean; recovered: number; reason?: string };
+        cache_cross_check?: {
+          checked: boolean;
+          recovered: number;
+          applied: boolean;
+          reason?: string;
+        };
         accounts_searched: string[];
         accounts_available: string[];
         per_account_errors?: Record<string, string>;
@@ -2338,10 +2365,14 @@ export class Executor {
         // Named loudly rather than quietly absorbed: if this is silently
         // papered over, every dry_run preview still under-reports and nobody
         // learns the server's FROM search cannot be trusted for this sender.
-        parsed.warning =
-          `The IMAP server's FROM search missed ${crossCheck.recovered} message(s) that the ` +
-          'local cache found; they were included in this hold. Treat server-side FROM ' +
-          'counts for this sender as a floor, not a total.';
+        parsed.warning = crossCheck.applied
+          ? `The IMAP server's FROM search missed ${crossCheck.recovered} message(s) that the ` +
+            'local cache found; they were included in this hold. Treat server-side FROM ' +
+            'counts for this sender as a floor, not a total.'
+          : `The IMAP server's FROM search missed ${crossCheck.recovered} message(s) that the ` +
+            'local cache found. They were NOT held: cache.mode is shadow, which measures ' +
+            "without changing behaviour. Run 'agent-mail cache on' to have sweeps include " +
+            'them.';
       }
     }
     return [{ type: 'text', text: JSON.stringify(parsed, null, 2) }];
