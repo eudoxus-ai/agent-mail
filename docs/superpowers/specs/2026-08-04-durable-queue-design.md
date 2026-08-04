@@ -1,7 +1,7 @@
 # Durable Background Queue — Design
 
 **Date:** 2026-08-04
-**Status:** Proposed. D2 is decided (all mutations via the daemon); D1 is a recommendation whose stakes D2 raises — see "Decisions".
+**Status:** Decided. Implementation plan: `docs/superpowers/plans/2026-08-04-durable-queue.md`
 **Scope:** Make accepted background work survive a process restart.
 
 ## Problem
@@ -28,9 +28,7 @@ The missing piece is only the durable hand-off between "accepted" and "running".
 
 ## Decisions
 
-Both are recommendations. Each is isolated enough to change without redesigning the rest.
-
-### D1 (proposed): when the daemon is down, accept and warn loudly
+### D1 (decided): when the daemon is down, accept and squawk
 
 Queue the work durably, return the `intent_id`, and state plainly — in the tool response, in `get_intent`, and in `get_diagnostics` — that nothing will execute until the daemon starts.
 
@@ -48,7 +46,9 @@ Accepting and warning keeps one execution path and one meaning of "accepted": th
 - `agent-mail status` leads with it.
 - The server preamble tells agents to call `get_diagnostics` when a mutation stays `queued`.
 
-If that still feels too quiet, the alternative is to refuse mutations outright when no worker has heartbeated recently — an explicit, loud failure at the cost of a hard daemon dependency. Worth deciding before implementation rather than after; the failure mode of getting it wrong is a user who thinks they filed fifty holds and filed nothing.
+Settled in favour of accepting: nothing is lost, and the loud signal sets expectations rather than failing work that is perfectly recoverable. Refusing was the alternative; it trades a recoverable delay for an outright failure, which is the worse deal when the queue is durable.
+
+The bar this sets: a user must never believe they filed fifty holds and have filed none. Every surface that could carry that misunderstanding has to say otherwise — the response payload, `get_intent`, `get_diagnostics`, `agent-mail status`, and the server preamble.
 
 ### D2 (decided): every mutation goes through the daemon
 
