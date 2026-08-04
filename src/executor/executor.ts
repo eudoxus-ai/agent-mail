@@ -474,6 +474,79 @@ export class Executor {
     return running;
   }
 
+  /**
+   * Run an intent a worker has already claimed.
+   *
+   * The claim moved it to `executing` and stamped the lease; this performs the
+   * action and settles the ledger. Unlike the other two paths it never throws:
+   * the caller is a drain loop, and an escaping rejection there takes the
+   * daemon — and every other queued job — down with it.
+   */
+  async performQueued(
+    intent: Intent
+  ): Promise<{ status: 'executed' | 'failed'; result?: Array<{ type: 'text'; text: string }> }> {
+    const toolParams = intent.params;
+
+    logAudit(this.db, {
+      intent_id: intent.id,
+      account_id: intent.account_id,
+      action: 'executing',
+      actor: 'worker',
+      detail: buildAuditSummary(intent.tool, 'executing', toolParams),
+    });
+
+    try {
+      const result = await this.performAction(intent);
+
+      const isDryRun = toolParams.dry_run === true;
+      updateIntentStatus(this.db, intent.id, 'executed', {
+        resolved_by: 'worker',
+        undo_token: isDryRun
+          ? undefined
+          : (generateUndoToken(intent.tool, toolParams) ?? undefined),
+        undo_expires_at: isDryRun ? undefined : (getUndoExpiry(intent.tool) ?? undefined),
+      });
+      logAudit(this.db, {
+        intent_id: intent.id,
+        account_id: intent.account_id,
+        action: 'executed',
+        actor: 'worker',
+        detail: buildAuditSummary(intent.tool, 'executed', toolParams),
+      });
+
+      return { status: 'executed', result };
+    } catch (error) {
+      const errorDetail =
+        error instanceof HoldBySenderBlockedError
+          ? error.errorDetail
+          : { message: error instanceof Error ? error.message : String(error) };
+
+      updateIntentStatus(this.db, intent.id, 'failed', { error_detail: errorDetail });
+      logAudit(this.db, {
+        intent_id: intent.id,
+        account_id: intent.account_id,
+        action: 'failed',
+        actor: 'worker',
+        detail: buildAuditSummary(intent.tool, 'failed', toolParams, errorDetail),
+      });
+      this.logger.warn('Queued execution failed', {
+        intent_id: intent.id,
+        tool: intent.tool,
+        error: errorDetail.message,
+      });
+
+      // Blocked-by-policy is a result, not a crash — it is already recorded
+      // and there is nobody to rethrow to.
+      return {
+        status: 'failed',
+        result:
+          error instanceof HoldBySenderBlockedError
+            ? [{ type: 'text', text: JSON.stringify(error.payload, null, 2) }]
+            : undefined,
+      };
+    }
+  }
+
   async createGatedIntent(params: {
     tool: string;
     toolParams: Record<string, unknown>;
