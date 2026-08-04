@@ -189,26 +189,32 @@ This is already latent — `undo_intent` and `restore_messages` replay recorded 
 
 > Real processes on one file, deliberately. Neither a mocked database nor two connections on one thread can exhibit the race this is guarding.
 
-### Task 2.4: Lease, heartbeat, reclaim
+### Task 2.4: Lease, heartbeat, reclaim — **done**
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
   - `heartbeat(db, intentId, workerId, leaseMs)` extends `lease_expires_at`, and only for the owning worker.
   - `reclaimExpired(db)` returns expired-lease `executing` intents to `queued` and clears `claimed_by`.
   - It leaves an unexpired lease alone.
   - An intent at `attempts >= 3` goes to `failed` with a structured `error_detail` instead of being requeued.
-- [ ] **Step 2: Verify it fails**
-- [ ] **Step 3: Implement** — in `src/ledger/queue.ts`.
-- [ ] **Step 4: Verify PASS**
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Verify it fails**
+- [x] **Step 3: Implement** — in `src/ledger/queue.ts`.
+- [x] **Step 4: Verify PASS**
+- [x] **Step 5: Commit**
 
-### Task 2.5: Lease must outlive the operation timeout
+### Task 2.5: Lease must outlive the operation timeout — **done**
 
-- [ ] **Step 1: Write the failing test**
+> The worker class is created here rather than in Phase 3, holding only the
+> constructor and its validation. Putting the guard in a free function to be
+> wired up later would have left it exercised by tests and reachable by nothing —
+> the failure mode this codebase keeps running into. `ImapConnectionPool` gained
+> `getOperationTimeoutMs()` so the daemon can supply the real value in 3.3.
+
+- [x] **Step 1: Write the failing test**
   - Constructing a worker with `leaseMs <= pool.operationTimeoutMs` throws at startup with a message naming both values.
-- [ ] **Step 2: Verify it fails**
-- [ ] **Step 3: Implement** — assert in the worker constructor.
-- [ ] **Step 4: Verify PASS**
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Verify it fails**
+- [x] **Step 3: Implement** — assert in the worker constructor.
+- [x] **Step 4: Verify PASS**
+- [x] **Step 5: Commit**
 
 > A lease shorter than the IMAP timeout means a legitimately slow sweep gets reclaimed and re-run underneath itself — silent duplicate mutation. Fail loudly at startup instead.
 
