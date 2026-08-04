@@ -351,7 +351,7 @@ function reportRuntime(): void {
  * Per-mailbox cache coverage. First backfill of a large account takes a while,
  * and without this it's indistinguishable from the daemon having hung.
  */
-async function printCacheStatus(): Promise<void> {
+export async function printCacheStatus(): Promise<void> {
   const { CACHE_DB_PATH } = await import('../config.js');
   if (!existsSync(CACHE_DB_PATH)) {
     console.log('Local cache: not created yet');

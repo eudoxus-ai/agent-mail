@@ -407,7 +407,14 @@ To delete it, stop the daemon and `rm ~/.agent-mail/cache.db`. Nothing is lost: 
 
 ### Turning it on
 
-Create `~/.agent-mail/cache.yaml`:
+```bash
+./bin/agent-mail.mjs cache            # what mode am I in, and what does it mean
+./bin/agent-mail.mjs cache shadow     # change it
+```
+
+`cache` with no argument prints the current mode, where it came from, what it does, and the per-mailbox sync state. Setting a mode edits `~/.agent-mail/cache.yaml` in place, leaving any other settings there alone.
+
+Or write the file yourself:
 
 ```yaml
 cache:
@@ -420,11 +427,10 @@ cache:
 
 Shadow mode exists because the failure that matters for a mail cache is silently *missing* a message. Watch the log for `cache: shadow divergence` before switching to `on`.
 
-Restart the daemon after changing the file — the mode is read at startup:
+Either way, restart the daemon afterwards — the mode is read once at startup, so a running daemon stays on the old one until it restarts:
 
 ```bash
 ./bin/agent-mail.mjs install-daemon   # reinstalls and restarts
-./bin/agent-mail.mjs status           # shows cache state and coverage
 ```
 
 ### The cache also fixes sender sweeps
