@@ -1,7 +1,7 @@
 # Durable Background Queue — Design
 
 **Date:** 2026-08-04
-**Status:** Proposed. D1 and D2 are recommendations, not settled — see "Decisions".
+**Status:** Proposed. D2 is decided (all mutations via the daemon); D1 is a recommendation whose stakes D2 raises — see "Decisions".
 **Scope:** Make accepted background work survive a process restart.
 
 ## Problem
@@ -41,17 +41,34 @@ Rejected alternatives:
 
 Accepting and warning keeps one execution path and one meaning of "accepted": the work is durably recorded and will run. The cost is that a stopped daemon shows up as work sitting idle rather than as an error, so the warning has to be prominent and `agent-mail status` has to lead with it.
 
-### D2 (proposed): queue bulk holds only, not all mutations
+**D2 raises the stakes on this considerably.** With every mutation queued, a stopped daemon means *nothing that changes mail works* — not a label, not a draft, not an undo. Under D1 each of those silently accepts and sits. That is defensible only if the daemon being down is loud and hard to miss:
 
-`hold_by_sender` and `hold_messages` go through the queue. `label_thread`, `draft_reply`, `unsubscribe_sender`, `restore_messages` keep executing inline in the MCP server.
+- The MCP server checks worker liveness on startup and logs an error, not a warning, when the daemon is absent.
+- Every queued response while the daemon is down says so in the payload, not just in a log.
+- `agent-mail status` leads with it.
+- The server preamble tells agents to call `get_diagnostics` when a mutation stays `queued`.
 
-The tempting alternative is routing *every* mutation through the daemon so it becomes the single IMAP mutator. That argument is weaker than it first appears:
+If that still feels too quiet, the alternative is to refuse mutations outright when no worker has heartbeated recently — an explicit, loud failure at the cost of a hard daemon dependency. Worth deciding before implementation rather than after; the failure mode of getting it wrong is a user who thinks they filed fifty holds and filed nothing.
 
-**It would not actually eliminate dual-consumer contention.** The MCP server still needs IMAP for reads whenever the cache is `off`, stale, or lacks coverage for the requested mailbox — which is the default today. Both processes would still hold connections to the same account. The contention we hit was between *bulk sweeps* and everything else, not between small writes and reads.
+### D2 (decided): every mutation goes through the daemon
 
-Against that partial benefit: making a one-message `label_thread` asynchronous is a real regression in feel, and it adds a polling path to every quick write. Not worth it for a problem it only half solves.
+All mutating tools queue — `hold_by_sender`, `hold_messages`, `label_thread`, `draft_reply`, `unsubscribe_sender`, `restore_messages`, `undo_intent`. The MCP server becomes write-only-to-the-queue and stops mutating mail entirely. The daemon is the sole IMAP mutator.
 
-Revisit if the cache reaches `mode: on` with full coverage and reads stop touching IMAP — at that point moving all mutations would genuinely leave one consumer, and the calculus changes.
+**What this genuinely buys**, and it is more than a first pass suggests: MCP server instances multiply. Claude Desktop, Claude Code and a CLI invocation are three processes, each with its own connection pool, each today mutating the same account independently. Routing mutations through the daemon means every write goes through exactly one pool with one per-account serialization queue, no matter how many clients are attached. That is a real reduction in contention on the write path, and it matches how approved gated intents already execute.
+
+**What it does not buy**, and the design should not pretend otherwise: this is not "one IMAP consumer per account". The MCP server still opens IMAP for *reads* whenever the cache is `off`, stale, or lacks coverage for the requested mailbox — the default today. Reads and writes will still contend. The win is on the write path and on collapsing N clients to one writer, not on eliminating the second consumer outright.
+
+That gap closes on its own as the cache reaches `mode: on` with real coverage, at which point reads stop touching IMAP and the daemon genuinely becomes the only consumer.
+
+#### D2a: small mutations wait briefly, so they still feel synchronous
+
+Making a one-message `label_thread` fire-and-forget would be a real regression — the agent would have to poll for every trivial action.
+
+So: everything queues, but for tools flagged as quick (`label_thread`, `draft_reply`, `unsubscribe_sender`) the MCP server polls the ledger for a short window (~10s) and returns the terminal result if it lands in time. Past that window it returns the `intent_id` and the caller polls, exactly like a bulk hold.
+
+The queue stays the single execution path — the wait is only in how the *response* is shaped. Bulk holds (`hold_by_sender`, `hold_messages`) never wait; they return an id immediately as they do now.
+
+Cost: a polling path in the MCP server, and up to ~10s of added latency on a small write when the daemon is busy with a sweep. Acceptable, and visible in `get_diagnostics` when it happens.
 
 ## Architecture
 
@@ -74,7 +91,7 @@ background: true
 get_intent ◄──────────────────  status + progress + queue_position
 ```
 
-The MCP server never executes queued work and never claims. It writes a row and returns.
+The MCP server never executes queued work and never claims. It writes a row and returns — immediately for bulk holds, or after a short wait for quick mutations (D2a).
 
 ## Schema
 
@@ -169,6 +186,8 @@ This is latent today (the same hazard exists for `undo_intent` and `restore_mess
 | Two daemons running | CAS makes the loser a no-op; only one claims each intent |
 | UIDVALIDITY changed before replay | Target refused, intent fails with a clear reason rather than moving the wrong mail |
 | Ledger locked by another process | Existing `busy_timeout` applies; claim retries next tick |
+| Quick mutation exceeds its short wait | Returns `intent_id` and `status: queued`; caller polls. Not an error |
+| Daemon down under D2 | *Every* mutation queues and idles. Liveness is surfaced as an error on startup, in each response, and in `status` |
 | Queue grows unboundedly | Sanity bound + `oldest_queued_age` surfaced in diagnostics |
 
 ## Testing
@@ -188,9 +207,12 @@ The claim CAS should be tested against a real SQLite file with two connections, 
 
 | Phase | Contents |
 |---|---|
-| 1 | `queued` status, claim/lease/heartbeat, daemon worker, reclaim, remove the cap |
+| 1 | `queued` status, claim/lease/heartbeat, daemon worker, reclaim, remove the cap. Bulk holds only, so the mechanism is proven on the tools that already return an id. |
 | 2 | `uidvalidity` on targets + generation check on replay |
-| 3 | `queue_position`, `worker` block in diagnostics, README and tool-description updates |
+| 3 | Route the remaining mutations through the queue, plus the short-wait path for quick tools (D2a) |
+| 4 | `queue_position`, `worker` block in diagnostics, README and tool-description updates |
+
+Phase 1 stops short of moving every mutation on purpose. The claim protocol, lease recovery and daemon-down handling all want proving on `hold_by_sender` — where an async response is already the contract — before `label_thread` depends on them. Same posture as shadow mode for the cache: get the mechanism trustworthy on the low-stakes path first.
 
 Phase 2 is separable and worth doing even if the queue is deferred.
 
