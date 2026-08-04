@@ -439,7 +439,41 @@ describe('migration 9 against a populated legacy ledger', () => {
       );
     }
 
+    // Child rows, because every real ledger has them and their absence is
+    // exactly why this migration shipped broken: `intent_targets` and
+    // `audit_log` both reference `intents(id)`, node:sqlite enables foreign
+    // keys by default, and `DROP TABLE intents` fails outright once anything
+    // points at it. An empty-child fixture cannot see that.
+    legacy.exec(`
+      CREATE TABLE IF NOT EXISTS intent_targets (
+        intent_id TEXT NOT NULL REFERENCES intents(id),
+        account_id TEXT NOT NULL, uid INTEGER NOT NULL, mailbox TEXT NOT NULL,
+        envelope_snapshot JSON, PRIMARY KEY (intent_id, account_id, uid)
+      );
+    `);
+    legacy
+      .prepare(
+        `INSERT INTO intent_targets (intent_id, account_id, uid, mailbox)
+         VALUES ('id-executed', 'icloud', 42, 'INBOX')`
+      )
+      .run();
+    legacy
+      .prepare(
+        `INSERT INTO audit_log (intent_id, account_id, action, actor)
+         VALUES ('id-executed', 'icloud', 'executed', 'policy')`
+      )
+      .run();
+
     runMigrations(legacy);
+
+    // The children survived and still point at a real parent.
+    expect(
+      (legacy.prepare(`SELECT COUNT(*) AS n FROM intent_targets`).get() as { n: number }).n
+    ).toBe(1);
+    expect(
+      (legacy.prepare(`SELECT COUNT(*) AS n FROM audit_log`).get() as { n: number }).n
+    ).toBe(1);
+    expect(legacy.prepare(`PRAGMA foreign_key_check`).all()).toEqual([]);
 
     const rows = legacy
       .prepare(`SELECT * FROM intents ORDER BY id`)

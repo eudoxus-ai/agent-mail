@@ -1,6 +1,89 @@
 import type { Database } from './sqlite.js';
 
+function tableExists(db: Database, name: string): boolean {
+  return (
+    db
+      .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`)
+      .get(name) != null
+  );
+}
+
+/**
+ * Run a create-copy-drop-rename table rebuild safely.
+ *
+ * Two things make the naive version fail on a real ledger, and it failed on a
+ * real one — the MCP server would not boot, dying on "table intents_v2 already
+ * exists" every start.
+ *
+ * **Foreign keys.** `node:sqlite` turns `PRAGMA foreign_keys` ON by default,
+ * unlike the SQLite C library. `intent_targets` and `audit_log` both reference
+ * `intents(id)`, so `DROP TABLE intents` on any ledger that has ever recorded a
+ * hold fails with "FOREIGN KEY constraint failed". The references are by name
+ * and resolve again once the staging table is renamed into place, so the
+ * enforcement is switched off for the rebuild and restored after. The pragma is
+ * a no-op inside a transaction, hence the ordering here.
+ *
+ * **Atomicity.** `db.exec()` does not wrap its statements in a transaction, and
+ * SQLite releases the write lock between them — four separate chances for the
+ * daemon, which writes to this file every second or so, to take the lock in a
+ * gap and leave the rebuild half-done. BEGIN IMMEDIATE takes the lock up front
+ * and holds it for all four, so the rebuild either happens or leaves no trace.
+ */
+function rebuildTable(db: Database, fn: () => void): void {
+  const previous = (db.prepare(`PRAGMA foreign_keys`).get() as { foreign_keys: number })
+    .foreign_keys;
+
+  // Must be outside the transaction: SQLite ignores this pragma within one.
+  if (previous) db.exec('PRAGMA foreign_keys = OFF');
+  try {
+    // Outside the inner try: if this throws, there is no transaction to undo.
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      fn();
+      db.exec('COMMIT');
+    } catch (error) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // Already rolled back by SQLite; the original error is the useful one.
+      }
+      throw error;
+    }
+  } finally {
+    if (previous) db.exec('PRAGMA foreign_keys = ON');
+  }
+}
+
+/**
+ * Finish or discard a rebuild that died partway, from before rebuilds were
+ * atomic.
+ *
+ * Which of the two is right depends entirely on whether the original table is
+ * still there, and getting it backwards destroys the ledger:
+ *
+ * - Both tables present — the copy never replaced the original, so the original
+ *   is authoritative and the `_v2` is a leftover. Drop it.
+ * - Only `_v2` present — the drop succeeded and the rename did not, so `_v2`
+ *   holds the *only* copy of the data. Finish the rename. Deleting it here
+ *   would throw away every intent the user has.
+ */
+function recoverInterruptedRebuild(db: Database, table: string): void {
+  const staging = `${table}_v2`;
+  if (!tableExists(db, staging)) return;
+
+  if (tableExists(db, table)) {
+    db.exec(`DROP TABLE ${staging}`);
+  } else {
+    db.exec(`ALTER TABLE ${staging} RENAME TO ${table}`);
+  }
+}
+
 export function runMigrations(db: Database): void {
+  // Before anything reads the schema. A ledger left mid-rebuild may have no
+  // `intents` table at all, and every migration below assumes there is one.
+  recoverInterruptedRebuild(db, 'intents');
+  recoverInterruptedRebuild(db, 'intent_targets');
+
   // Migration 1: add reverses_intent_id column to intents
   const intentCols = db.prepare(`PRAGMA table_info(intents)`).all() as Array<{ name: string }>;
   const intentColNames = intentCols.map((c) => c.name);
@@ -64,7 +147,7 @@ export function runMigrations(db: Database): void {
     .get() as { sql: string } | undefined;
 
   if (targetsSql && !/PRIMARY KEY \(intent_id, account_id, mailbox, uid\)/.test(targetsSql.sql)) {
-    db.exec(`
+    rebuildTable(db, () => db.exec(`
       CREATE TABLE intent_targets_v2 (
         intent_id         TEXT    NOT NULL REFERENCES intents(id),
         account_id        TEXT    NOT NULL,
@@ -82,7 +165,7 @@ export function runMigrations(db: Database): void {
 
       DROP TABLE intent_targets;
       ALTER TABLE intent_targets_v2 RENAME TO intent_targets;
-    `);
+    `));
   }
 
   // Migration 7: record the mailbox generation a UID was captured in.
@@ -129,7 +212,7 @@ export function runMigrations(db: Database): void {
     .get() as { sql: string } | undefined;
 
   if (intentsSql && !/'queued'/.test(intentsSql.sql)) {
-    db.exec(`
+    rebuildTable(db, () => db.exec(`
       CREATE TABLE intents_v2 (
         id TEXT PRIMARY KEY,
         account_id TEXT NOT NULL,
@@ -166,7 +249,7 @@ export function runMigrations(db: Database): void {
 
       DROP TABLE intents;
       ALTER TABLE intents_v2 RENAME TO intents;
-    `);
+    `));
   }
 
   // Partial index: the worker's claim query only ever looks at live work, and
