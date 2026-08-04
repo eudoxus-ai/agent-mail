@@ -115,4 +115,66 @@ export function runMigrations(db: Database): void {
   if (!targetColsV3.map((c) => c.name).includes('destination_uidvalidity')) {
     db.exec(`ALTER TABLE intent_targets ADD COLUMN destination_uidvalidity INTEGER`);
   }
+
+  // Migration 9: the ledger becomes the queue.
+  //
+  // Adds the `queued` status and the four claim columns. SQLite cannot ALTER a
+  // CHECK constraint, so this rebuilds `intents` the way migration 6 rebuilt
+  // `intent_targets`. Every column added by an earlier migration —
+  // reverses_intent_id, reversed_by_intent_id, progress — has to be carried
+  // across by name; a rebuild that quietly drops one breaks undo links and
+  // progress reporting without failing anything.
+  const intentsSql = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'intents'`)
+    .get() as { sql: string } | undefined;
+
+  if (intentsSql && !/'queued'/.test(intentsSql.sql)) {
+    db.exec(`
+      CREATE TABLE intents_v2 (
+        id TEXT PRIMARY KEY,
+        account_id TEXT NOT NULL,
+        tool TEXT NOT NULL,
+        params JSON NOT NULL,
+        risk TEXT NOT NULL CHECK (risk IN ('none', 'low', 'medium', 'high')),
+        status TEXT NOT NULL DEFAULT 'pending'
+          CHECK (status IN ('pending', 'queued', 'approved', 'executing', 'executed', 'rejected', 'failed', 'undone')),
+        error_detail JSON,
+        agent_id TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        resolved_at DATETIME,
+        resolved_by TEXT,
+        undo_token TEXT,
+        undo_expires_at DATETIME,
+        reverses_intent_id JSON,
+        reversed_by_intent_id TEXT,
+        progress JSON,
+        claimed_by TEXT,
+        claimed_at DATETIME,
+        lease_expires_at DATETIME,
+        attempts INTEGER NOT NULL DEFAULT 0
+      );
+
+      INSERT INTO intents_v2
+        (id, account_id, tool, params, risk, status, error_detail, agent_id,
+         created_at, resolved_at, resolved_by, undo_token, undo_expires_at,
+         reverses_intent_id, reversed_by_intent_id, progress)
+      SELECT
+         id, account_id, tool, params, risk, status, error_detail, agent_id,
+         created_at, resolved_at, resolved_by, undo_token, undo_expires_at,
+         reverses_intent_id, reversed_by_intent_id, progress
+      FROM intents;
+
+      DROP TABLE intents;
+      ALTER TABLE intents_v2 RENAME TO intents;
+    `);
+  }
+
+  // Partial index: the worker's claim query only ever looks at live work, and
+  // the ledger is mostly terminal rows. Created after the rebuild because
+  // DROP TABLE takes its indexes with it.
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_intents_queued
+      ON intents(status, created_at)
+      WHERE status IN ('queued', 'executing')
+  `);
 }

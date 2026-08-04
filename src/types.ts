@@ -25,6 +25,8 @@ export type RiskLevel = 'none' | 'low' | 'medium' | 'high';
 export type GateType = 'ungated' | 'configurable' | 'always_gated';
 export type IntentStatus =
   | 'pending'
+  /** Accepted and durable, waiting for a worker to claim it. */
+  | 'queued'
   | 'approved'
   | 'executing'
   | 'executed'
