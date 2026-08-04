@@ -1639,6 +1639,8 @@ export class Executor {
           mailbox: string;
           subject: string;
           from: string;
+          /** Undefined on a dry run, or if the snapshot call failed. */
+          uidvalidity?: number;
         }> = [];
 
         const holding = await imap.getMailboxPath('holding');
@@ -1647,6 +1649,21 @@ export class Executor {
         const combinedUidMap = new Map<number, number>();
 
         for (const [mailbox, uids] of byMailbox) {
+          // The generation these UIDs belong to. Captured before the move, in
+          // the same borrow, so it describes the mailbox the UIDs were read
+          // from rather than whatever it may become later.
+          let uidvalidity: number | undefined;
+          if (!dryRun) {
+            try {
+              uidvalidity = (await imap.mailboxSnapshot(mailbox)).uidValidity;
+            } catch {
+              // A snapshot failure must not block the hold. The target is
+              // recorded without a generation and is treated as pre-migration
+              // at replay time — degraded, not broken.
+              uidvalidity = undefined;
+            }
+          }
+
           if (includeSummary || !dryRun) {
             const envs = await imap.fetchEnvelopes(mailbox, uids);
             for (const env of envs) {
@@ -1656,6 +1673,7 @@ export class Executor {
                 mailbox,
                 subject: env.subject,
                 from: env.from.address,
+                uidvalidity,
               });
             }
           }
@@ -1677,6 +1695,7 @@ export class Executor {
                   account_id: e.account_id,
                   uid: e.uid,
                   mailbox: e.mailbox,
+                  uidvalidity: e.uidvalidity,
                   envelope_snapshot: {
                     subject: e.subject,
                     from: e.from,
