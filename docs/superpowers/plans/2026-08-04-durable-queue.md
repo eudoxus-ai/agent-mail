@@ -273,38 +273,52 @@ This is already latent — `undo_intent` and `restore_messages` replay recorded 
 
 The bar: **a user must never believe they filed fifty holds and have filed none.**
 
-### Task 4.1: Worker heartbeat record
+### Task 4.1: Worker heartbeat record — **done**
 
-- [ ] **Step 1: Write the failing test** — `test/ledger/queue.test.ts`
+- [x] **Step 1: Write the failing test** — `test/ledger/queue.test.ts`
   - `recordWorkerHeartbeat` writes worker id, pid, and timestamp.
   - `isWorkerAlive(db, staleAfterMs)` is true just after a heartbeat, false once stale, false when none was ever written.
-- [ ] **Step 2: Verify it fails**
-- [ ] **Step 3: Implement** — migration 10 adds a single-row `worker_heartbeat` table; helpers in `src/ledger/worker-heartbeat.ts`. Daemon heartbeats every 15s; stale after 60s.
-- [ ] **Step 4: Verify PASS**
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Verify it fails**
+- [x] **Step 3: Implement** — migration 10 adds a single-row `worker_heartbeat` table; helpers in `src/ledger/worker-heartbeat.ts`. Daemon heartbeats every 15s; stale after 60s.
+- [x] **Step 4: Verify PASS**
+- [x] **Step 5: Commit**
 
-### Task 4.2: Say so in every affected surface
+### Task 4.2: Say so in every affected surface — **done** (two of three)
 
-- [ ] **Step 1: Write the failing tests** — `test/server/daemon-down.test.ts`
+> **The queued-mutation response is deferred to Task 5.1**, where the enqueue
+> path is actually born. Today's background path runs inside the MCP process, so
+> the daemon is not required for it — stamping `daemon_running: false` on that
+> response would be plainly wrong. `describeWorkerState` exists and is shared;
+> 5.1 attaches it to the response it creates.
+>
+> Tests live in `test/executor/daemon-down.test.ts`, not `test/server/`:
+> `get_intent` and `get_diagnostics` are executor surfaces.
+
+- [x] **Step 1: Write the failing tests** — `test/server/daemon-down.test.ts`
   - With no live worker, a queued mutation response includes `daemon_running: false` and a `warning` naming the fix (`agent-mail install-daemon`).
   - With a live worker, neither field is present.
   - `get_intent` on a `queued` intent reports the same when the worker is down.
   - `get_diagnostics` leads with it: `worker.alive: false` plus `queued_count` and `oldest_queued_age_seconds`.
-- [ ] **Step 2: Verify they fail**
-- [ ] **Step 3: Implement** — a shared `describeWorkerState(db)` used by all three, so the wording cannot drift between them.
-- [ ] **Step 4: Verify PASS**
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Verify they fail**
+- [x] **Step 3: Implement** — a shared `describeWorkerState(db)` used by all three, so the wording cannot drift between them.
+- [x] **Step 4: Verify PASS**
+- [x] **Step 5: Commit**
 
-### Task 4.3: CLI and startup
+### Task 4.3: CLI and startup — **done**
 
-- [ ] **Step 1: Write the failing test** — `agent-mail status` prints a worker-down banner *before* anything else when the worker is stale and work is queued.
-- [ ] **Step 2: Verify it fails**
-- [ ] **Step 3: Implement**
+> The banner prints *before* the launchd check, not after. `agent-mail status`
+> returns early with "Daemon: not installed" when the plist is missing — which
+> is exactly the case where a user most needs to be told their queue is going
+> nowhere, and the least likely place to look for it.
+
+- [x] **Step 1: Write the failing test** — `agent-mail status` prints a worker-down banner *before* anything else when the worker is stale and work is queued.
+- [x] **Step 2: Verify it fails**
+- [x] **Step 3: Implement**
   - `daemonStatus()` leads with the banner.
   - MCP server logs at **error** level on startup when no live worker is found — not warn.
   - Server preamble gains one line: if a mutation stays `queued`, call `get_diagnostics`.
-- [ ] **Step 4: Verify PASS**
-- [ ] **Step 5: Commit**
+- [x] **Step 4: Verify PASS**
+- [x] **Step 5: Commit**
 
 ---
 

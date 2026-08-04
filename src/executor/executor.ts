@@ -38,6 +38,11 @@ import {
 } from '../ledger/intent-targets.js';
 import { updateIntentProgress, getIntentProgress } from '../ledger/intents.js';
 import { checkStuckExecuting } from '../ledger/db.js';
+import {
+  describeWorkerState,
+  INSTALL_HINT,
+  type WorkerState,
+} from '../ledger/worker-heartbeat.js';
 import { decodeCursor, encodeCursor, type SearchCursor } from '../lib/search-cursor.js';
 import { projectResult } from '../lib/envelope-projection.js';
 import { searchCache, countByAccount } from '../cache/query.js';
@@ -1185,7 +1190,13 @@ export class Executor {
     const busy = pool.accounts.filter((a) => a.in_flight !== null);
     const queued = pool.accounts.filter((a) => a.queue_depth > 0);
 
+    const worker = describeWorkerState(this.db);
+
     return {
+      // First, deliberately. Nothing else in here matters if the thing that
+      // performs queued work is not running, and burying it under connection
+      // statistics is exactly how that gets missed.
+      worker,
       generated_at: new Date().toISOString(),
       runtime: {
         node: process.version,
@@ -1213,6 +1224,7 @@ export class Executor {
         stuckCount: stuck.length,
         longestElapsedMs: Math.max(0, ...busy.map((a) => a.in_flight!.elapsed_ms)),
         timeoutMs: pool.operation_timeout_ms,
+        worker,
       }),
     };
   }
@@ -1716,6 +1728,17 @@ export class Executor {
       };
       if (links.reverses.length > 0) payload.reverses_intent_id = links.reverses;
       if (links.reversed_by) payload.reversed_by_intent_id = links.reversed_by;
+
+      // Only for work still waiting. A poller asking about a queued intent is
+      // asking "why has this not happened yet", and a stopped daemon is the
+      // answer. Saying it on an intent that already finished would train the
+      // reader to skip past it.
+      if (row.status === 'queued') {
+        const worker = describeWorkerState(this.db);
+        payload.daemon_running = worker.alive;
+        if (worker.warning) payload.warning = worker.warning;
+      }
+
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
 
@@ -2353,7 +2376,20 @@ function buildInterpretation(input: {
   stuckCount: number;
   longestElapsedMs: number;
   timeoutMs: number;
+  worker: WorkerState;
 }): string {
+  // Ahead of everything else, but only when it is actually the explanation:
+  // work is waiting and nothing is there to do it. A stopped daemon with an
+  // empty queue is worth reporting in the `worker` block and is not the cause
+  // of anything, and blaming it there would send people chasing it every time.
+  if (!input.worker.alive && input.worker.queued_count > 0) {
+    const waited = input.worker.oldest_queued_age_seconds ?? 0;
+    return (
+      `${input.worker.queued_count} action(s) are queued and nothing is running them — ` +
+      `the daemon is not running (oldest has waited ${waited}s). ` +
+      `Nothing has been lost; it will drain once the daemon starts. ${INSTALL_HINT}`
+    );
+  }
   if (input.busyCount === 0 && input.stuckCount === 0) {
     return 'Idle. No IMAP operation in flight and nothing mid-execution.';
   }

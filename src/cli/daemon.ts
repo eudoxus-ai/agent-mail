@@ -208,6 +208,15 @@ export function uninstallDaemon(): void {
 }
 
 export async function daemonStatus(): Promise<void> {
+  // First, before the launchd check and before its early return.
+  //
+  // "Daemon: not installed" reads like a note about setup; it does not say
+  // that accepted work is piling up unperformed. Someone running this command
+  // is usually already wondering why nothing happened, and the answer has to be
+  // the first thing on the screen rather than something below three sections of
+  // healthy-looking output.
+  await printWorkerBanner();
+
   if (!existsSync(PLIST_PATH)) {
     console.log('Daemon: not installed');
     return;
@@ -265,6 +274,26 @@ export async function daemonStatus(): Promise<void> {
   }
 
   await printCacheStatus();
+}
+
+/**
+ * Print the queue-is-going-nowhere banner, if there is one to print.
+ *
+ * Best-effort: a locked or missing ledger means we cannot tell, and failing to
+ * report a problem must not turn `status` into a command that errors out.
+ */
+async function printWorkerBanner(): Promise<void> {
+  if (!existsSync(LEDGER_DB_PATH)) return;
+  try {
+    const { openDatabase } = await import('../ledger/db.js');
+    const { describeWorkerState } = await import('../ledger/worker-heartbeat.js');
+    const { buildWorkerBanner } = await import('./worker-banner.js');
+
+    const banner = buildWorkerBanner(describeWorkerState(openDatabase()));
+    if (banner) console.log(`${banner}\n`);
+  } catch {
+    // Cannot read the ledger — say nothing rather than fail the command.
+  }
 }
 
 /**
