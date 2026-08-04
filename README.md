@@ -414,11 +414,31 @@ cache:
   mode: shadow    # off (default) | shadow | on
 ```
 
-- **`off`** — the cache is never read. The daemon still syncs it in the background, so it warms up.
-- **`shadow`** — every search runs against both the cache and IMAP. IMAP's answer is what you get; the two are compared and any difference is logged to `~/.agent-mail/agent-mail.log`. Run here for a few days first.
+- **`off`** (default) — the cache is neither read nor written. The daemon does **not** sync it, so nothing warms up in the background; there is no cache until you pick another mode.
+- **`shadow`** — the daemon syncs, and every search runs against both the cache and IMAP. IMAP's answer is what you get; the two are compared and any difference is logged to `~/.agent-mail/agent-mail.log`. Run here for a few days first.
 - **`on`** — searches are served from the cache, falling back to IMAP when the cache is stale or a mailbox hasn't finished backfilling.
 
 Shadow mode exists because the failure that matters for a mail cache is silently *missing* a message. Watch the log for `cache: shadow divergence` before switching to `on`.
+
+Restart the daemon after changing the file — the mode is read at startup:
+
+```bash
+./bin/agent-mail.mjs install-daemon   # reinstalls and restarts
+./bin/agent-mail.mjs status           # shows cache state and coverage
+```
+
+### The cache also fixes sender sweeps
+
+`hold_by_sender` matches via the IMAP server's `SEARCH FROM`, and that search has been observed to miss — a long sender address returned nothing while ten messages from it sat in the inbox. The cache stores the address parsed out of the IMAP ENVELOPE and matches it locally, so once it is on (`shadow` or `on`), every sender sweep cross-checks the server's result against it and **holds anything the server missed**, reporting what it recovered:
+
+```json
+{
+  "cache_cross_check": { "checked": true, "recovered": 10 },
+  "warning": "The IMAP server's FROM search missed 10 message(s) that the local cache found; they were included in this hold."
+}
+```
+
+The relationship is one-way on purpose. The cache has a backfill floor and a sync interval, so it under-reports in its own way — a cache hit the server missed is evidence, but a cache miss proves nothing. So it only ever *adds* messages to a sweep, never removes them, and cached UIDs from a stale `UIDVALIDITY` are discarded rather than acted on. With the cache off, sweeps behave exactly as before and the response carries no `cache_cross_check` at all.
 
 ### The daemon does the syncing
 

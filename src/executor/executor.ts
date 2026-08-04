@@ -376,6 +376,78 @@ export class Executor {
   }
 
   /**
+   * Find messages from this sender that the server's FROM search did not return.
+   *
+   * The match in `hold_by_sender` is performed by the IMAP server, and it has
+   * been observed to miss — a long sender address returned nothing while ten
+   * messages from it sat in the inbox. The local cache stores the address
+   * parsed out of the IMAP ENVELOPE and matches it with a plain LIKE, so it can
+   * find what the server's index did not.
+   *
+   * Strictly one-way. The cache has a backfill floor and a sync interval, so it
+   * under-reports in its own way: a cache hit the server missed is evidence,
+   * but a cache miss proves nothing. So this only ever adds UIDs to a sweep —
+   * letting it subtract would turn its coverage gaps into silently missed
+   * holds, which is the bug being fixed, relocated.
+   */
+  private async recoverMissedBySender(args: {
+    accountId: string;
+    mailbox: string;
+    from: string;
+    before?: Date;
+    limit: number;
+    alreadyFound: number[];
+    imap: { mailboxSnapshot(mailbox: string): Promise<{ uidValidity: number }> };
+  }): Promise<{ uids: number[]; checked: boolean; reason?: string }> {
+    // `no cache` is distinct from an unusable one: with no cache configured
+    // there is nothing to report, whereas an unusable cache means the
+    // cross-check did not happen and the caller should not read completeness
+    // into the result.
+    if (!this.cache) return { uids: [], checked: false, reason: 'no cache' };
+    if (this.cacheConfig.mode === 'off') {
+      return { uids: [], checked: false, reason: 'cache mode is off' };
+    }
+
+    const attempt = this.readFromCache({
+      accountIds: [args.accountId],
+      mailbox: args.mailbox,
+      from: args.from,
+      before: args.before,
+      limit: args.limit,
+    });
+    if (!attempt) return { uids: [], checked: false, reason: 'cache read failed' };
+    if (!attempt.servable) {
+      return { uids: [], checked: false, reason: `cache ${attempt.coverage.state}` };
+    }
+
+    const found = new Set(args.alreadyFound);
+    const candidates = attempt.rows.filter((row) => !found.has(row.uid));
+    if (candidates.length === 0) return { uids: [], checked: true };
+
+    // A cached UID is only meaningful in the generation it was cached in. The
+    // snapshot costs a round trip, so it is only taken when there is something
+    // to validate.
+    let current: number;
+    try {
+      current = (await args.imap.mailboxSnapshot(args.mailbox)).uidValidity;
+    } catch {
+      // Cannot prove the UIDs are current, so do not act on them. Under-holding
+      // is recoverable; moving the wrong messages is not.
+      return { uids: [], checked: false, reason: 'could not read mailbox generation' };
+    }
+
+    const usable = candidates.filter((row) => row.uidvalidity === current);
+    if (usable.length < candidates.length) {
+      this.logger.warn('cache: ignoring sender matches from a stale generation', {
+        account_id: args.accountId,
+        mailbox: args.mailbox,
+        ignored: candidates.length - usable.length,
+      });
+    }
+    return { uids: usable.map((row) => row.uid), checked: true };
+  }
+
+  /**
    * Write the action to the queue and hand back its id. Nothing runs here.
    *
    * Bulk mailbox sweeps over a slow provider can outlast any client's patience,
@@ -2047,17 +2119,48 @@ export class Executor {
       pool: this.pool,
       accountIds: targetIds,
       label: 'hold_by_sender:search',
-      fn: async (_accountId, imap) => {
+      fn: async (accountId, imap) => {
         const rows = await imap.search(mailbox, criteria, limit);
-        return rows.map((r) => r.uid);
+        const uids = rows.map((r) => r.uid);
+        const recovered = await this.recoverMissedBySender({
+          accountId,
+          mailbox,
+          from,
+          before: criteria.before,
+          limit,
+          alreadyFound: uids,
+          imap,
+        });
+        return { uids, recovered };
       },
     });
 
     const expandedTargets: Target[] = [];
+    let crossCheck: { checked: boolean; recovered: number; reason?: string } | undefined;
+
     for (const accountId of searchResult.accounts_searched) {
-      const uids = searchResult.per_account[accountId] ?? [];
-      for (const uid of uids) {
+      const leg = searchResult.per_account[accountId] as
+        | { uids: number[]; recovered: { uids: number[]; checked: boolean; reason?: string } }
+        | undefined;
+      if (!leg) continue;
+
+      for (const uid of leg.uids) {
         expandedTargets.push({ account_id: accountId, uid, mailbox });
+      }
+      // Recovered UIDs are added, never substituted. The cache can only ever
+      // grow a sweep — see recoverMissedBySender for why that direction is the
+      // only safe one.
+      for (const uid of leg.recovered.uids) {
+        expandedTargets.push({ account_id: accountId, uid, mailbox });
+      }
+
+      if (leg.recovered.reason !== 'no cache') {
+        crossCheck = {
+          checked: (crossCheck?.checked ?? false) || leg.recovered.checked,
+          recovered: (crossCheck?.recovered ?? 0) + leg.recovered.uids.length,
+          reason: crossCheck?.reason ?? leg.recovered.reason,
+        };
+        if (crossCheck.checked) delete crossCheck.reason;
       }
     }
 
@@ -2146,15 +2249,28 @@ export class Executor {
         }
       }
 
+      // If the cache could not be consulted, say so rather than letting the
+      // zero read as verified. An unchecked zero and a cross-checked zero are
+      // very different claims.
+      const cacheNote = !crossCheck
+        ? ''
+        : crossCheck.checked
+          ? ' The local cache was cross-checked and found nothing either, so this is a ' +
+            'real zero rather than a search that missed.'
+          : ` The local cache could NOT be cross-checked (${crossCheck.reason}), so a ` +
+            'server-side search miss has not been ruled out. Enabling the cache would ' +
+            'settle it.';
+
       const diagnosis =
-        unfilteredCount && unfilteredCount > 0
+        (unfilteredCount && unfilteredCount > 0
           ? `The server matched ${unfilteredCount} message(s) from this sender, but all of ` +
             `them are at or after before=${before}, so none were eligible. Widen or drop ` +
             '`before`.'
           : `No message in ${mailbox} matched from="${from}". The match is performed by the ` +
             'IMAP server, not locally, and it is a substring match on the From header. If ' +
             'you can see messages from this sender, try a shorter distinctive substring ' +
-            '(the domain alone, say) — long addresses have been observed not to match.';
+            '(the domain alone, say) — long addresses have been observed not to match.') +
+        cacheNote;
 
       // Queued sweeps never return this payload to anyone: the caller gets an
       // id and polls get_intent, which shows status and targets. Recording the
@@ -2172,6 +2288,7 @@ export class Executor {
         matched: 0;
         searched: { from: string; mailbox: string; before?: string };
         diagnosis: string;
+        cache_cross_check?: { checked: boolean; recovered: number; reason?: string };
         accounts_searched: string[];
         accounts_available: string[];
         per_account_errors?: Record<string, string>;
@@ -2184,6 +2301,7 @@ export class Executor {
         matched: 0,
         searched: { from, mailbox, ...(before ? { before } : {}) },
         diagnosis,
+        ...(crossCheck ? { cache_cross_check: crossCheck } : {}),
         accounts_searched: searchResult.accounts_searched,
         accounts_available: allIds,
         dry_run: dryRun,
@@ -2202,17 +2320,31 @@ export class Executor {
       includeSummary,
     });
 
+    const hasSearchErrors = Object.keys(searchResult.errors).length > 0;
+    if (!hasSearchErrors && !crossCheck) return result;
+
+    const parsed = JSON.parse(result[0].text);
     // Merge search-time per_account_errors so the caller sees both search
     // failures and move failures in one place.
-    if (Object.keys(searchResult.errors).length > 0) {
-      const parsed = JSON.parse(result[0].text);
+    if (hasSearchErrors) {
       parsed.per_account_errors = {
         ...(parsed.per_account_errors ?? {}),
         ...searchResult.errors,
       };
-      return [{ type: 'text', text: JSON.stringify(parsed, null, 2) }];
     }
-    return result;
+    if (crossCheck) {
+      parsed.cache_cross_check = crossCheck;
+      if (crossCheck.recovered > 0) {
+        // Named loudly rather than quietly absorbed: if this is silently
+        // papered over, every dry_run preview still under-reports and nobody
+        // learns the server's FROM search cannot be trusted for this sender.
+        parsed.warning =
+          `The IMAP server's FROM search missed ${crossCheck.recovered} message(s) that the ` +
+          'local cache found; they were included in this hold. Treat server-side FROM ' +
+          'counts for this sender as a floor, not a total.';
+      }
+    }
+    return [{ type: 'text', text: JSON.stringify(parsed, null, 2) }];
   }
 
   private async performUndo(
