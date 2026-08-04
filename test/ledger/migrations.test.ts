@@ -3,12 +3,21 @@ import { openDatabase } from '../../src/ledger/db.js';
 import { runMigrations } from '../../src/ledger/migrations.js';
 
 describe('ledger schema v3', () => {
-  it('has intent_targets table with envelope_snapshot and destination_uid columns', () => {
+  it('has intent_targets table with envelope_snapshot, destination_uid and uidvalidity', () => {
     const db = openDatabase(':memory:');
     const cols = db.prepare(`PRAGMA table_info(intent_targets)`).all() as Array<{ name: string }>;
     const names = cols.map((c) => c.name).sort();
     expect(names).toEqual(
-      ['intent_id', 'account_id', 'uid', 'mailbox', 'envelope_snapshot', 'destination_uid'].sort()
+      [
+        'intent_id',
+        'account_id',
+        'uid',
+        'mailbox',
+        'envelope_snapshot',
+        'destination_uid',
+        // A UID is meaningless without the mailbox generation it came from.
+        'uidvalidity',
+      ].sort()
     );
   });
 

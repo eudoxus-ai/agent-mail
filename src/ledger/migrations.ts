@@ -84,4 +84,19 @@ export function runMigrations(db: Database): void {
       ALTER TABLE intent_targets_v2 RENAME TO intent_targets;
     `);
   }
+
+  // Migration 7: record the mailbox generation a UID was captured in.
+  //
+  // IMAP UIDs are meaningful only within a (mailbox, UIDVALIDITY) pair. Every
+  // replay path — restore_messages, undo_intent, and a durable queue's
+  // at-least-once retry — moves mail by recorded UID, so replaying across a
+  // generation boundary would move messages the user never selected. Nullable
+  // on purpose: rows written before this migration have no generation and must
+  // stay usable, or undo breaks for everything already in the ledger.
+  const targetColsV2 = db
+    .prepare(`PRAGMA table_info(intent_targets)`)
+    .all() as Array<{ name: string }>;
+  if (!targetColsV2.map((c) => c.name).includes('uidvalidity')) {
+    db.exec(`ALTER TABLE intent_targets ADD COLUMN uidvalidity INTEGER`);
+  }
 }
