@@ -2,13 +2,15 @@ import { z } from 'zod';
 import type { ToolDefinition } from '../types.js';
 
 const description =
-  'Hold ALL messages from a given sender address (optionally bounded by `before`). Reversible for 30 days via restore_messages or undo_intent. Use for "clean out newsletter X" style triage — prefer hold_messages when you already have specific UIDs. Supports dry_run and include_summary.';
+  'Hold ALL messages from a given sender address (optionally bounded by `before`). Reversible for 30 days via restore_messages or undo_intent. Use for "clean out newsletter X" style triage — prefer hold_messages when you already have specific UIDs. Supports dry_run and include_summary. IMPORTANT: matching nothing is not the same as sweeping clean. A sweep that matched no messages returns status "no_match" with matched: 0 and a diagnosis (queued sweeps report phase "no_match" via get_intent). Do NOT report a sender as cleared on a no_match — the FROM match is done by the IMAP server as a substring match and can miss, so verify with search_threads before concluding the mailbox is clean.';
 
 const inputSchema = z.object({
   from: z
     .string()
     .min(1)
-    .describe('Sender email address (or substring match per IMAP SEARCH FROM).'),
+    .describe(
+      'Sender email address, or a substring of it. Matching is performed by the IMAP server via SEARCH FROM, not locally — a substring like the domain matches every subdomain that contains it, and very long full addresses have been observed to match nothing at all. If a sweep returns no_match but you can see messages from the sender, retry with a shorter distinctive substring.'
+    ),
   before: z
     .string()
     .optional()

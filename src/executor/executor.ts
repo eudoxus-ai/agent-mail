@@ -2113,7 +2113,65 @@ export class Executor {
     }
 
     if (expandedTargets.length === 0) {
+      // Matching nothing must not look like sweeping clean.
+      //
+      // This returned `executed` with an empty target list, which reads as "no
+      // messages from that sender" — and in the reported case ten of them were
+      // sitting in the inbox. Two very different things produce zero and they
+      // have opposite fixes, so the payload has to say which:
+      //
+      //   - the server's FROM search matched nothing (try a different or
+      //     shorter substring; the match happens server-side and long
+      //     addresses have been seen to miss), or
+      //   - it matched, and our own `before` cursor filtered every hit away.
+      //
+      // The second is only worth a round trip when a cursor was actually given.
+      let unfilteredCount: number | null = null;
+      if (before) {
+        try {
+          const probe = await fanOut({
+            pool: this.pool,
+            accountIds: targetIds,
+            label: 'hold_by_sender:no-match-probe',
+            fn: async (_accountId, imap) => (await imap.searchUids(mailbox, { from })).length,
+          });
+          unfilteredCount = Object.values(probe.per_account).reduce<number>(
+            (sum, n) => sum + (typeof n === 'number' ? n : 0),
+            0
+          );
+        } catch {
+          // A diagnostic that can fail the operation it is diagnosing is worse
+          // than no diagnostic.
+          unfilteredCount = null;
+        }
+      }
+
+      const diagnosis =
+        unfilteredCount && unfilteredCount > 0
+          ? `The server matched ${unfilteredCount} message(s) from this sender, but all of ` +
+            `them are at or after before=${before}, so none were eligible. Widen or drop ` +
+            '`before`.'
+          : `No message in ${mailbox} matched from="${from}". The match is performed by the ` +
+            'IMAP server, not locally, and it is a substring match on the From header. If ' +
+            'you can see messages from this sender, try a shorter distinctive substring ' +
+            '(the domain alone, say) — long addresses have been observed not to match.';
+
+      // Queued sweeps never return this payload to anyone: the caller gets an
+      // id and polls get_intent, which shows status and targets. Recording the
+      // outcome is the only way a zero match is visible on that path at all.
+      updateIntentProgress(this.db, intent.id, 'no_match', {
+        from,
+        mailbox,
+        before,
+        matched: 0,
+        server_matched_ignoring_before: unfilteredCount,
+      });
+
       const payload: {
+        status: 'no_match';
+        matched: 0;
+        searched: { from: string; mailbox: string; before?: string };
+        diagnosis: string;
         accounts_searched: string[];
         accounts_available: string[];
         per_account_errors?: Record<string, string>;
@@ -2122,6 +2180,10 @@ export class Executor {
         per_account: unknown[];
         moved?: unknown[];
       } = {
+        status: 'no_match',
+        matched: 0,
+        searched: { from, mailbox, ...(before ? { before } : {}) },
+        diagnosis,
         accounts_searched: searchResult.accounts_searched,
         accounts_available: allIds,
         dry_run: dryRun,
