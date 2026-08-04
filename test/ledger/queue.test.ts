@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { openDatabase } from '../../src/ledger/db.js';
 import { runMigrations } from '../../src/ledger/migrations.js';
 import { DatabaseSync, type Database } from '../../src/ledger/sqlite.js';
+import { claimNext } from '../../src/ledger/queue.js';
 
 /**
  * The ledger becomes the queue.
@@ -99,6 +100,103 @@ describe('claim columns', () => {
       .get() as { claimed_by: string | null; lease_expires_at: string | null };
     expect(row.claimed_by).toBeNull();
     expect(row.lease_expires_at).toBeNull();
+  });
+});
+
+/**
+ * The claim is the whole safety story: it is the one operation that decides
+ * who runs a job, and getting it wrong means either a job runs twice or it
+ * never runs at all.
+ */
+describe('claimNext', () => {
+  /** Distinct created_at values, so "oldest first" means something. */
+  function queue(id: string, accountId = 'icloud', createdAt?: string): void {
+    db.prepare(
+      `INSERT INTO intents (id, account_id, tool, params, risk, status, created_at)
+       VALUES (?, ?, 'hold_by_sender', '{}', 'medium', 'queued', ?)`
+    ).run(id, accountId, createdAt ?? new Date().toISOString());
+  }
+
+  it('returns null when nothing is queued', () => {
+    expect(claimNext(db, 'worker-1', 60_000)).toBeNull();
+  });
+
+  it('claims the oldest queued intent and flips it to executing', () => {
+    queue('newer', 'icloud', '2026-08-04T12:00:02.000Z');
+    queue('older', 'icloud', '2026-08-04T12:00:01.000Z');
+
+    const claimed = claimNext(db, 'worker-1', 60_000);
+
+    expect(claimed?.id).toBe('older');
+    expect(claimed?.status).toBe('executing');
+  });
+
+  it('records the claim and counts the attempt', () => {
+    queue('a');
+    const before = Date.now();
+
+    const claimed = claimNext(db, 'worker-1', 60_000)!;
+
+    expect(claimed.claimed_by).toBe('worker-1');
+    expect(claimed.attempts).toBe(1);
+    expect(claimed.claimed_at).not.toBeNull();
+    // The lease has to be in the future by roughly the requested window, or
+    // reclaim will yank the job out from under the worker that just took it.
+    const expiry = new Date(claimed.lease_expires_at!).getTime();
+    expect(expiry).toBeGreaterThanOrEqual(before + 60_000);
+    expect(expiry).toBeLessThan(before + 70_000);
+  });
+
+  it('leaves the rest of the queue alone', () => {
+    queue('a', 'icloud', '2026-08-04T12:00:01.000Z');
+    queue('b', 'icloud', '2026-08-04T12:00:02.000Z');
+
+    claimNext(db, 'worker-1', 60_000);
+
+    const row = db.prepare(`SELECT status FROM intents WHERE id = 'b'`).get() as {
+      status: string;
+    };
+    expect(row.status).toBe('queued');
+  });
+
+  it('does not take a second job for an account that already has one running', () => {
+    // Per-account IMAP serialization means a second concurrent job on the same
+    // account cannot make progress — it would just hold a lease while blocked
+    // behind the first, and the lease would expire mid-wait.
+    queue('a', 'icloud', '2026-08-04T12:00:01.000Z');
+    queue('b', 'icloud', '2026-08-04T12:00:02.000Z');
+
+    expect(claimNext(db, 'worker-1', 60_000)?.id).toBe('a');
+    expect(claimNext(db, 'worker-1', 60_000)).toBeNull();
+  });
+
+  it('still takes work for a different account', () => {
+    queue('a', 'icloud', '2026-08-04T12:00:01.000Z');
+    queue('b', 'gmail', '2026-08-04T12:00:02.000Z');
+
+    expect(claimNext(db, 'worker-1', 60_000)?.id).toBe('a');
+    expect(claimNext(db, 'worker-1', 60_000)?.id).toBe('b');
+  });
+
+  it('is not blocked by a legacy executing intent that nobody claimed', () => {
+    // Intents left `executing` by the old in-process path have no claim and no
+    // lease. Treating them as live would wedge that account's queue forever.
+    db.prepare(
+      `INSERT INTO intents (id, account_id, tool, params, risk, status)
+       VALUES ('orphan', 'icloud', 'hold_by_sender', '{}', 'medium', 'executing')`
+    ).run();
+    queue('a');
+
+    expect(claimNext(db, 'worker-1', 60_000)?.id).toBe('a');
+  });
+
+  it('does not claim work that is merely pending approval', () => {
+    db.prepare(
+      `INSERT INTO intents (id, account_id, tool, params, risk, status)
+       VALUES ('p', 'icloud', 'hold_by_sender', '{}', 'high', 'pending')`
+    ).run();
+
+    expect(claimNext(db, 'worker-1', 60_000)).toBeNull();
   });
 });
 

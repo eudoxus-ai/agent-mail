@@ -77,5 +77,9 @@ export function rowToIntent(row: Record<string, unknown>): Intent {
     resolved_by: (row.resolved_by as string) ?? null,
     undo_token: (row.undo_token as string) ?? null,
     undo_expires_at: (row.undo_expires_at as string) ?? null,
+    claimed_by: (row.claimed_by as string) ?? null,
+    claimed_at: (row.claimed_at as string) ?? null,
+    lease_expires_at: (row.lease_expires_at as string) ?? null,
+    attempts: Number(row.attempts ?? 0),
   };
 }
