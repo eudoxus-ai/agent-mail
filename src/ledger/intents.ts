@@ -177,3 +177,48 @@ export function getReversalLinks(
     reversed_by: row.reversed_by_intent_id ?? null,
   };
 }
+
+export interface IntentProgress {
+  phase: string;
+  detail?: Record<string, unknown>;
+  updated_at: string;
+}
+
+/**
+ * Record what a running action is currently doing.
+ *
+ * Best-effort and deliberately unthrowing: progress reporting must never be
+ * the reason a mail operation fails.
+ */
+export function updateIntentProgress(
+  db: Database,
+  intentId: string,
+  phase: string,
+  detail?: Record<string, unknown>
+): void {
+  try {
+    const progress: IntentProgress = {
+      phase,
+      detail,
+      updated_at: new Date().toISOString(),
+    };
+    db.prepare(`UPDATE intents SET progress = ? WHERE id = ?`).run(
+      JSON.stringify(progress),
+      intentId
+    );
+  } catch {
+    // Never let telemetry break the action it is describing.
+  }
+}
+
+export function getIntentProgress(db: Database, intentId: string): IntentProgress | null {
+  const row = db.prepare(`SELECT progress FROM intents WHERE id = ?`).get(intentId) as
+    | { progress: string | null }
+    | undefined;
+  if (!row?.progress) return null;
+  try {
+    return JSON.parse(row.progress) as IntentProgress;
+  } catch {
+    return null;
+  }
+}

@@ -134,7 +134,12 @@ describe('search_threads multi-account', () => {
     expect(payload.accounts_searched).toEqual(['a@x.com']);
     expect(payload.accounts_available.sort()).toEqual(['a@x.com', 'b@y.com']);
     expect(pool.withConnection).toHaveBeenCalledTimes(1);
-    expect(pool.withConnection).toHaveBeenCalledWith('a@x.com', expect.any(Function));
+    // Third arg labels the borrow so pool diagnostics name the operation.
+    expect(pool.withConnection).toHaveBeenCalledWith(
+      'a@x.com',
+      expect.any(Function),
+      'search_threads'
+    );
   });
 
   it('populates snippet via fetchSnippet when include_snippets: true and snippet is empty', async () => {

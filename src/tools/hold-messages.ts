@@ -13,6 +13,12 @@ const inputSchema = z.object({
     .optional()
     .default(true)
     .describe('Default true: response includes moved[{uid, account_id, subject, from, original_mailbox}]. Set false to skip if you only need UIDs.'),
+  background: z
+    .boolean()
+    .optional()
+    .describe(
+      'Return an intent_id immediately and perform the move in the background instead of waiting for it to finish. Strongly recommended for large sweeps: a client-side timeout on a synchronous call tells you nothing about whether the move happened, and leaves you with no intent_id to undo. Poll get_intent(intent_id) until status is "executed" or "failed". Default false.'
+    ),
 });
 
 export const holdMessagesTool: ToolDefinition = {

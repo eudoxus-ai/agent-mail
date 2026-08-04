@@ -16,11 +16,18 @@ function toParticipants(addrs: Array<{ name?: string | null; address?: string | 
   return (addrs ?? []).map(toParticipant);
 }
 
+export interface ImapProviderOptions {
+  /** Called when the connection dies asynchronously, outside any awaited call. */
+  onError?: (error: Error) => void;
+}
+
 export class ImapProvider {
   private client: ImapFlow;
   private account: ResolvedAccount;
+  private dead = false;
+  private lastError: Error | null = null;
 
-  constructor(account: ResolvedAccount) {
+  constructor(account: ResolvedAccount, options: ImapProviderOptions = {}) {
     this.account = account;
     this.client = new ImapFlow({
       host: account.imap.host,
@@ -31,15 +38,83 @@ export class ImapProvider {
         pass: account.auth.pass,
       },
       logger: false,
+      // Required for the local cache's delta sync. Without it, EXPUNGE
+      // notifications carry sequence numbers instead of UIDs, so
+      // qresyncDelta() cannot tell which cached message was deleted and
+      // deletions would never propagate — messages removed in another client
+      // would linger in the cache indefinitely.
+      qresync: true,
+      // Bound the wait for a server that stops responding. Without these a
+      // half-open connection produces no error and no data — the operation
+      // just never settles, and because pool borrows are serialized that
+      // wedges the whole account. These make it surface as an error the pool
+      // can act on.
+      connectionTimeout: 30_000,
+      greetingTimeout: 30_000,
+      // Generous: a large SEARCH or MOVE on a slow provider is legitimately
+      // quiet for a while, so this is only meant to catch a truly dead socket.
+      socketTimeout: 5 * 60_000,
     });
+
+    // ImapFlow is an EventEmitter, and Node throws on an 'error' event with no
+    // registered listener — an uncaught exception that kills the process.
+    //
+    // A pooled connection sitting idle gets its TLS socket reset routinely
+    // (iCloud in particular). That arrives asynchronously, outside any awaited
+    // call, so withConnection's try/catch never sees it. Without this listener
+    // a routine ECONNRESET takes down the whole MCP server mid-request: the
+    // client waits forever for a response that no longer has a process to come
+    // from, and any IMAP work already committed stays committed.
+    this.client.on('error', (error: Error) => {
+      this.dead = true;
+      this.lastError = error;
+      options.onError?.(error);
+    });
+
+    // A clean server-side close is equally fatal to reuse, just not an error.
+    this.client.on('close', () => {
+      this.dead = true;
+    });
+  }
+
+  /** True once the connection has errored or closed; the pool must not reuse it. */
+  isDead(): boolean {
+    return this.dead;
+  }
+
+  /** The error that killed the connection, for logging. */
+  getLastError(): Error | null {
+    return this.lastError;
   }
 
   async connect(): Promise<void> {
     await this.client.connect();
+    this.dead = false;
+    this.lastError = null;
   }
 
   async disconnect(): Promise<void> {
     await this.client.logout();
+  }
+
+  /**
+   * Drop the connection without a protocol round-trip.
+   *
+   * `logout()` sends LOGOUT and waits for the server to answer — which a hung
+   * connection never will, so tearing one down with logout() hangs the
+   * teardown itself. The socket then stays open while a replacement is
+   * created, and those orphans accumulate against the provider's per-account
+   * connection cap until it refuses or stalls new ones.
+   *
+   * `close()` destroys the socket locally, so it always completes.
+   */
+  destroy(): void {
+    this.dead = true;
+    try {
+      this.client.close();
+    } catch {
+      // Already closed; nothing to do.
+    }
   }
 
   async noop(): Promise<void> {
@@ -528,6 +603,328 @@ export class ImapProvider {
     }
   }
 
+  // === Local cache sync ===================================================
+  // These back src/provider/imap-sync.ts, which adapts them to the cache's
+  // SyncProvider port. They live here because this class owns the ImapFlow
+  // client; the cache layer stays free of any imapflow dependency.
+
+  /** UIDVALIDITY / UIDNEXT / HIGHESTMODSEQ for a mailbox. */
+  async mailboxSnapshot(mailbox: string): Promise<{
+    uidValidity: number;
+    uidNext: number;
+    highestModseq: number | null;
+    exists: number;
+  }> {
+    const status = await this.client.status(mailbox, {
+      uidNext: true,
+      uidValidity: true,
+      highestModseq: true,
+      messages: true,
+    });
+
+    return {
+      uidValidity: Number(status.uidValidity ?? 0),
+      uidNext: Number(status.uidNext ?? 0),
+      // A server without CONDSTORE simply omits HIGHESTMODSEQ. Reporting null
+      // rather than 0 is what routes the sync engine to its fallback path.
+      highestModseq:
+        status.highestModseq == null ? null : Number(status.highestModseq),
+      exists: Number(status.messages ?? 0),
+    };
+  }
+
+  /** Every UID in a mailbox, ascending, optionally bounded by date. */
+  async listAllUids(mailbox: string, since?: Date): Promise<number[]> {
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      const query = since ? { since } : { all: true };
+      const result = await this.client.search(query as any, { uid: true });
+      return Array.isArray(result) ? [...result].sort((a, b) => a - b) : [];
+    } finally {
+      lock.release();
+    }
+  }
+
+  /**
+   * Envelope-level fetch for the cache: everything needed to build a row
+   * except the body. Includes BODYSTRUCTURE so attachment metadata is recorded
+   * without downloading any payloads (design D1).
+   */
+  async fetchSyncEnvelopes(
+    mailbox: string,
+    uids: number[]
+  ): Promise<
+    Array<{
+      uid: number;
+      modseq: number | null;
+      internalDate: Date | null;
+      size: number | null;
+      listId: string | null;
+      snippet: string;
+      attachments: Array<{
+        part_id: string;
+        filename: string | null;
+        mime_type: string | null;
+        size: number | null;
+      }>;
+      message: EmailMessage;
+    }>
+  > {
+    if (uids.length === 0) return [];
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      const results = [];
+      for await (const msg of this.client.fetch(
+        uids.join(','),
+        {
+          uid: true,
+          envelope: true,
+          flags: true,
+          internalDate: true,
+          size: true,
+          bodyStructure: true,
+          source: { start: 0, maxLength: 2048 },
+        },
+        { uid: true }
+      )) {
+        const source = msg.source?.toString('utf-8') ?? '';
+        const { listId, listUnsubscribe } = extractListHeadersFromSource(source);
+        const listUnsubscribePost = extractHeader(source, 'List-Unsubscribe-Post');
+        const references =
+          extractHeader(source, 'References')?.split(/\s+/).filter(Boolean) ?? [];
+
+        const message: EmailMessage = {
+          uid: msg.uid,
+          // Unlike the search path, a missing Message-Id is NOT synthesized
+          // here. ingest.ts needs to see it as absent so the message gets a
+          // synthetic thread instead of joining every other id-less message.
+          messageId: msg.envelope?.messageId ?? '',
+          from: toParticipant(msg.envelope?.from?.[0]),
+          to: toParticipants(msg.envelope?.to),
+          cc: toParticipants(msg.envelope?.cc),
+          date: msg.envelope?.date?.toISOString() ?? '',
+          subject: msg.envelope?.subject ?? '',
+          bodyText: '',
+          inReplyTo: extractHeader(source, 'In-Reply-To') ?? undefined,
+          references,
+          flags: Array.from(msg.flags ?? []),
+          listUnsubscribe:
+            listUnsubscribe != null
+              ? parseListUnsubscribe(listUnsubscribe, listUnsubscribePost ?? undefined)
+              : undefined,
+          mailbox,
+        };
+
+        results.push({
+          uid: msg.uid,
+          modseq: msg.modseq == null ? null : Number(msg.modseq),
+          // imapflow types this as string | Date depending on server response.
+          internalDate: toDate(msg.internalDate),
+          size: msg.size ?? null,
+          listId,
+          snippet: extractSnippet(msg.source ?? Buffer.alloc(0)),
+          attachments: collectAttachments(msg.bodyStructure),
+          message,
+        });
+      }
+      return results;
+    } finally {
+      lock.release();
+    }
+  }
+
+  /**
+   * Download the text/plain and text/html parts of each message.
+   *
+   * Deliberately not the full RFC822 source: attachment payloads are what turn
+   * a ~300 MB cache into a multi-GB one, and they're rarely the search target.
+   */
+  async fetchTextParts(
+    mailbox: string,
+    uids: number[]
+  ): Promise<
+    Array<{ uid: number; text: string | null; html: string | null; charset: string | null }>
+  > {
+    if (uids.length === 0) return [];
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      const structures = new Map<number, unknown>();
+      for await (const msg of this.client.fetch(
+        uids.join(','),
+        { uid: true, bodyStructure: true },
+        { uid: true }
+      )) {
+        structures.set(msg.uid, msg.bodyStructure);
+      }
+
+      const results = [];
+      for (const uid of uids) {
+        const structure = structures.get(uid);
+        if (!structure) continue;
+
+        const parts = collectTextParts(structure);
+        if (parts.plain === null && parts.html === null) continue;
+
+        const [text, html] = await Promise.all([
+          parts.plain ? this.downloadPart(uid, parts.plain) : Promise.resolve(null),
+          parts.html ? this.downloadPart(uid, parts.html) : Promise.resolve(null),
+        ]);
+
+        results.push({ uid, text, html, charset: parts.charset });
+      }
+      return results;
+    } finally {
+      lock.release();
+    }
+  }
+
+  private async downloadPart(uid: number, partId: string): Promise<string | null> {
+    try {
+      const downloaded = await this.client.download(String(uid), partId, { uid: true });
+      if (!downloaded?.content) return null;
+      return await streamToString(downloaded.content);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Download one attachment payload.
+   *
+   * Attachment bytes are never cached (design D1), so this always hits the
+   * server. The size is checked against BODYSTRUCTURE before downloading —
+   * refusing a 2 GB part after streaming it to memory would be too late.
+   */
+  async fetchAttachment(
+    mailbox: string,
+    uid: number,
+    partId: string,
+    maxBytes: number
+  ): Promise<{
+    content: Buffer;
+    filename: string | null;
+    mimeType: string | null;
+  } | null> {
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      const msg = await this.client.fetchOne(
+        String(uid),
+        { uid: true, bodyStructure: true },
+        { uid: true }
+      );
+      if (!msg || !msg.bodyStructure) return null;
+
+      const meta = collectAttachments(msg.bodyStructure).find(
+        (a) => a.part_id === partId
+      );
+      if (!meta) return null;
+
+      if (meta.size != null && meta.size > maxBytes) {
+        throw new Error(
+          `Attachment is ${meta.size} bytes, which exceeds the ${maxBytes} byte limit`
+        );
+      }
+
+      const downloaded = await this.client.download(String(uid), partId, {
+        uid: true,
+        maxBytes,
+      });
+      if (!downloaded?.content) return null;
+
+      const chunks: Buffer[] = [];
+      let total = 0;
+      for await (const chunk of downloaded.content as NodeJS.ReadableStream) {
+        const buf = typeof chunk === 'string' ? Buffer.from(chunk) : (chunk as Buffer);
+        total += buf.byteLength;
+        // BODYSTRUCTURE size is advisory — enforce again on the real stream so
+        // a lying server can't push us past the limit.
+        if (total > maxBytes) {
+          throw new Error(`Attachment exceeds the ${maxBytes} byte limit`);
+        }
+        chunks.push(buf);
+      }
+
+      return {
+        content: Buffer.concat(chunks),
+        filename: meta.filename,
+        mimeType: meta.mime_type,
+      };
+    } finally {
+      lock.release();
+    }
+  }
+
+  /**
+   * QRESYNC delta: everything that changed since a known MODSEQ, in one round
+   * trip. Returns null when the server can't serve one, which routes the sync
+   * engine to its UIDNEXT-scan fallback.
+   */
+  async qresyncDelta(
+    mailbox: string,
+    known: { uidValidity: number; highestModseq: number }
+  ): Promise<{
+    uidValidity: number;
+    highestModseq: number | null;
+    vanished: number[];
+    changed: number[];
+    vanishedReliable: boolean;
+  } | null> {
+    if (!this.client.capabilities.has('CONDSTORE') && !this.client.capabilities.has('QRESYNC')) {
+      return null;
+    }
+
+    // The `qresync: true` constructor option only takes effect if the server
+    // actually advertises QRESYNC. On a CONDSTORE-only server, expunges still
+    // arrive as sequence numbers — useless for identifying a cached row — so
+    // the caller must reconcile deletions a different way.
+    const vanishedReliable = this.client.capabilities.has('QRESYNC');
+
+    const vanished: number[] = [];
+    const onExpunge = (payload: { uid?: number; vanished?: boolean }) => {
+      if (payload?.uid != null) vanished.push(payload.uid);
+    };
+
+    this.client.on('expunge', onExpunge);
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      const box = this.client.mailbox;
+      const uidValidity = Number(
+        (box && typeof box !== 'boolean' ? box.uidValidity : undefined) ?? 0
+      );
+
+      // A UIDVALIDITY change invalidates the caller's whole view; hand it back
+      // so the engine purges rather than merging two UID generations.
+      if (uidValidity !== known.uidValidity) {
+        return {
+          uidValidity,
+          highestModseq: null,
+          vanished: [],
+          changed: [],
+          vanishedReliable,
+        };
+      }
+
+      const changed: number[] = [];
+      for await (const msg of this.client.fetch(
+        '1:*',
+        { uid: true },
+        { uid: true, changedSince: BigInt(known.highestModseq) }
+      )) {
+        changed.push(msg.uid);
+      }
+
+      const highestModseq =
+        box && typeof box !== 'boolean' && box.highestModseq != null
+          ? Number(box.highestModseq)
+          : null;
+
+      return { uidValidity, highestModseq, vanished, changed, vanishedReliable };
+    } finally {
+      lock.release();
+      this.client.off('expunge', onExpunge);
+    }
+  }
+
   async getMailboxPath(
     name: 'inbox' | 'drafts' | 'sent' | 'trash' | 'holding'
   ): Promise<string> {
@@ -554,6 +951,120 @@ export class ImapProvider {
     };
     return fallbacks[name] ?? name;
   }
+}
+
+function toDate(value: string | Date | null | undefined): Date | null {
+  if (!value) return null;
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+interface BodyNode {
+  type?: string;
+  part?: string;
+  disposition?: string;
+  dispositionParameters?: Record<string, string>;
+  parameters?: Record<string, string>;
+  size?: number;
+  childNodes?: unknown[];
+}
+
+/**
+ * Walk a BODYSTRUCTURE collecting attachment metadata — never payloads.
+ *
+ * A part counts as an attachment when it is explicitly dispositioned as one, or
+ * when it carries a filename and isn't one of the text parts we cache inline.
+ * Inline images with filenames are included deliberately: a user looking for
+ * "the screenshot Bob sent" should find it.
+ */
+export function collectAttachments(structure: unknown): Array<{
+  part_id: string;
+  filename: string | null;
+  mime_type: string | null;
+  size: number | null;
+}> {
+  const found: Array<{
+    part_id: string;
+    filename: string | null;
+    mime_type: string | null;
+    size: number | null;
+  }> = [];
+
+  const walk = (node: BodyNode | null | undefined): void => {
+    if (!node || typeof node !== 'object') return;
+
+    const type = (node.type ?? '').toLowerCase();
+    const disposition = (node.disposition ?? '').toLowerCase();
+    const filename =
+      node.dispositionParameters?.filename ?? node.parameters?.name ?? null;
+
+    const isMultipart = type.startsWith('multipart/');
+    const isCachedText = type === 'text/plain' || type === 'text/html';
+
+    if (
+      !isMultipart &&
+      node.part &&
+      (disposition === 'attachment' || (filename && !isCachedText))
+    ) {
+      found.push({
+        part_id: node.part,
+        filename: filename ?? null,
+        mime_type: node.type ?? null,
+        size: node.size ?? null,
+      });
+    }
+
+    for (const child of node.childNodes ?? []) {
+      walk(child as BodyNode);
+    }
+  };
+
+  walk(structure as BodyNode);
+  return found;
+}
+
+/**
+ * Locate the text/plain and text/html parts to cache.
+ *
+ * Both are kept when present: plain text is what gets indexed and searched,
+ * HTML is what read_thread renders. A single-part text message has no `part`
+ * identifier, so it falls back to '1' — the whole body.
+ */
+export function collectTextParts(structure: unknown): {
+  plain: string | null;
+  html: string | null;
+  charset: string | null;
+} {
+  let plain: string | null = null;
+  let html: string | null = null;
+  let charset: string | null = null;
+
+  const walk = (node: BodyNode | null | undefined): void => {
+    if (!node || typeof node !== 'object') return;
+
+    const type = (node.type ?? '').toLowerCase();
+    const disposition = (node.disposition ?? '').toLowerCase();
+
+    // A text part dispositioned as an attachment (a .txt someone sent) is not
+    // the message body and must not be indexed as one.
+    if (disposition !== 'attachment') {
+      if (type === 'text/plain' && plain === null) {
+        plain = node.part ?? '1';
+        charset ??= node.parameters?.charset ?? null;
+      } else if (type === 'text/html' && html === null) {
+        html = node.part ?? '1';
+        charset ??= node.parameters?.charset ?? null;
+      }
+    }
+
+    for (const child of node.childNodes ?? []) {
+      walk(child as BodyNode);
+    }
+  };
+
+  walk(structure as BodyNode);
+  return { plain, html, charset };
 }
 
 function extractHeader(source: string, name: string): string | null {

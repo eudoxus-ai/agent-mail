@@ -36,6 +36,13 @@ const inputSchema = z.object({
     .max(1000)
     .optional()
     .describe('Safety cap per account. Default 500.'),
+  background: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe(
+      'Default TRUE for this tool. Returns an intent_id immediately and performs the move in the background; poll get_intent(intent_id) until status is "executed" or "failed". This is the default because a sender sweep has no upper bound on size — a synchronous call can outrun the client timeout, and that timeout tells you nothing about whether the move happened while leaving you no intent_id to undo with. Pass false only for senders you know are small and you want the moved-message list inline.'
+    ),
 });
 
 export const holdBySenderTool: ToolDefinition = {

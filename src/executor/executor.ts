@@ -31,9 +31,22 @@ import { generateUndoToken, getUndoExpiry, parseUndoToken } from './undo.js';
 import { buildUndoHint } from '../lib/undo-hint.js';
 import { fanOut } from './fan-out.js';
 import { parseTargets, type Target } from '../tools/target.js';
-import { insertIntentTargets, getIntentTargets } from '../ledger/intent-targets.js';
-import { decodeCursor, encodeCursor } from '../lib/search-cursor.js';
+import {
+  insertIntentTargets,
+  getIntentTargets,
+  updateIntentTargetDestinations,
+} from '../ledger/intent-targets.js';
+import { updateIntentProgress, getIntentProgress } from '../ledger/intents.js';
+import { checkStuckExecuting } from '../ledger/db.js';
+import { decodeCursor, encodeCursor, type SearchCursor } from '../lib/search-cursor.js';
 import { projectResult } from '../lib/envelope-projection.js';
+import { searchCache, countByAccount } from '../cache/query.js';
+import { getCoverage, isServable } from '../cache/coverage.js';
+import { diffResults, logDivergence } from '../cache/shadow.js';
+import { invalidate } from '../cache/invalidate.js';
+import { stageAttachment, AttachmentTooLargeError } from '../cache/attachment-store.js';
+import { INLINE_MAX_BYTES } from '../tools/get-attachment.js';
+import { DEFAULT_CACHE_CONFIG, type CacheConfig } from '../cache/config.js';
 
 /**
  * Thrown from `holdBySender` when the replies-present policy gate blocks the
@@ -89,6 +102,64 @@ interface SearchThreadsMultiPayload {
   per_account_counts?: Record<string, number>;
   results: SearchThreadResult[];
   next_cursor?: string;
+  /**
+   * Present only on cache-backed responses. Lets the caller distinguish
+   * "no results" from "no results within the window I have cached locally".
+   */
+  cache?: {
+    state: string;
+    last_synced_at: string | null;
+    coverage: Record<string, Record<string, unknown>>;
+  };
+}
+
+/**
+ * Raised when too much background work is already outstanding.
+ *
+ * Queued background jobs are not durable: the pool queue is a promise chain in
+ * process memory and nothing records "waiting to run". A restart therefore
+ * vaporizes everything queued while leaving each intent marked `executing`
+ * forever. Capping the depth bounds how much can be lost that way — it is not
+ * a throughput control, since per-account serialization means the queue drains
+ * at the same rate however fast it is filled.
+ */
+export class BackgroundQueueFullError extends Error {
+  constructor(
+    readonly inFlight: number,
+    readonly limit: number
+  ) {
+    super(
+      `${inFlight} background action(s) already outstanding (limit ${limit}). ` +
+        'Poll the ones you have with get_intent until they report "executed", then queue more.'
+    );
+    this.name = 'BackgroundQueueFullError';
+  }
+}
+
+/**
+ * Tools that change mail. Only these can be meaningfully orphaned by a restart
+ * — a read that died with the process changed nothing.
+ */
+const MUTATING_TOOLS = new Set([
+  'hold_messages',
+  'hold_by_sender',
+  'restore_messages',
+  'label_thread',
+  'queue_send',
+  'draft_reply',
+  'unsubscribe_sender',
+  'undo_intent',
+]);
+
+/** Exported for tests: only mutations can be orphaned by a restart. */
+export function isMutatingTool(tool: string): boolean {
+  return MUTATING_TOOLS.has(tool);
+}
+
+function maxBackgroundJobs(): number {
+  const raw = process.env.AGENT_MAIL_MAX_BACKGROUND;
+  const parsed = raw ? Number.parseInt(raw, 10) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 8;
 }
 
 export interface ExecutorDeps {
@@ -96,6 +167,13 @@ export interface ExecutorDeps {
   accounts: AccountConfig[];
   pool: ImapConnectionPool;
   logger: Logger;
+  /**
+   * Local message cache. Optional: when absent (or when its mode is `off`)
+   * every read goes to IMAP exactly as before. The cache is an optimization,
+   * never a dependency.
+   */
+  cache?: Database;
+  cacheConfig?: CacheConfig;
 }
 
 export class Executor {
@@ -109,12 +187,29 @@ export class Executor {
    * reversible IMAP side effect before the DB CAS has a chance to settle.
    */
   private readonly pendingUndos = new Set<string>();
+  private cache: Database | null;
+  private cacheConfig: CacheConfig;
+  /** Background actions started but not yet settled. */
+  private backgroundInFlight = 0;
 
   constructor(deps: ExecutorDeps) {
     this.db = deps.db;
     this.accounts = deps.accounts;
     this.pool = deps.pool;
     this.logger = deps.logger;
+    this.cache = deps.cache ?? null;
+    this.cacheConfig = deps.cacheConfig ?? DEFAULT_CACHE_CONFIG;
+  }
+
+  /** Outstanding background actions and the cap on them. */
+  backgroundLoad(): { in_flight: number; limit: number } {
+    return { in_flight: this.backgroundInFlight, limit: maxBackgroundJobs() };
+  }
+
+  /** Fire-and-forget cache maintenance after a successful IMAP mutation (D2). */
+  private echoToCache(input: Parameters<typeof invalidate>[1]): void {
+    if (!this.cache) return;
+    invalidate(this.cache, input, this.logger);
   }
 
   async executeImmediate(params: {
@@ -201,6 +296,110 @@ export class Executor {
       }
       throw error;
     }
+  }
+
+  /**
+   * Create the intent, hand back its id, then run the action in the background.
+   *
+   * Bulk mailbox sweeps over a slow provider can outlast any client's patience,
+   * and a client-side timeout is not a signal about what happened on the
+   * server — the same timeout can mean "finished, response lost" or "never
+   * ran". Either way the caller was left with no intent id, so the batch could
+   * not be undone and the only recovery was to re-run and compare.
+   *
+   * Returning the id first makes the outcome knowable regardless: poll
+   * `get_intent` for the terminal status. It also survives a process death,
+   * because the intent is already on disk in `executing` — which is exactly
+   * what distinguishes a crash from a slow provider after the fact.
+   */
+  async executeInBackground(params: {
+    tool: string;
+    toolParams: Record<string, unknown>;
+    accountId: string;
+    agentId: string;
+    risk: RiskLevel;
+  }): Promise<Intent> {
+    const limit = maxBackgroundJobs();
+    if (this.backgroundInFlight >= limit) {
+      // Reject before creating an intent, so a refused request leaves no
+      // record stuck at `executing`.
+      throw new BackgroundQueueFullError(this.backgroundInFlight, limit);
+    }
+
+    const intent = createIntent(this.db, {
+      account_id: params.accountId,
+      tool: params.tool,
+      params: params.toolParams,
+      risk: params.risk,
+      agent_id: params.agentId,
+    });
+
+    logAudit(this.db, {
+      intent_id: intent.id,
+      account_id: params.accountId,
+      action: 'created',
+      actor: params.agentId,
+      detail: buildAuditSummary(params.tool, 'created', params.toolParams),
+    });
+
+    updateIntentStatus(this.db, intent.id, 'executing');
+    logAudit(this.db, {
+      intent_id: intent.id,
+      account_id: params.accountId,
+      action: 'executing',
+      actor: 'policy',
+      detail: buildAuditSummary(params.tool, 'executing', params.toolParams),
+    });
+
+    const running = getIntent(this.db, intent.id)!;
+
+    // Deliberately not awaited. Every path inside settles the intent status,
+    // and the catch-all guarantees no unhandled rejection can reach the top
+    // level — an unhandled rejection here would kill the server, which is the
+    // failure this whole change exists to make survivable.
+    this.backgroundInFlight += 1;
+    void (async () => {
+      try {
+        await this.performAction(running);
+        const isDryRun = params.toolParams.dry_run === true;
+        updateIntentStatus(this.db, running.id, 'executed', {
+          resolved_by: 'policy',
+          undo_token: isDryRun
+            ? undefined
+            : (generateUndoToken(params.tool, params.toolParams) ?? undefined),
+          undo_expires_at: isDryRun ? undefined : (getUndoExpiry(params.tool) ?? undefined),
+        });
+        logAudit(this.db, {
+          intent_id: running.id,
+          account_id: params.accountId,
+          action: 'executed',
+          actor: 'policy',
+          detail: buildAuditSummary(params.tool, 'executed', params.toolParams),
+        });
+      } catch (error) {
+        const errorDetail =
+          error instanceof HoldBySenderBlockedError
+            ? error.errorDetail
+            : { message: error instanceof Error ? error.message : String(error) };
+        updateIntentStatus(this.db, running.id, 'failed', { error_detail: errorDetail });
+        logAudit(this.db, {
+          intent_id: running.id,
+          account_id: params.accountId,
+          action: 'failed',
+          actor: 'policy',
+          detail: buildAuditSummary(params.tool, 'failed', params.toolParams, errorDetail),
+        });
+        this.logger.warn('Background execution failed', {
+          intent_id: running.id,
+          tool: params.tool,
+          error: errorDetail.message,
+        });
+      } finally {
+        this.backgroundInFlight -= 1;
+      }
+    })();
+
+    return running;
   }
 
   async createGatedIntent(params: {
@@ -559,9 +758,32 @@ export class Executor {
     // at most `limit` rows at the boundary were already returned on page 1.
     const imapFetchLimit = decodedCursor ? limit * 2 : limit;
 
+    // Cache read path. `on` serves from the cache when coverage allows;
+    // `shadow` computes the cache answer but still returns IMAP's, logging any
+    // divergence. Either way a cache failure falls through to IMAP.
+    const cacheAttempt =
+      this.cache && this.cacheConfig.mode !== 'off'
+        ? this.readFromCache({
+            accountIds: targetIds,
+            mailbox,
+            query,
+            from: baseCriteria.from,
+            to: baseCriteria.to,
+            subject: baseCriteria.subject,
+            since: baseCriteria.since,
+            before: baseCriteria.before,
+            limit,
+          })
+        : null;
+
+    if (cacheAttempt && this.cacheConfig.mode === 'on' && cacheAttempt.servable) {
+      return this.buildCachePayload(cacheAttempt, allIds, limit, intent, decodedCursor);
+    }
+
     const fanResult = await fanOut({
       pool: this.pool,
       accountIds: targetIds,
+      label: 'search_threads',
       fn: async (accountId, imap) => {
         const resultSets = query
           ? await Promise.all([
@@ -681,7 +903,251 @@ export class Executor {
         boundary_seen,
       });
     }
+
+    // Shadow mode: IMAP's answer is what ships; the cache answer is only
+    // compared against it. This is the gate that has to pass before anyone
+    // flips mode to `on`.
+    if (cacheAttempt && this.cacheConfig.mode === 'shadow') {
+      const diff = diffResults(allResults, cacheAttempt.rows);
+      logDivergence(
+        this.logger,
+        { mailbox, query, account_ids: targetIds, limit, cache_state: cacheAttempt.coverage.state },
+        diff
+      );
+    }
+
     return payload;
+  }
+
+  /** Run the cache-side query, tolerating any failure by returning null. */
+  private readFromCache(params: {
+    accountIds: string[];
+    mailbox: string;
+    query?: string;
+    from?: string;
+    to?: string;
+    subject?: string;
+    since?: Date;
+    before?: Date;
+    limit: number;
+  }): {
+    rows: ReturnType<typeof searchCache>;
+    coverage: ReturnType<typeof getCoverage>;
+    servable: boolean;
+  } | null {
+    if (!this.cache) return null;
+    try {
+      const coverage = getCoverage(this.cache, params.accountIds, {
+        freshnessWindowSeconds: this.cacheConfig.freshnessWindowSeconds,
+        // Coverage must be judged for the mailbox actually being searched.
+        mailbox: params.mailbox,
+      });
+      const rows = searchCache(this.cache, params);
+      return { rows, coverage, servable: isServable(coverage.state) };
+    } catch (error) {
+      this.logger.warn('cache: read failed, falling back to IMAP', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  private buildCachePayload(
+    attempt: NonNullable<ReturnType<Executor['readFromCache']>>,
+    allIds: string[],
+    limit: number,
+    intent: Intent,
+    cursor: SearchCursor | null
+  ): SearchThreadsMultiPayload {
+    const fields = intent.params.fields as string[] | undefined;
+
+    // `before` was padded by 1 ms so rows sharing the previous page's boundary
+    // timestamp come back rather than being skipped. They must then be
+    // filtered by the tuple already emitted, exactly as the IMAP path does —
+    // otherwise page two repeats page one and, when enough messages share a
+    // timestamp, the cursor stops advancing.
+    const rows = cursor ? applyCursorBoundary(attempt.rows, cursor) : attempt.rows;
+
+    const payload: SearchThreadsMultiPayload = {
+      accounts_searched: Object.keys(countByAccount(rows)),
+      accounts_available: allIds,
+      per_account_counts: countByAccount(rows),
+      results: rows.map((r) => projectResult(r as never, fields)) as never,
+    };
+
+    // Coverage travels with every cache-backed answer so "no results" can be
+    // distinguished from "no results within what I have locally".
+    payload.cache = {
+      state: attempt.coverage.state,
+      last_synced_at: attempt.coverage.last_synced_at,
+      coverage: attempt.coverage.coverage,
+    };
+
+    if (rows.length >= limit && rows.length > 0) {
+      const oldest = rows[rows.length - 1];
+      const boundaryMs = new Date(oldest.envelope.date).getTime();
+      payload.next_cursor = encodeCursor({
+        before: oldest.envelope.date,
+        boundary_seen: rows
+          .filter((r) => new Date(r.envelope.date).getTime() === boundaryMs)
+          .map((r) => ({
+            account_id: r.account_id,
+            mailbox: r.mailbox,
+            uid: r.uid,
+          })),
+      });
+    }
+
+    return payload;
+  }
+
+  /**
+   * A snapshot of everything that explains a hang.
+   *
+   * The connection pool lives in this process and nowhere else, so a separate
+   * CLI cannot observe it. Without this, a stalled background action is
+   * indistinguishable from one that was never picked up.
+   */
+  private collectDiagnostics(): Record<string, unknown> {
+    const pool = this.pool.diagnostics();
+
+    // Exclude the diagnostics call itself, and every other read-only tool.
+    //
+    // Reads are recorded as intents too and are `executing` for the duration,
+    // so an unfiltered list always contains at least this call observing
+    // itself — reported as an orphan, on an idle server, which is precisely
+    // when someone reaches for this. Only mutations can be meaningfully
+    // orphaned: a read that vanished with the process changed nothing and has
+    // nothing to re-run.
+    const stuck = checkStuckExecuting(this.db)
+      .filter((intent) => MUTATING_TOOLS.has(intent.tool))
+      .map((intent) => {
+        const targets = getIntentTargets(this.db, intent.id);
+        return {
+          intent_id: intent.id,
+          tool: intent.tool,
+          account_id: intent.account_id,
+          created_at: intent.created_at,
+          age_seconds: Math.round(
+            (Date.now() - new Date(`${intent.created_at}Z`).getTime()) / 1000
+          ),
+          progress: getIntentProgress(this.db, intent.id),
+          targets_recorded: targets.length,
+          targets_unconfirmed: targets.filter((t) => t.destination_uid === null).length,
+        };
+      });
+
+    const busy = pool.accounts.filter((a) => a.in_flight !== null);
+    const queued = pool.accounts.filter((a) => a.queue_depth > 0);
+
+    return {
+      generated_at: new Date().toISOString(),
+      runtime: {
+        node: process.version,
+        pid: process.pid,
+        uptime_seconds: Math.round(process.uptime()),
+      },
+      // Leak tell: opened minus closed should equal live, and live should
+      // never exceed the number of configured accounts.
+      connections: {
+        opened: pool.opened,
+        closed: pool.closed,
+        live: pool.live,
+        accounts_configured: this.accounts.length,
+        leaked: pool.opened - pool.closed !== pool.live || pool.live > this.accounts.length,
+      },
+      accounts: pool.accounts,
+      operation_timeout_ms: pool.operation_timeout_ms,
+      // Queued background work is NOT durable — it lives in process memory.
+      // A restart orphans all of it, which is why the depth is capped.
+      background: this.backgroundLoad(),
+      executing_intents: stuck,
+      interpretation: buildInterpretation({
+        busyCount: busy.length,
+        queuedCount: queued.length,
+        stuckCount: stuck.length,
+        longestElapsedMs: Math.max(0, ...busy.map((a) => a.in_flight!.elapsed_ms)),
+        timeoutMs: pool.operation_timeout_ms,
+      }),
+    };
+  }
+
+  private async fetchAttachment(
+    intent: Intent
+  ): Promise<Array<{ type: 'text'; text: string }>> {
+    const target = intent.params.target as Target;
+    const partId = intent.params.part_id as string;
+    const inline = intent.params.inline === true;
+    const maxBytes = this.cacheConfig.maxAttachmentBytes;
+    // Target.mailbox is optional across the tool surface; INBOX is the
+    // documented default everywhere else, so match it here.
+    const mailbox = target.mailbox ?? 'INBOX';
+
+    const fetched = await this.pool.withConnection(target.account_id, (imap) =>
+      imap.fetchAttachment(mailbox, target.uid, partId, maxBytes)
+    );
+
+    if (!fetched) {
+      throw new Error(
+        `No attachment at part_id "${partId}" on ${mailbox}:${target.uid}`
+      );
+    }
+
+    if (inline) {
+      if (fetched.content.byteLength > INLINE_MAX_BYTES) {
+        throw new Error(
+          `Attachment is ${fetched.content.byteLength} bytes, too large to inline (limit ${INLINE_MAX_BYTES}). Omit "inline" to stage it on disk instead.`
+        );
+      }
+      return [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              filename: fetched.filename,
+              mime_type: fetched.mimeType,
+              size: fetched.content.byteLength,
+              content_base64: fetched.content.toString('base64'),
+            },
+            null,
+            2
+          ),
+        },
+      ];
+    }
+
+    try {
+      const staged = stageAttachment({
+        filename: fetched.filename,
+        partId,
+        content: fetched.content,
+        maxBytes,
+      });
+
+      return [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              filename: staged.filename,
+              mime_type: fetched.mimeType,
+              size: staged.size,
+              path: staged.path,
+              expires_at: staged.expiresAt.toISOString(),
+            },
+            null,
+            2
+          ),
+        },
+      ];
+    } catch (error) {
+      if (error instanceof AttachmentTooLargeError) {
+        throw new Error(
+          `${error.message}. Raise cache.max_attachment_bytes if you need it.`
+        );
+      }
+      throw error;
+    }
   }
 
   private async listSendersMulti(intent: Intent): Promise<{
@@ -835,6 +1301,14 @@ export class Executor {
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
 
+    if (intent.tool === 'get_attachment') {
+      return this.fetchAttachment(intent);
+    }
+
+    if (intent.tool === 'get_diagnostics') {
+      return [{ type: 'text', text: JSON.stringify(this.collectDiagnostics(), null, 2) }];
+    }
+
     // Multi-account label: group targets by account, fan out per-account
     if (intent.tool === 'label_thread') {
       const targets = intent.params.targets as Target[];
@@ -851,6 +1325,7 @@ export class Executor {
       const fanResult = await fanOut({
         pool: this.pool,
         accountIds,
+        label: 'label_thread',
         fn: async (accountId, imap) => {
           const byMailbox = new Map<string, number[]>();
           for (const t of grouped[accountId]) {
@@ -864,6 +1339,16 @@ export class Executor {
             } else {
               await imap.removeFlags(uids, [label], mailbox);
             }
+            // IMAP has already accepted the change; echo it locally so a
+            // follow-up search doesn't show the old flags (design D2).
+            this.echoToCache({
+              accountId,
+              mailbox,
+              uids,
+              effect: 'flags_changed',
+              detail:
+                action === 'add' ? { flagsAdded: [label] } : { flagsRemoved: [label] },
+            });
           }
           return { uids: grouped[accountId].map((t) => t.uid) };
         },
@@ -956,6 +1441,13 @@ export class Executor {
             const holdingUid = entry.destination_uid ?? t.uid;
             if (!dryRun) {
               const { uidMap } = await imap.moveMessages([holdingUid], holding, entry.original_mailbox);
+              this.echoToCache({
+                accountId,
+                mailbox: holding,
+                uids: [holdingUid],
+                effect: 'moved',
+                detail: { toMailbox: entry.original_mailbox },
+              });
               // Map the restored-to UID back under the source uid key for persistence
               const restoredUid = uidMap.get(holdingUid) ?? holdingUid;
               acctUidMap.set(t.uid, restoredUid);
@@ -1028,6 +1520,10 @@ export class Executor {
         created_at: row.created_at,
         account_id: row.account_id,
         status: row.status,
+        // What it is doing right now. Without this, a long-running action
+        // reports only status: "executing" with an empty targets array, which
+        // is indistinguishable from one that was never picked up.
+        progress: getIntentProgress(this.db, id),
         targets,
       };
       if (links.reverses.length > 0) payload.reverses_intent_id = links.reverses;
@@ -1164,10 +1660,57 @@ export class Executor {
             }
           }
           if (!dryRun) {
+            // Write the restorable record BEFORE touching mail.
+            //
+            // Previously targets were persisted only after every account's
+            // moves finished, so a process death mid-sweep left messages in
+            // holding with no envelope snapshot and no original_mailbox —
+            // restore_messages could not put them back. Writing first costs a
+            // row that may turn out to be unused (see the dangling-target
+            // cleanup below); getting it backwards costs recoverability.
+            insertIntentTargets(
+              this.db,
+              intent.id,
+              envelopeSnapshots
+                .filter((e) => e.mailbox === mailbox)
+                .map((e) => ({
+                  account_id: e.account_id,
+                  uid: e.uid,
+                  mailbox: e.mailbox,
+                  envelope_snapshot: {
+                    subject: e.subject,
+                    from: e.from,
+                    original_mailbox: e.mailbox,
+                  },
+                }))
+            );
+
+            updateIntentProgress(this.db, intent.id, 'moving', {
+              account_id: accountId,
+              mailbox,
+              messages: uids.length,
+            });
+
             const { uidMap } = await imap.moveMessages(uids, mailbox, holding);
             for (const [src, dst] of uidMap) {
               combinedUidMap.set(src, dst);
             }
+
+            // Confirm where they landed. A target still lacking a
+            // destination_uid after the fact is the fingerprint of an
+            // interrupted run.
+            updateIntentTargetDestinations(this.db, intent.id, accountId, uidMap, mailbox);
+            // Drop the source rows immediately so held messages stop showing
+            // up in searches of their original mailbox. The destination copy
+            // has a server-assigned UID we don't know, so the holding mailbox
+            // is only marked dirty — the next sync discovers it.
+            this.echoToCache({
+              accountId,
+              mailbox,
+              uids,
+              effect: 'moved',
+              detail: { toMailbox: holding },
+            });
           }
           perMailbox.push({ mailbox, message_count: uids.length, uids });
         }
@@ -1195,27 +1738,15 @@ export class Executor {
       }
     }
 
-    // Persist targets to ledger on real (non-dry) runs
+    // Targets were already written inside the fan-out, before each move, and
+    // their destination UIDs confirmed immediately after. This pass only
+    // reconciles anything the per-mailbox path missed — a server that reports
+    // no UID mapping, or an account whose fan-out leg failed after the ledger
+    // write. Upsert semantics make it safe to repeat.
     if (!dryRun && allEnvelopes.length > 0) {
-      insertIntentTargets(
-        this.db,
-        intent.id,
-        allEnvelopes.map((e: any) => {
-          const acctUidMap = allUidMaps.get(e.account_id);
-          const destinationUid = acctUidMap?.get(e.uid) ?? null;
-          return {
-            account_id: e.account_id,
-            uid: e.uid,
-            mailbox: e.mailbox,
-            envelope_snapshot: {
-              subject: e.subject,
-              from: e.from,
-              original_mailbox: e.mailbox,
-            },
-            destination_uid: destinationUid ?? undefined,
-          };
-        })
-      );
+      for (const [accountId, uidMap] of allUidMaps) {
+        updateIntentTargetDestinations(this.db, intent.id, accountId, uidMap);
+      }
     }
 
     // Strip internal `envelopes` and `uidMap` fields before building the public payload
@@ -1305,9 +1836,16 @@ export class Executor {
       before: before ? new Date(before) : undefined,
     };
 
+    updateIntentProgress(this.db, intent.id, 'searching', {
+      from,
+      accounts: targetIds,
+      mailbox,
+    });
+
     const searchResult = await fanOut({
       pool: this.pool,
       accountIds: targetIds,
+      label: 'hold_by_sender:search',
       fn: async (_accountId, imap) => {
         const rows = await imap.search(mailbox, criteria, limit);
         return rows.map((r) => r.uid);
@@ -1481,6 +2019,13 @@ export class Executor {
             return destUid ?? t.uid;
           });
           await imap.moveMessages(holdingUids, holding, inbox);
+          this.echoToCache({
+            accountId,
+            mailbox: holding,
+            uids: holdingUids,
+            effect: 'moved',
+            detail: { toMailbox: inbox },
+          });
         });
       }
       return;
@@ -1507,6 +2052,13 @@ export class Executor {
           const holding = await imap.getMailboxPath('holding');
           for (const { uid, currentMailbox } of list) {
             await imap.moveMessages([uid], currentMailbox, holding);
+            this.echoToCache({
+              accountId,
+              mailbox: currentMailbox,
+              uids: [uid],
+              effect: 'moved',
+              detail: { toMailbox: holding },
+            });
           }
         });
       }
@@ -1528,4 +2080,62 @@ export class Executor {
 
     throw new Error(`Unknown undo action: ${undoOp.reverseAction}`);
   }
+}
+
+
+/** Turn the raw counters into the sentence a reader actually needs. */
+function buildInterpretation(input: {
+  busyCount: number;
+  queuedCount: number;
+  stuckCount: number;
+  longestElapsedMs: number;
+  timeoutMs: number;
+}): string {
+  if (input.busyCount === 0 && input.stuckCount === 0) {
+    return 'Idle. No IMAP operation in flight and nothing mid-execution.';
+  }
+  if (input.busyCount === 0 && input.stuckCount > 0) {
+    return (
+      `${input.stuckCount} mutating action(s) are marked executing with no IMAP operation ` +
+      'running. That means the process restarted while they were in flight — they will ' +
+      'never complete on their own. Re-run them; hold_by_sender is idempotent. ' +
+      '(Read-only calls, including this one, are excluded — they change nothing and ' +
+      'cannot be orphaned.)'
+    );
+  }
+  const seconds = Math.round(input.longestElapsedMs / 1000);
+  const timeoutSeconds = Math.round(input.timeoutMs / 1000);
+  return (
+    `${input.busyCount} IMAP operation(s) in flight, longest running ${seconds}s ` +
+    `(abandoned at ${timeoutSeconds}s). ${input.queuedCount} account(s) have queued work. ` +
+    'Borrows are serialized per account, so anything queued behind a slow operation ' +
+    'waits for it — a small job sitting at "executing" is usually queued, not stuck.'
+  );
+}
+
+
+/**
+ * Drop rows already emitted at the previous page's boundary timestamp.
+ *
+ * Mirrors the IMAP path: keep anything strictly older than the boundary, plus
+ * boundary-timestamp rows whose (account_id, mailbox, uid) triple was not
+ * already returned. UIDs are unique only per account/mailbox, so a scalar
+ * comparison would drop cross-account rows that merely share a UID.
+ */
+export function applyCursorBoundary<
+  T extends { account_id: string; mailbox: string; uid: number; envelope: { date: string } },
+>(rows: T[], cursor: SearchCursor): T[] {
+  const boundaryMs = new Date(cursor.before).getTime();
+  const seen = new Set(
+    cursor.boundary_seen.map((r) => `${r.account_id}\u0000${r.mailbox}\u0000${r.uid}`)
+  );
+
+  return rows.filter((row) => {
+    const rowMs = new Date(row.envelope.date).getTime();
+    if (rowMs < boundaryMs) return true;
+    if (rowMs === boundaryMs) {
+      return !seen.has(`${row.account_id}\u0000${row.mailbox}\u0000${row.uid}`);
+    }
+    return false;
+  });
 }

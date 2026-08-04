@@ -2,11 +2,20 @@ import type { Database } from '../ledger/sqlite.js';
 import type { AccountConfig, PolicyConfig, ToolDefinition, RiskLevel } from '../types.js';
 import type { Logger } from '../logger.js';
 import type { Executor } from '../executor/executor.js';
+import { BackgroundQueueFullError } from '../executor/executor.js';
 import { evaluatePolicy } from '../policy/engine.js';
 import { getAccount, getDefaultAccount } from '../provider/accounts.js';
 import { describeIntent } from '../ledger/audit-summary.js';
 import { DEFAULT_REVIEWER_PORT } from '../config.js';
 import { buildApprovalUrl } from '../reviewer/urls.js';
+
+/**
+ * Tools that accept `background: true`.
+ *
+ * Only the bulk mutations. Read tools are bounded and cheap enough to await,
+ * and queue_send is always gated — it already returns an intent id up front.
+ */
+const BACKGROUNDABLE_TOOLS = new Set(['hold_messages', 'hold_by_sender']);
 
 export interface MiddlewareDeps {
   db: Database;
@@ -119,6 +128,60 @@ export function wrapToolHandler(
             },
           ],
         };
+      }
+
+      // Opt-in background execution for long bulk sweeps. Only honored for
+      // tools that declare support: returning an id before the work happens is
+      // only useful when the caller can poll for the outcome, and only safe
+      // when the action records enough to be undone.
+      if (params.background === true && BACKGROUNDABLE_TOOLS.has(canonicalToolName)) {
+        try {
+          const intent = await deps.executor.executeInBackground({
+            tool: canonicalToolName,
+            toolParams: params,
+            accountId: resolvedAccountId,
+            agentId: deps.agentId,
+            risk: policyResult.risk,
+          });
+
+          const load = deps.executor.backgroundLoad();
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({
+                  status: 'executing',
+                  intent_id: intent.id,
+                  queue: load,
+                  message: `${toolDef.name} started in the background.`,
+                  how_to_check: `Poll get_intent with intent_id "${intent.id}" until status is "executed" or "failed".`,
+                  how_to_undo: `undo_intent with intent_id "${intent.id}" once it reports "executed".`,
+                }),
+              },
+            ],
+          };
+        } catch (error) {
+          if (!(error instanceof BackgroundQueueFullError)) throw error;
+
+          // A refusal, not a failure: nothing was queued and nothing needs
+          // undoing. Retry the identical call once the outstanding work drains.
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({
+                  status: 'queue_full',
+                  queued: error.inFlight,
+                  limit: error.limit,
+                  message: error.message,
+                  nothing_happened: true,
+                  what_to_do:
+                    'Poll your outstanding intent_ids with get_intent. When some report "executed", retry this exact call. Work is serialized per account, so queueing more would not make it finish sooner — it would only put more work at risk if the server restarts.',
+                }),
+              },
+            ],
+          };
+        }
       }
 
       // Execute immediately
