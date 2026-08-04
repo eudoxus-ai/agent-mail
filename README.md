@@ -305,36 +305,48 @@ It distinguishes the three cases that look identical from outside:
 
 - **Queued.** `queue_depth` above 1 on an account with an `in_flight` operation. Borrows serialize per account, so a one-message job behind a full-history sweep waits for it. Not stuck — just behind something.
 - **Wedged.** An `in_flight` operation whose `elapsed_ms` is climbing toward `operation_timeout_ms`. It will be abandoned at that point and the account will recover.
-- **Orphaned.** Intents at `executing` with *no* operation in flight. The process restarted mid-action; they will never finish on their own. Re-run them — `hold_by_sender` is idempotent.
+- **Orphaned.** Intents at `executing` with *no* operation in flight and no worker claim. These predate the queue: the process restarted mid-action and nothing will finish them. Re-run them — `hold_by_sender` is idempotent. Queued work does not end up here; a claim whose worker dies is requeued when its lease expires.
 
 `connections.leaked` is a computed check: `opened - closed` should equal `live`, and `live` should never exceed the number of configured accounts.
 
 `get_intent` also reports a `progress` field for running actions (`searching`, then `moving` with a message count), so a long job is distinguishable from one that never started.
 
-### Pacing a large batch
+### How work is executed
 
-Background actions are capped at **8 outstanding** (`AGENT_MAIL_MAX_BACKGROUND` to change). Past that, the call is refused with `status: "queue_full"` and `nothing_happened: true` — no intent is created, so there is nothing to reconcile or undo. Poll your outstanding ids, then retry the identical call.
+Mutations are performed by the **daemon**, not by the MCP server. A tool that changes mail writes the action into the ledger at `status: "queued"`, hands back an `intent_id`, and returns. The daemon claims queued work, performs it, and settles the intent to `executed` or `failed`.
 
-The cap is not a throughput control. Work is serialized per account, so a queue of 50 drains at exactly the same rate as a queue of 8 — the cap exists because **queued background work is not durable**. The pool queue is a promise chain in process memory; nothing records "waiting to run". If the server restarts, everything queued is lost while each intent stays marked `executing` forever. Capping the depth bounds how much a restart can strand.
+That split is the point: the queue is on disk, so accepted work survives a restart of either process. It also means **nothing happens if the daemon is not running.** Every surface says so —
 
-So: work through a long list in batches of about eight, polling between. Firing everything at once is no faster and risks far more.
+- the tool response carries `daemon_running: false` and a `warning`,
+- `get_intent` on a queued action says the same,
+- `get_diagnostics` leads with a `worker` block and names it in the `interpretation`,
+- `agent-mail status` opens with a banner,
+- the MCP server logs it at `error` on startup.
+
+Nothing is lost while the daemon is down. Queued work drains as soon as it starts, which is why **re-running an action that is merely slow will duplicate it** — poll `get_intent` instead.
+
+There is no batch-size limit. Filing fifty holds at once is fine: they queue durably and drain one at a time per account. (An earlier version capped outstanding background work at 8, because it ran in the MCP process' memory and a restart lost it. That reason is gone.) A `status: "queue_overflow"` refusal at 1000 queued actions is a runaway-loop backstop, not backpressure — it means something is filing in a loop. Nothing is queued by a refused call, so there is nothing to reconcile or undo.
 
 ### Long bulk sweeps
 
-`hold_messages` and `hold_by_sender` accept `background: true`. The call returns an `intent_id` right away and the move runs in the background:
+`hold_messages` and `hold_by_sender` take `background: true` (the default for `hold_by_sender`). The call queues the work and returns an `intent_id` right away:
 
 ```json
 {
-  "status": "executing",
+  "status": "queued",
   "intent_id": "3f9a…",
+  "queue_depth": 3,
+  "daemon_running": true,
   "how_to_check": "Poll get_intent with intent_id \"3f9a…\" until status is \"executed\" or \"failed\".",
   "how_to_undo": "undo_intent with intent_id \"3f9a…\" once it reports \"executed\"."
 }
 ```
 
-Use it for full-history sweeps — anything with no `since` floor over a large mailbox, especially on iCloud. A synchronous call that outruns the client's patience gives you a timeout, and a timeout tells you nothing: the move may have completed with the response lost, or never have run at all. Worse, you get no `intent_id`, so the batch can't be undone. With `background: true` the id exists before any mail moves, so the outcome is always knowable and always reversible.
+Use it for full-history sweeps — anything with no `since` floor over a large mailbox, especially on iCloud. A synchronous call that outruns the client's patience gives you a timeout, and a timeout tells you nothing: the move may have completed with the response lost, or never have run at all. Worse, you get no `intent_id`, so the batch can't be undone. Queued, the id exists before any mail moves, so the outcome is always knowable and always reversible.
 
-Targets are recorded in the ledger *before* each move and confirmed after, so even a sweep interrupted partway leaves a restorable record. `agent-mail status` lists any actions that died mid-execution, with the intent id to undo them.
+Targets are recorded in the ledger *before* each move and confirmed after, so even a sweep interrupted partway leaves a restorable record. If the daemon dies mid-job, the lease on its claim expires and another worker picks the job up — up to three attempts, after which the intent is marked `failed` with an explanation rather than retried forever.
+
+`agent-mail status` lists any actions that died mid-execution, with the intent id to undo them.
 
 ## Policy
 

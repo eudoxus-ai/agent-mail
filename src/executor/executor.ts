@@ -119,25 +119,30 @@ interface SearchThreadsMultiPayload {
 }
 
 /**
- * Raised when too much background work is already outstanding.
+ * The depth at which a queue this long has to be a bug.
  *
- * Queued background jobs are not durable: the pool queue is a promise chain in
- * process memory and nothing records "waiting to run". A restart therefore
- * vaporizes everything queued while leaving each intent marked `executing`
- * forever. Capping the depth bounds how much can be lost that way — it is not
- * a throughput control, since per-account serialization means the queue drains
- * at the same rate however fast it is filled.
+ * Not backpressure. The old cap of 8 existed because queued background work
+ * was not durable — a promise chain in process memory that a restart
+ * vaporized, leaving every intent marked `executing` forever — so bounding the
+ * depth bounded the loss. Queued work is on disk now and survives a restart,
+ * which is why fifty holds in one go is a reasonable thing to do and no longer
+ * needs refusing. This bound exists only so a runaway loop cannot fill the
+ * ledger unnoticed.
  */
-export class BackgroundQueueFullError extends Error {
+export const QUEUE_SANITY_LIMIT = 1000;
+
+/** Raised when the queue is so deep that something is looping. */
+export class QueueOverflowError extends Error {
   constructor(
-    readonly inFlight: number,
+    readonly queued: number,
     readonly limit: number
   ) {
     super(
-      `${inFlight} background action(s) already outstanding (limit ${limit}). ` +
-        'Poll the ones you have with get_intent until they report "executed", then queue more.'
+      `${queued} actions are already queued (limit ${limit}). That is far more than ` +
+        'a person files by hand, so something is probably looping. Nothing was queued ' +
+        'by this call.'
     );
-    this.name = 'BackgroundQueueFullError';
+    this.name = 'QueueOverflowError';
   }
 }
 
@@ -233,12 +238,6 @@ export function isMutatingTool(tool: string): boolean {
   return MUTATING_TOOLS.has(tool);
 }
 
-function maxBackgroundJobs(): number {
-  const raw = process.env.AGENT_MAIL_MAX_BACKGROUND;
-  const parsed = raw ? Number.parseInt(raw, 10) : NaN;
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 8;
-}
-
 export interface ExecutorDeps {
   db: Database;
   accounts: AccountConfig[];
@@ -266,8 +265,6 @@ export class Executor {
   private readonly pendingUndos = new Set<string>();
   private cache: Database | null;
   private cacheConfig: CacheConfig;
-  /** Background actions started but not yet settled. */
-  private backgroundInFlight = 0;
 
   constructor(deps: ExecutorDeps) {
     this.db = deps.db;
@@ -278,9 +275,12 @@ export class Executor {
     this.cacheConfig = deps.cacheConfig ?? DEFAULT_CACHE_CONFIG;
   }
 
-  /** Outstanding background actions and the cap on them. */
-  backgroundLoad(): { in_flight: number; limit: number } {
-    return { in_flight: this.backgroundInFlight, limit: maxBackgroundJobs() };
+  /** How much accepted work is waiting on the daemon. */
+  queueLoad(): { queued: number; limit: number } {
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS n FROM intents WHERE status = 'queued'`)
+      .get() as { n: number };
+    return { queued: Number(row.n ?? 0), limit: QUEUE_SANITY_LIMIT };
   }
 
   /** Fire-and-forget cache maintenance after a successful IMAP mutation (D2). */
@@ -376,31 +376,32 @@ export class Executor {
   }
 
   /**
-   * Create the intent, hand back its id, then run the action in the background.
+   * Write the action to the queue and hand back its id. Nothing runs here.
    *
    * Bulk mailbox sweeps over a slow provider can outlast any client's patience,
    * and a client-side timeout is not a signal about what happened on the
    * server — the same timeout can mean "finished, response lost" or "never
-   * ran". Either way the caller was left with no intent id, so the batch could
-   * not be undone and the only recovery was to re-run and compare.
+   * ran". Returning the id first makes the outcome knowable either way: poll
+   * `get_intent` for the terminal status.
    *
-   * Returning the id first makes the outcome knowable regardless: poll
-   * `get_intent` for the terminal status. It also survives a process death,
-   * because the intent is already on disk in `executing` — which is exactly
-   * what distinguishes a crash from a slow provider after the fact.
+   * The work used to run right here, in a fire-and-forget closure. That made
+   * the id a promise this process could not keep: a restart vaporized the
+   * closure and left the intent reading `executing` forever, indistinguishable
+   * from a slow provider. The daemon performs it now, and `queued` is a state
+   * that survives on disk.
    */
-  async executeInBackground(params: {
+  async enqueue(params: {
     tool: string;
     toolParams: Record<string, unknown>;
     accountId: string;
     agentId: string;
     risk: RiskLevel;
   }): Promise<Intent> {
-    const limit = maxBackgroundJobs();
-    if (this.backgroundInFlight >= limit) {
-      // Reject before creating an intent, so a refused request leaves no
-      // record stuck at `executing`.
-      throw new BackgroundQueueFullError(this.backgroundInFlight, limit);
+    const { queued, limit } = this.queueLoad();
+    if (queued >= limit) {
+      // Refuse before creating an intent, so nothing is left behind to
+      // reconcile — the caller can retry the identical call verbatim.
+      throw new QueueOverflowError(queued, limit);
     }
 
     const intent = createIntent(this.db, {
@@ -419,64 +420,12 @@ export class Executor {
       detail: buildAuditSummary(params.tool, 'created', params.toolParams),
     });
 
-    updateIntentStatus(this.db, intent.id, 'executing');
-    logAudit(this.db, {
-      intent_id: intent.id,
-      account_id: params.accountId,
-      action: 'executing',
-      actor: 'policy',
-      detail: buildAuditSummary(params.tool, 'executing', params.toolParams),
-    });
+    // `queued`, not `executing`. The distinction is the whole point: executing
+    // claims something is happening, and for a year the most common reason it
+    // was not was that nothing was ever going to.
+    updateIntentStatus(this.db, intent.id, 'queued');
 
-    const running = getIntent(this.db, intent.id)!;
-
-    // Deliberately not awaited. Every path inside settles the intent status,
-    // and the catch-all guarantees no unhandled rejection can reach the top
-    // level — an unhandled rejection here would kill the server, which is the
-    // failure this whole change exists to make survivable.
-    this.backgroundInFlight += 1;
-    void (async () => {
-      try {
-        await this.performAction(running);
-        const isDryRun = params.toolParams.dry_run === true;
-        updateIntentStatus(this.db, running.id, 'executed', {
-          resolved_by: 'policy',
-          undo_token: isDryRun
-            ? undefined
-            : (generateUndoToken(params.tool, params.toolParams) ?? undefined),
-          undo_expires_at: isDryRun ? undefined : (getUndoExpiry(params.tool) ?? undefined),
-        });
-        logAudit(this.db, {
-          intent_id: running.id,
-          account_id: params.accountId,
-          action: 'executed',
-          actor: 'policy',
-          detail: buildAuditSummary(params.tool, 'executed', params.toolParams),
-        });
-      } catch (error) {
-        const errorDetail =
-          error instanceof HoldBySenderBlockedError
-            ? error.errorDetail
-            : { message: error instanceof Error ? error.message : String(error) };
-        updateIntentStatus(this.db, running.id, 'failed', { error_detail: errorDetail });
-        logAudit(this.db, {
-          intent_id: running.id,
-          account_id: params.accountId,
-          action: 'failed',
-          actor: 'policy',
-          detail: buildAuditSummary(params.tool, 'failed', params.toolParams, errorDetail),
-        });
-        this.logger.warn('Background execution failed', {
-          intent_id: running.id,
-          tool: params.tool,
-          error: errorDetail.message,
-        });
-      } finally {
-        this.backgroundInFlight -= 1;
-      }
-    })();
-
-    return running;
+    return getIntent(this.db, intent.id)!;
   }
 
   /**
@@ -1214,9 +1163,9 @@ export class Executor {
       },
       accounts: pool.accounts,
       operation_timeout_ms: pool.operation_timeout_ms,
-      // Queued background work is NOT durable — it lives in process memory.
-      // A restart orphans all of it, which is why the depth is capped.
-      background: this.backgroundLoad(),
+      // Accepted work waiting on the daemon. Durable: it is in the ledger, so
+      // a restart delays it rather than losing it.
+      queue: this.queueLoad(),
       executing_intents: stuck,
       interpretation: buildInterpretation({
         busyCount: busy.length,

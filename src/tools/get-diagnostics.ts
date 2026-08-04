@@ -4,7 +4,7 @@ import type { ToolDefinition } from '../types.js';
 export const getDiagnosticsTool: ToolDefinition = {
   name: 'get_diagnostics',
   description:
-    'Live internal state of the running MCP server: IMAP connection pool health, per-account queue depth, the operation currently in flight and how long it has been running, any actions stuck mid-execution, and runtime info. Use this when tool calls hang, time out, or when background intents sit at "executing" without progressing — it distinguishes "queued behind a slow operation" from "wedged" from "the process restarted". This state lives only inside the server process, so no CLI command can show it.',
+    'Health of the whole system: whether the daemon that performs queued mutations is alive, how much work is queued and how long the oldest has waited, IMAP connection pool state, per-account queue depth, the operation currently in flight and how long it has been running, any actions stuck mid-execution, and runtime info. Call this FIRST when a mutation sits at "queued" without progressing — the usual cause is that the daemon is not running, and the `worker` block plus `interpretation` say so directly and give the command to fix it. Also use it when tool calls hang or time out: it distinguishes "queued behind a slow operation" from "wedged" from "the process restarted". Pool state lives only inside the server process, so no CLI command can show it.',
   inputSchema: z.object({}),
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   async execute() {

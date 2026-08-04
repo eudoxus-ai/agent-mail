@@ -17,7 +17,7 @@ const inputSchema = z.object({
     .boolean()
     .optional()
     .describe(
-      'Return an intent_id immediately and perform the move in the background instead of waiting for it to finish. Strongly recommended for large sweeps: a client-side timeout on a synchronous call tells you nothing about whether the move happened, and leaves you with no intent_id to undo. Poll get_intent(intent_id) until status is "executed" or "failed". Default false.'
+      'Queue the move and return an intent_id immediately with status "queued" instead of waiting for it to finish; the agent-mail daemon performs it. Strongly recommended for large sweeps: a client-side timeout on a synchronous call tells you nothing about whether the move happened, and leaves you with no intent_id to undo. Poll get_intent(intent_id) until status is "executed" or "failed". "queued" is normal and durable — do NOT re-run it, that duplicates the move; if it stays queued, call get_diagnostics. Default false.'
     ),
 });
 

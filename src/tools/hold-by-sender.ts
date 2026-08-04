@@ -41,7 +41,7 @@ const inputSchema = z.object({
     .optional()
     .default(true)
     .describe(
-      'Default TRUE for this tool. Returns an intent_id immediately and performs the move in the background; poll get_intent(intent_id) until status is "executed" or "failed". This is the default because a sender sweep has no upper bound on size — a synchronous call can outrun the client timeout, and that timeout tells you nothing about whether the move happened while leaving you no intent_id to undo with. Pass false only for senders you know are small and you want the moved-message list inline.'
+      'Default TRUE for this tool. Queues the sweep and returns an intent_id immediately with status "queued"; the agent-mail daemon performs it. Poll get_intent(intent_id) until status is "executed" or "failed". "queued" is normal and means the work is recorded and durable — do NOT re-run it, that duplicates the move. If it stays queued, call get_diagnostics: the daemon may not be running. This is the default because a sender sweep has no upper bound on size — a synchronous call can outrun the client timeout, and that timeout tells you nothing about whether the move happened while leaving you no intent_id to undo with. Pass false only for senders you know are small and you want the moved-message list inline.'
     ),
 });
 

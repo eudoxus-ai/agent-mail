@@ -324,34 +324,51 @@ The bar: **a user must never believe they filed fifty holds and have filed none.
 
 ## Phase 5 — Cut bulk holds over
 
-### Task 5.1: Enqueue instead of executing in-process
+### Task 5.1: Enqueue instead of executing in-process — **done**
 
-- [ ] **Step 1: Write the failing tests** — extend `test/server/background-execution.test.ts`
+> Also carries the queued-mutation surface deferred from Task 4.2:
+> `daemon_running` and `warning` on the enqueue response. Depth comes from
+> `describeWorkerState`'s own read rather than a second `queueLoad()` call, so
+> liveness and depth cannot disagree within one response — and the middleware
+> needs one less method on the executor for stubs to drift from.
+
+- [x] **Step 1: Write the failing tests** — extend `test/server/background-execution.test.ts`
   - `hold_by_sender` creates an intent at `queued` and returns its id.
   - The MCP-side executor does **not** run the action (no IMAP calls).
   - The response keeps `intent_id`, `how_to_check`, `how_to_undo`.
-- [ ] **Step 2: Verify they fail**
-- [ ] **Step 3: Implement** — replace `executeInBackground`'s in-memory IIFE with a `queued` insert. Delete the fire-and-forget closure entirely; it must not survive as a fallback.
-- [ ] **Step 4: Verify PASS**
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Verify they fail**
+- [x] **Step 3: Implement** — replace `executeInBackground`'s in-memory IIFE with a `queued` insert. Delete the fire-and-forget closure entirely; it must not survive as a fallback.
+- [x] **Step 4: Verify PASS**
+- [x] **Step 5: Commit**
 
-### Task 5.2: Remove the background cap
+### Task 5.2: Remove the background cap — **done**
 
-- [ ] **Step 1: Write the failing test** — 50 queued holds all succeed; no `queue_full`.
-- [ ] **Step 2: Verify it fails**
-- [ ] **Step 3: Implement** — delete `BackgroundQueueFullError`, `backgroundInFlight`, `AGENT_MAIL_MAX_BACKGROUND`, and the `queue_full` branch. Keep a much higher sanity bound (say 1000 queued) purely as a runaway-loop backstop, with its own distinct error.
-- [ ] **Step 4: Verify PASS** — and delete the now-obsolete cap tests rather than leaving them asserting removed behavior.
-- [ ] **Step 5: Commit**
+> `BackgroundQueueFullError`, `backgroundInFlight`, `AGENT_MAIL_MAX_BACKGROUND`
+> and the `queue_full` branch are gone, along with the fire-and-forget closure
+> in `executeInBackground` — which is deleted, not kept as a fallback.
+> `QueueOverflowError` at 1000 queued replaces it as a runaway-loop backstop
+> with its own status (`queue_overflow`) and its own advice.
 
-### Task 5.3: End-to-end, real SQLite
+- [x] **Step 1: Write the failing test** — 50 queued holds all succeed; no `queue_full`.
+- [x] **Step 2: Verify it fails**
+- [x] **Step 3: Implement** — delete `BackgroundQueueFullError`, `backgroundInFlight`, `AGENT_MAIL_MAX_BACKGROUND`, and the `queue_full` branch. Keep a much higher sanity bound (say 1000 queued) purely as a runaway-loop backstop, with its own distinct error.
+- [x] **Step 4: Verify PASS** — and delete the now-obsolete cap tests rather than leaving them asserting removed behavior.
+- [x] **Step 5: Commit**
 
-- [ ] **Step 1: Write the failing test**
+### Task 5.3: End-to-end, real SQLite — **done**
+
+> `test/server/queue-end-to-end.test.ts`: two connections to one temp file, the
+> middleware on one and a worker on the other, sharing nothing but the file.
+> Mutation-checked both ways — leaving the intent at `pending`, and running the
+> action inline the way the old path did, each fail three of the four tests.
+
+- [x] **Step 1: Write the failing test**
   - Enqueue via the middleware, run a worker against the same database file, assert the intent reaches `executed` and targets are recorded.
   - Restart simulation: enqueue 5, run the worker for one job, drop it, start a new worker, assert all 5 finish. **This is the test that would have caught the original bug.**
-- [ ] **Step 2: Verify it fails**
-- [ ] **Step 3: Implement** — no new code expected.
-- [ ] **Step 4: Verify PASS**
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Verify it fails**
+- [x] **Step 3: Implement** — no new code expected.
+- [x] **Step 4: Verify PASS**
+- [x] **Step 5: Commit**
 
 **Ship gate:** merge here. Bulk holds are durable, the cap is gone, a missing daemon is loud.
 
