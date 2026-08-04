@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { openDatabase } from '../../src/ledger/db.js';
 import { runMigrations } from '../../src/ledger/migrations.js';
 import { DatabaseSync, type Database } from '../../src/ledger/sqlite.js';
-import { claimNext } from '../../src/ledger/queue.js';
+import { claimNext, heartbeat, reclaimExpired } from '../../src/ledger/queue.js';
 
 /**
  * The ledger becomes the queue.
@@ -197,6 +197,162 @@ describe('claimNext', () => {
     ).run();
 
     expect(claimNext(db, 'worker-1', 60_000)).toBeNull();
+  });
+});
+
+/**
+ * The lease is what makes a dead worker recoverable rather than a permanent
+ * hole. A worker holds its claim by heartbeating; when the heartbeats stop, the
+ * lease lapses and the job goes back in the queue.
+ */
+describe('heartbeat', () => {
+  function claimOne(worker = 'worker-1', leaseMs = 60_000) {
+    db.prepare(
+      `INSERT INTO intents (id, account_id, tool, params, risk, status)
+       VALUES ('a', 'icloud', 'hold_by_sender', '{}', 'medium', 'queued')`
+    ).run();
+    return claimNext(db, worker, leaseMs)!;
+  }
+
+  function leaseOf(id: string): string {
+    return (
+      db.prepare(`SELECT lease_expires_at FROM intents WHERE id = ?`).get(id) as {
+        lease_expires_at: string;
+      }
+    ).lease_expires_at;
+  }
+
+  it('pushes the lease out', () => {
+    const claimed = claimOne('worker-1', 1_000);
+    const before = leaseOf(claimed.id);
+
+    expect(heartbeat(db, claimed.id, 'worker-1', 60_000)).toBe(true);
+
+    expect(new Date(leaseOf(claimed.id)).getTime()).toBeGreaterThan(
+      new Date(before).getTime()
+    );
+  });
+
+  it('refuses a worker that does not hold the claim', () => {
+    const claimed = claimOne('worker-1', 1_000);
+    const before = leaseOf(claimed.id);
+
+    // Otherwise a worker that lost its claim to reclaim could keep extending
+    // the lease of whoever took the job over from it.
+    expect(heartbeat(db, claimed.id, 'worker-2', 60_000)).toBe(false);
+    expect(leaseOf(claimed.id)).toBe(before);
+  });
+
+  it('refuses once the job is no longer executing', () => {
+    const claimed = claimOne();
+    db.prepare(`UPDATE intents SET status = 'executed' WHERE id = ?`).run(claimed.id);
+
+    expect(heartbeat(db, claimed.id, 'worker-1', 60_000)).toBe(false);
+  });
+});
+
+describe('reclaimExpired', () => {
+  function claimWithLease(id: string, accountId: string, leaseMs: number): void {
+    db.prepare(
+      `INSERT INTO intents (id, account_id, tool, params, risk, status)
+       VALUES (?, ?, 'hold_by_sender', '{}', 'medium', 'queued')`
+    ).run(id, accountId);
+    claimNext(db, 'dead-worker', leaseMs);
+  }
+
+  function statusOf(id: string) {
+    return db
+      .prepare(
+        `SELECT status, claimed_by, lease_expires_at, attempts, error_detail
+           FROM intents WHERE id = ?`
+      )
+      .get(id) as {
+      status: string;
+      claimed_by: string | null;
+      lease_expires_at: string | null;
+      attempts: number;
+      error_detail: string | null;
+    };
+  }
+
+  it('puts an expired claim back in the queue', () => {
+    claimWithLease('a', 'icloud', -1_000); // already expired
+
+    const result = reclaimExpired(db);
+
+    expect(result.requeued).toEqual(['a']);
+    const row = statusOf('a');
+    expect(row.status).toBe('queued');
+    // The claim must be cleared too, or the per-account rule keeps treating
+    // this account as busy and nothing on it ever runs again.
+    expect(row.claimed_by).toBeNull();
+    expect(row.lease_expires_at).toBeNull();
+  });
+
+  it('leaves a live lease alone', () => {
+    claimWithLease('a', 'icloud', 60_000);
+
+    expect(reclaimExpired(db).requeued).toEqual([]);
+    expect(statusOf('a').status).toBe('executing');
+  });
+
+  it('leaves an unclaimed executing intent alone', () => {
+    // Legacy rows from the in-process path have no claim and no lease. They are
+    // not the queue's to reclaim — requeuing them would re-run a mutation that
+    // may well have completed.
+    db.prepare(
+      `INSERT INTO intents (id, account_id, tool, params, risk, status)
+       VALUES ('legacy', 'icloud', 'hold_by_sender', '{}', 'medium', 'executing')`
+    ).run();
+
+    expect(reclaimExpired(db).requeued).toEqual([]);
+    expect(statusOf('legacy').status).toBe('executing');
+  });
+
+  it('gives up after too many attempts instead of requeuing forever', () => {
+    claimWithLease('a', 'icloud', -1_000);
+    // Two prior attempts already burned; this expiry is the third.
+    db.prepare(`UPDATE intents SET attempts = 3 WHERE id = 'a'`).run();
+
+    const result = reclaimExpired(db);
+
+    expect(result.requeued).toEqual([]);
+    expect(result.failed).toEqual(['a']);
+
+    const row = statusOf('a');
+    expect(row.status).toBe('failed');
+    // A bare 'failed' with no explanation is what sent the last round of
+    // debugging in circles. Say what happened and how many times.
+    const detail = JSON.parse(row.error_detail!) as {
+      code: string;
+      attempts: number;
+      message: string;
+    };
+    expect(detail.code).toBe('lease_expired_max_attempts');
+    expect(detail.attempts).toBe(3);
+    expect(detail.message).toMatch(/3/);
+  });
+
+  it('requeues one job and fails another in the same sweep', () => {
+    claimWithLease('a', 'icloud', -1_000);
+    claimWithLease('b', 'gmail', -1_000);
+    db.prepare(`UPDATE intents SET attempts = 3 WHERE id = 'b'`).run();
+
+    const result = reclaimExpired(db);
+
+    expect(result.requeued).toEqual(['a']);
+    expect(result.failed).toEqual(['b']);
+  });
+
+  it('makes a reclaimed job claimable again', () => {
+    claimWithLease('a', 'icloud', -1_000);
+    reclaimExpired(db);
+
+    const reclaimed = claimNext(db, 'worker-2', 60_000);
+
+    expect(reclaimed?.id).toBe('a');
+    // Attempt two. The count is what eventually stops a poison job.
+    expect(reclaimed?.attempts).toBe(2);
   });
 });
 
