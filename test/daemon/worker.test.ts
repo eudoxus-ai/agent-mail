@@ -3,6 +3,7 @@ import { openDatabase } from '../../src/ledger/db.js';
 import type { Database } from '../../src/ledger/sqlite.js';
 import { createLogger } from '../../src/logger.js';
 import { getIntent, updateIntentStatus } from '../../src/ledger/intents.js';
+import { getWorkerHeartbeat, isWorkerAlive } from '../../src/ledger/worker-heartbeat.js';
 import type { Intent } from '../../src/types.js';
 
 // Spy on the heartbeat without changing it. A leaked heartbeat timer is
@@ -324,6 +325,60 @@ describe('QueueWorker drain loop', () => {
     heartbeatCalls.count = 0;
     await new Promise((resolve) => setTimeout(resolve, 60));
     expect(heartbeatCalls.count).toBe(0);
+  });
+
+  it('announces itself in the ledger as soon as it starts', async () => {
+    // Not on the first tick, not after the first job — immediately. Everything
+    // that reports "is anything draining the queue?" reads this row, and a
+    // daemon that has started but not yet beaten would be reported as down.
+    const { executor } = stubExecutor();
+    const worker = makeWorker(executor, { workerId: 'announcer' });
+
+    worker.start();
+    try {
+      const beat = getWorkerHeartbeat(db)!;
+      expect(beat.worker_id).toBe('announcer');
+      expect(beat.pid).toBe(process.pid);
+      expect(isWorkerAlive(db)).toBe(true);
+    } finally {
+      await worker.stop();
+    }
+  });
+
+  it('keeps beating while it runs', async () => {
+    const { executor } = stubExecutor();
+    const worker = makeWorker(executor, { heartbeatIntervalMs: 10 });
+
+    worker.start();
+    try {
+      const first = getWorkerHeartbeat(db)!.last_seen_at;
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(Date.parse(getWorkerHeartbeat(db)!.last_seen_at)).toBeGreaterThan(
+        Date.parse(first)
+      );
+    } finally {
+      await worker.stop();
+    }
+  });
+
+  it('withdraws the announcement when it stops, and does not renew it', async () => {
+    const { executor } = stubExecutor();
+    const worker = makeWorker(executor, { heartbeatIntervalMs: 10 });
+
+    worker.start();
+    await worker.stop();
+
+    // A deliberately stopped daemon must not read as alive for another minute
+    // — that is the window where someone runs a command, sees nothing wrong,
+    // and walks away from a queue that is going nowhere.
+    expect(getWorkerHeartbeat(db)).toBeNull();
+    expect(isWorkerAlive(db)).toBe(false);
+
+    // And it must stay withdrawn. A liveness timer left running would put the
+    // row back on its next beat, which is worse than never clearing it: the
+    // daemon would look healthy precisely because it had been stopped.
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(getWorkerHeartbeat(db)).toBeNull();
   });
 
   it('drains on its own once started', async () => {

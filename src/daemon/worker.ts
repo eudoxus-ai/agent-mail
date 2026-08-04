@@ -6,6 +6,11 @@ import type { Executor } from '../executor/executor.js';
 import type { Intent } from '../types.js';
 import { claimNext, heartbeat, reclaimExpired } from '../ledger/queue.js';
 import { updateIntentStatus } from '../ledger/intents.js';
+import {
+  recordWorkerHeartbeat,
+  clearWorkerHeartbeat,
+  HEARTBEAT_INTERVAL_MS,
+} from '../ledger/worker-heartbeat.js';
 
 export interface QueueWorkerDeps {
   db: Database;
@@ -21,6 +26,8 @@ export interface QueueWorkerDeps {
   maxConcurrent?: number;
   /** Identifies this worker in the ledger. Defaults to host + pid + a uuid. */
   workerId?: string;
+  /** How often to record liveness for other processes to read. */
+  heartbeatIntervalMs?: number;
 }
 
 /** Long enough to outlive the pool's 5-minute default with room to spare. */
@@ -64,7 +71,10 @@ export class QueueWorker {
   private readonly maxConcurrent: number;
   readonly workerId: string;
 
+  private readonly heartbeatIntervalMs: number;
+
   private timer: NodeJS.Timeout | null = null;
+  private liveness: NodeJS.Timeout | null = null;
   private stopped = false;
   private ticking = false;
   private readonly inFlight = new Map<string, Promise<void>>();
@@ -78,6 +88,7 @@ export class QueueWorker {
     this.tickMs = deps.tickMs ?? DEFAULT_TICK_MS;
     this.maxConcurrent = deps.maxConcurrent ?? DEFAULT_MAX_CONCURRENT;
     this.workerId = deps.workerId ?? `${hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`;
+    this.heartbeatIntervalMs = deps.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS;
 
     if (this.leaseMs <= this.operationTimeoutMs) {
       // Not clamped, not warned about — thrown. A lease that can expire while
@@ -104,12 +115,29 @@ export class QueueWorker {
   start(): void {
     if (this.timer) return;
     this.stopped = false;
+
+    // Announce before the first tick, not after it. Everything that answers
+    // "is anything draining the queue?" reads this row, and a daemon that has
+    // started but not yet beaten would be reported as down.
+    this.beat();
+    this.liveness = setInterval(() => this.beat(), this.heartbeatIntervalMs);
+    this.liveness.unref?.();
+
     this.timer = setInterval(() => {
       void this.tick();
     }, this.tickMs);
     // Don't hold the process open on our account; the daemon decides that.
     this.timer.unref?.();
     void this.tick();
+  }
+
+  private beat(): void {
+    try {
+      recordWorkerHeartbeat(this.db, { workerId: this.workerId, pid: process.pid });
+    } catch (error) {
+      // Liveness reporting must never be the reason the queue stops draining.
+      this.logger.warn('Could not record worker liveness', { error: describe(error) });
+    }
   }
 
   /**
@@ -125,7 +153,20 @@ export class QueueWorker {
       clearInterval(this.timer);
       this.timer = null;
     }
+    if (this.liveness) {
+      clearInterval(this.liveness);
+      this.liveness = null;
+    }
     await this.drain();
+
+    // Withdraw the announcement last, after the final job has settled: until
+    // then this process really is still working, and reporting otherwise would
+    // invite a second daemon to start beside it.
+    try {
+      clearWorkerHeartbeat(this.db);
+    } catch (error) {
+      this.logger.warn('Could not clear worker liveness', { error: describe(error) });
+    }
   }
 
   /** Wait for in-flight jobs without stopping the loop. */

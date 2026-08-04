@@ -177,4 +177,20 @@ export function runMigrations(db: Database): void {
       ON intents(status, created_at)
       WHERE status IN ('queued', 'executing')
   `);
+
+  // Migration 10: somewhere for the worker to say it is alive.
+  //
+  // The worker runs inside the daemon; the MCP server and the CLI are separate
+  // processes that can see nothing of it. The ledger file is the only thing all
+  // three share, so liveness is written here. Single row on purpose — this
+  // answers one question, and a growing log would cost a long-running daemon
+  // writes nobody reads.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS worker_heartbeat (
+      id           INTEGER PRIMARY KEY CHECK (id = 1),
+      worker_id    TEXT    NOT NULL,
+      pid          INTEGER NOT NULL,
+      last_seen_at DATETIME NOT NULL
+    )
+  `);
 }
