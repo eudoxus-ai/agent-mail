@@ -361,42 +361,11 @@ export async function printCacheStatus(): Promise<void> {
   try {
     const { openCache } = await import('../cache/db.js');
     const { loadCacheConfig } = await import('../cache/config.js');
-    const config = loadCacheConfig();
+    const { buildCacheStatusLines } = await import('./cache-status.js');
+
     const cache = openCache(CACHE_DB_PATH, { readOnly: true });
-
-    const rows = cache
-      .prepare(
-        `SELECT s.account_id, s.mailbox, s.backfill_complete, s.oldest_date, s.last_delta_at,
-                (SELECT COUNT(*) FROM messages m
-                 WHERE m.account_id = s.account_id AND m.mailbox = s.mailbox) AS messages,
-                (SELECT COUNT(*) FROM messages m
-                 WHERE m.account_id = s.account_id AND m.mailbox = s.mailbox
-                   AND m.body_state = 'pending') AS pending_bodies
-         FROM mailbox_state s
-         ORDER BY s.account_id, s.mailbox`
-      )
-      .all() as Array<Record<string, number | string | null>>;
-
-    console.log(`Local cache: mode=${config.mode}`);
-    if (rows.length === 0) {
-      console.log('  (no mailboxes synced yet)');
-      return;
-    }
-
-    for (const row of rows) {
-      const complete = row.backfill_complete === 1;
-      const oldest = row.oldest_date
-        ? new Date(Number(row.oldest_date)).toISOString().slice(0, 10)
-        : '—';
-      const synced = row.last_delta_at
-        ? `${Math.round((Date.now() - Number(row.last_delta_at)) / 1000)}s ago`
-        : 'pending';
-      const bodies = Number(row.pending_bodies) > 0 ? `, ${row.pending_bodies} bodies queued` : '';
-
-      console.log(
-        `  ${row.account_id}/${row.mailbox}: ${row.messages} messages, ` +
-          `${complete ? 'backfill complete' : 'backfilling'}, back to ${oldest}, synced ${synced}${bodies}`
-      );
+    for (const line of buildCacheStatusLines(cache, loadCacheConfig())) {
+      console.log(line);
     }
   } catch (error) {
     console.log(
