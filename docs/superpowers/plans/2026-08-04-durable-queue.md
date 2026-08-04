@@ -27,7 +27,7 @@ Phases 1 and 2–5 are independently shippable. Stop after Phase 5 and the syste
 - `test/server/daemon-down.test.ts`
 
 **Modify:**
-- `src/ledger/migrations.ts` — migrations 7–9.
+- `src/ledger/migrations.ts` — migrations 7–10.
 - `src/ledger/db.ts` — `status` CHECK gains `queued`.
 - `src/ledger/intent-targets.ts` — `uidvalidity` column + generation guard.
 - `src/executor/executor.ts` — enqueue instead of execute; remove the background cap; UIDVALIDITY check before acting on a target.
@@ -46,36 +46,55 @@ A durable queue is at-least-once: a worker that dies after the IMAP move but bef
 
 This is already latent — `undo_intent` and `restore_messages` replay recorded UIDs today — so it ships on its own regardless of the queue.
 
-### Task 1.1: Record UIDVALIDITY on every target
+### Task 1.1: Record UIDVALIDITY on every target — **done** (6e52c7d)
 
-- [ ] **Step 1: Write the failing test** — `test/ledger/uidvalidity-guard.test.ts`
+- [x] **Step 1: Write the failing test** — `test/ledger/uidvalidity-guard.test.ts`
   - `insertIntentTargets` persists `uidvalidity` and `getIntentTargets` returns it.
   - A target inserted without one reads back `null` (back-compat for rows written before this change).
-- [ ] **Step 2: Run, verify it fails**
-- [ ] **Step 3: Implement**
+- [x] **Step 2: Run, verify it fails**
+- [x] **Step 3: Implement**
   - Migration 7: `ALTER TABLE intent_targets ADD COLUMN uidvalidity INTEGER`.
   - Add `uidvalidity?: number` to `IntentTargetInsert` and `uidvalidity: number | null` to `IntentTargetRow`; thread through insert and read.
-- [ ] **Step 4: Verify PASS**
-- [ ] **Step 5: Commit**
+- [x] **Step 4: Verify PASS**
+- [x] **Step 5: Commit**
 
-### Task 1.2: Capture it at hold time
+### Task 1.2: Capture it at hold time — **done** (7803eca)
 
-- [ ] **Step 1: Write the failing test** — extend `test/ledger/crash-recoverability.test.ts`
+- [x] **Step 1: Write the failing test** — `test/executor/hold-uidvalidity.test.ts`
   - A hold records the mailbox's current UIDVALIDITY on each target.
-- [ ] **Step 2: Verify it fails**
-- [ ] **Step 3: Implement** — `holdTargets` already calls `imap.mailboxSnapshot()` indirectly via the pool; fetch `uidValidity` per mailbox once per batch and pass it into `insertIntentTargets`.
-- [ ] **Step 4: Verify PASS**
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Verify it fails**
+- [x] **Step 3: Implement** — `holdTargets` already calls `imap.mailboxSnapshot()` indirectly via the pool; fetch `uidValidity` per mailbox once per batch and pass it into `insertIntentTargets`.
+- [x] **Step 4: Verify PASS**
+- [x] **Step 5: Commit**
 
-### Task 1.3: Refuse to act on a stale generation
+### Task 1.3: Refuse to act on a stale generation — **done**
 
-- [ ] **Step 1: Write the failing test**
-  - `restore_messages` on a target whose recorded `uidvalidity` differs from the mailbox's current value fails with a clear reason and moves nothing.
-  - A target with `uidvalidity: null` (pre-migration row) is allowed through, with a warning logged — refusing would break undo for everything recorded before this change.
-- [ ] **Step 2: Verify it fails**
-- [ ] **Step 3: Implement** — a `assertGenerationMatches(imap, mailbox, recorded)` helper in the executor, called before any replay path (`restore_messages`, `undo_intent`, worker retry).
-- [ ] **Step 4: Verify PASS**
-- [ ] **Step 5: Commit**
+> **Correction found while implementing.** As written, this task guarded the
+> wrong mailbox. `uidvalidity` (Tasks 1.1–1.2) describes the mailbox a message
+> came *from*. But `restore_messages` and the hold undo move `destination_uid`,
+> which lives in the *holding* folder — so checking the source mailbox's
+> generation would miss a rebuild of holding entirely (the actual hazard) while
+> refusing restores into a mailbox that had merely been recreated (a false
+> positive on a safe operation). Implementing it literally would have shipped a
+> guard that looked right and guarded nothing.
+>
+> Fix: a second nullable column, `destination_uidvalidity`, recording the
+> generation of the mailbox `destination_uid` lives in. `uidvalidity` still
+> covers the worker-retry case (replaying a hold reads UIDs out of the source
+> mailbox); `destination_uidvalidity` covers every replay of a completed move.
+> **This shifts the later migration numbers by one: the `intents` rebuild is
+> migration 9 and `worker_heartbeat` is migration 10.**
+
+- [x] **Step 1: Write the failing test** — `test/executor/generation-guard.test.ts`
+  - A hold records the holding folder's generation alongside `destination_uid`.
+  - `restore_messages` on a target whose recorded generation differs from the holding folder's current value fails with a reason naming both values, and moves nothing.
+  - It restores normally when the generation still matches.
+  - A target with a `null` generation (pre-migration row) is allowed through, with a warning logged — refusing would break undo for everything recorded before this change.
+  - `undo_intent` on a hold refuses across a generation change, and moves nothing (undo is all-or-nothing, so it checks every target up front).
+- [x] **Step 2: Verify it fails** — 4 of 5 failed; the matching-generation case passed before and after, as it should.
+- [x] **Step 3: Implement** — migration 8 plus `assertGenerationMatches(imap, mailbox, recorded, {logger, cache})` in the executor, called from `restore_messages`, `move_back_to_inbox`, and `rehold_messages`. Exported for the worker retry in Phase 3.
+- [x] **Step 4: Verify PASS** — 663 passed, 1 skipped.
+- [x] **Step 5: Commit**
 
 **Ship gate:** Phase 1 can merge on its own. Everything below assumes it.
 
@@ -91,7 +110,7 @@ This is already latent — `undo_intent` and `restore_messages` replay recorded 
   - `claimed_by` / `claimed_at` / `lease_expires_at` / `attempts` round-trip.
 - [ ] **Step 2: Verify it fails**
 - [ ] **Step 3: Implement**
-  - Migration 8: SQLite cannot ALTER a CHECK constraint, so rebuild `intents` the way migration 6 rebuilt `intent_targets` — create `intents_v2` with the widened CHECK and the four new columns, `INSERT … SELECT`, drop, rename. Preserve every existing column including `progress`, `reverses_intent_id`, `reversed_by_intent_id`.
+  - Migration 9: SQLite cannot ALTER a CHECK constraint, so rebuild `intents` the way migration 6 rebuilt `intent_targets` — create `intents_v2` with the widened CHECK and the four new columns, `INSERT … SELECT`, drop, rename. Preserve every existing column including `progress`, `reverses_intent_id`, `reversed_by_intent_id`.
   - Index: `CREATE INDEX idx_intents_queued ON intents(status, created_at) WHERE status IN ('queued','executing')`.
 - [ ] **Step 4: Verify PASS** — plus a test that an existing populated ledger survives the rebuild with all rows and columns intact.
 - [ ] **Step 5: Commit**
@@ -202,7 +221,7 @@ The bar: **a user must never believe they filed fifty holds and have filed none.
   - `recordWorkerHeartbeat` writes worker id, pid, and timestamp.
   - `isWorkerAlive(db, staleAfterMs)` is true just after a heartbeat, false once stale, false when none was ever written.
 - [ ] **Step 2: Verify it fails**
-- [ ] **Step 3: Implement** — migration 9 adds a single-row `worker_heartbeat` table; helpers in `src/ledger/worker-heartbeat.ts`. Daemon heartbeats every 15s; stale after 60s.
+- [ ] **Step 3: Implement** — migration 10 adds a single-row `worker_heartbeat` table; helpers in `src/ledger/worker-heartbeat.ts`. Daemon heartbeats every 15s; stale after 60s.
 - [ ] **Step 4: Verify PASS**
 - [ ] **Step 5: Commit**
 
@@ -331,7 +350,7 @@ npm run build
 
 | Risk | Mitigation |
 |---|---|
-| Migration 8 rewrites `intents` | Test against a ledger populated in every status; verify row count and every column after |
+| Migration 9 rewrites `intents` | Test against a ledger populated in every status; verify row count and every column after |
 | Lease shorter than IMAP timeout duplicates work | Startup assertion (Task 2.5) |
 | At-least-once replays a move | Phase 1 generation guard; `hold_by_sender` is naturally idempotent |
 | Worker dies repeatedly on one job | `attempts >= 3` → `failed`, not requeued |

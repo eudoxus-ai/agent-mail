@@ -14,6 +14,8 @@ export interface IntentTargetInsert {
   destination_uid?: number;
   /** UIDVALIDITY of `mailbox` when this UID was captured. */
   uidvalidity?: number;
+  /** UIDVALIDITY of the mailbox `destination_uid` lives in. */
+  destination_uidvalidity?: number;
 }
 
 export interface IntentTargetRow {
@@ -28,6 +30,11 @@ export interface IntentTargetRow {
    * are allowed through rather than refused — see assertGenerationMatches.
    */
   uidvalidity: number | null;
+  /**
+   * The generation that makes `destination_uid` meaningful. This is the one
+   * every replay path checks, because replays move the destination UID.
+   */
+  destination_uidvalidity: number | null;
 }
 
 export function insertIntentTargets(
@@ -45,14 +52,17 @@ export function insertIntentTargets(
     // Keying without it silently overwrote one snapshot with the other and
     // left a moved message unrestorable.
     `INSERT INTO intent_targets
-       (intent_id, account_id, uid, mailbox, envelope_snapshot, destination_uid, uidvalidity)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+       (intent_id, account_id, uid, mailbox, envelope_snapshot, destination_uid,
+        uidvalidity, destination_uidvalidity)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(intent_id, account_id, mailbox, uid) DO UPDATE SET
        envelope_snapshot = COALESCE(excluded.envelope_snapshot, intent_targets.envelope_snapshot),
        destination_uid = COALESCE(excluded.destination_uid, intent_targets.destination_uid),
        -- COALESCE, not overwrite: a retry that omits the generation must not
        -- erase one already recorded, or the guard silently stops guarding.
-       uidvalidity = COALESCE(excluded.uidvalidity, intent_targets.uidvalidity)`
+       uidvalidity = COALESCE(excluded.uidvalidity, intent_targets.uidvalidity),
+       destination_uidvalidity =
+         COALESCE(excluded.destination_uidvalidity, intent_targets.destination_uidvalidity)`
   );
   for (const t of targets) {
     stmt.run(
@@ -62,7 +72,8 @@ export function insertIntentTargets(
       t.mailbox,
       t.envelope_snapshot ? JSON.stringify(t.envelope_snapshot) : null,
       t.destination_uid ?? null,
-      t.uidvalidity ?? null
+      t.uidvalidity ?? null,
+      t.destination_uidvalidity ?? null
     );
   }
 }
@@ -77,26 +88,37 @@ export function updateIntentTargetDestinations(
   intentId: string,
   accountId: string,
   uidMap: Map<number, number>,
-  mailbox?: string
+  mailbox?: string,
+  /** UIDVALIDITY of the mailbox the messages landed in. */
+  destinationUidvalidity?: number
 ): void {
   if (uidMap.size === 0) return;
 
   // Scoped by mailbox when the caller knows it, for the same reason the
   // conflict key includes it: the same UID in two mailboxes is two messages,
   // and an unscoped update would stamp the wrong destination on one of them.
+  //
+  // COALESCE on the generation for the same reason the upsert uses it: the
+  // reconciliation pass that runs after every account finishes calls this
+  // without a generation, and must not erase the one recorded per mailbox.
   const stmt = mailbox
     ? db.prepare(
-        `UPDATE intent_targets SET destination_uid = ?
-         WHERE intent_id = ? AND account_id = ? AND mailbox = ? AND uid = ?`
+        `UPDATE intent_targets
+            SET destination_uid = ?,
+                destination_uidvalidity = COALESCE(?, destination_uidvalidity)
+          WHERE intent_id = ? AND account_id = ? AND mailbox = ? AND uid = ?`
       )
     : db.prepare(
-        `UPDATE intent_targets SET destination_uid = ?
-         WHERE intent_id = ? AND account_id = ? AND uid = ?`
+        `UPDATE intent_targets
+            SET destination_uid = ?,
+                destination_uidvalidity = COALESCE(?, destination_uidvalidity)
+          WHERE intent_id = ? AND account_id = ? AND uid = ?`
       );
 
+  const generation = destinationUidvalidity ?? null;
   for (const [sourceUid, destinationUid] of uidMap) {
-    if (mailbox) stmt.run(destinationUid, intentId, accountId, mailbox, sourceUid);
-    else stmt.run(destinationUid, intentId, accountId, sourceUid);
+    if (mailbox) stmt.run(destinationUid, generation, intentId, accountId, mailbox, sourceUid);
+    else stmt.run(destinationUid, generation, intentId, accountId, sourceUid);
   }
 }
 
@@ -114,7 +136,8 @@ export function getUnconfirmedTargets(
 export function getIntentTargets(db: Database, intentId: string): IntentTargetRow[] {
   const rows = db
     .prepare(
-      `SELECT intent_id, account_id, uid, mailbox, envelope_snapshot, destination_uid, uidvalidity
+      `SELECT intent_id, account_id, uid, mailbox, envelope_snapshot, destination_uid,
+              uidvalidity, destination_uidvalidity
        FROM intent_targets WHERE intent_id = ? ORDER BY account_id, uid`
     )
     .all(intentId) as Array<Record<string, unknown>>;
@@ -128,5 +151,7 @@ export function getIntentTargets(db: Database, intentId: string): IntentTargetRo
       : null,
     destination_uid: r.destination_uid != null ? Number(r.destination_uid) : null,
     uidvalidity: r.uidvalidity != null ? Number(r.uidvalidity) : null,
+    destination_uidvalidity:
+      r.destination_uidvalidity != null ? Number(r.destination_uidvalidity) : null,
   }));
 }

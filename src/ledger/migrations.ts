@@ -99,4 +99,20 @@ export function runMigrations(db: Database): void {
   if (!targetColsV2.map((c) => c.name).includes('uidvalidity')) {
     db.exec(`ALTER TABLE intent_targets ADD COLUMN uidvalidity INTEGER`);
   }
+
+  // Migration 8: record the generation the *destination* UID belongs to.
+  //
+  // `uidvalidity` describes (mailbox, uid) — where the message came from. But
+  // every replay path moves `destination_uid`, which lives in the mailbox the
+  // message was moved *into*: restore and the hold undo both move it back out
+  // of the holding folder. Checking the source mailbox's generation there would
+  // guard the wrong mailbox — it would miss a rebuild of holding entirely while
+  // refusing restores into a mailbox that was merely recreated. Nullable for
+  // the same back-compat reason as migration 7.
+  const targetColsV3 = db
+    .prepare(`PRAGMA table_info(intent_targets)`)
+    .all() as Array<{ name: string }>;
+  if (!targetColsV3.map((c) => c.name).includes('destination_uidvalidity')) {
+    db.exec(`ALTER TABLE intent_targets ADD COLUMN destination_uidvalidity INTEGER`);
+  }
 }
