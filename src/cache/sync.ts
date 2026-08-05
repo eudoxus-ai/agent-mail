@@ -221,10 +221,33 @@ export async function syncMailbox(
       Object.assign(result, await runFallback(db, options, mailbox, snapshot.uidValidity, state?.uidnext ?? 0));
     }
 
-    result.bodiesFetched = await drainBodies(db, options, mailbox, snapshot.uidValidity);
-
+    // Record the envelope sync as done BEFORE touching bodies.
+    //
+    // Bodies used to be fetched first, so a body fetch that hit the pool's
+    // timeout threw past this line and the mailbox was marked failed with its
+    // timestamp never advancing — while its envelopes had synced perfectly.
+    // Status then reported the whole account stale and unusable, every tick,
+    // for as long as any body fetch was slow. Envelopes are what searches,
+    // sender sweeps and coverage actually use; bodies only add full-text.
     refreshOldestDate(db, accountId, mailbox);
     upsertMailboxState(db, accountId, mailbox, { last_delta_at: now() });
+
+    try {
+      result.bodiesFetched = await drainBodies(db, options, mailbox, snapshot.uidValidity);
+    } catch (error) {
+      // Best-effort, and named as such: "Connection not available" recorded
+      // against a mailbox sent a whole debugging session after the wrong
+      // thing. The rows stay `pending` and the next pass picks them up.
+      const message = error instanceof Error ? error.message : String(error);
+      options.logger?.warn('cache: body fetch failed, envelopes are still current', {
+        account_id: accountId,
+        mailbox,
+        error: message,
+      });
+      upsertMailboxState(db, accountId, mailbox, {
+        last_error: `message bodies could not be fetched (envelopes are current): ${message}`,
+      });
+    }
 
     const finalState = getMailboxState(db, accountId, mailbox);
     result.backfillComplete = finalState?.backfill_complete === 1;

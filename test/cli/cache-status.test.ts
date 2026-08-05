@@ -36,8 +36,11 @@ function mailbox(
   } as never);
 }
 
-function lines(mode: 'off' | 'shadow' | 'on' = 'shadow'): string {
-  return buildCacheStatusLines(db, { ...DEFAULT_CACHE_CONFIG, mode }).join('\n');
+function lines(
+  mode: 'off' | 'shadow' | 'on' = 'shadow',
+  daemonRunning?: boolean
+): string {
+  return buildCacheStatusLines(db, { ...DEFAULT_CACHE_CONFIG, mode }, daemonRunning).join('\n');
 }
 
 describe('cache status', () => {
@@ -122,5 +125,23 @@ describe('cache status', () => {
   it('does not claim a verdict it cannot support when the cache is off', () => {
     mailbox('theaboutbox', 'INBOX');
     expect(lines('off')).toMatch(/off/i);
+  });
+
+  it('does not ask whether the daemon is running when it already knows', () => {
+    mailbox('icloud', 'INBOX', { last_delta_at: Date.now() - 3 * HOUR });
+
+    // `status` prints the daemon's PID two lines above this. Asking the
+    // question again, having just answered it, is what made the output read as
+    // though the command did not know what it had told you.
+    const known = lines('shadow', true);
+    expect(known).not.toMatch(/is the daemon running\?/i);
+    expect(known).toMatch(/daemon is running/i);
+    // And it points at the cause that is actually left.
+    expect(known).toMatch(/failing|longer than the window/i);
+  });
+
+  it('does say so when the daemon is known to be down', () => {
+    mailbox('icloud', 'INBOX', { last_delta_at: Date.now() - 3 * HOUR });
+    expect(lines('shadow', false)).toMatch(/daemon is not running/i);
   });
 });

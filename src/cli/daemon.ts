@@ -222,6 +222,7 @@ export async function daemonStatus(): Promise<void> {
     return;
   }
 
+  let daemonRunning = false;
   try {
     const output = execSync(`launchctl print gui/$(id -u)/${PLIST_NAME} 2>&1`, {
       encoding: 'utf-8',
@@ -229,6 +230,7 @@ export async function daemonStatus(): Promise<void> {
     const pidMatch = output.match(/pid = (\d+)/);
     if (pidMatch) {
       console.log(`Daemon: running (PID ${pidMatch[1]})`);
+      daemonRunning = true;
     } else {
       console.log('Daemon: installed but not running');
     }
@@ -273,7 +275,7 @@ export async function daemonStatus(): Promise<void> {
     }
   }
 
-  await printCacheStatus();
+  await printCacheStatus(daemonRunning);
 }
 
 /**
@@ -351,7 +353,7 @@ function reportRuntime(): void {
  * Per-mailbox cache coverage. First backfill of a large account takes a while,
  * and without this it's indistinguishable from the daemon having hung.
  */
-export async function printCacheStatus(): Promise<void> {
+export async function printCacheStatus(daemonRunning?: boolean): Promise<void> {
   const { CACHE_DB_PATH } = await import('../config.js');
   if (!existsSync(CACHE_DB_PATH)) {
     console.log('Local cache: not created yet');
@@ -364,7 +366,7 @@ export async function printCacheStatus(): Promise<void> {
     const { buildCacheStatusLines } = await import('./cache-status.js');
 
     const cache = openCache(CACHE_DB_PATH, { readOnly: true });
-    for (const line of buildCacheStatusLines(cache, loadCacheConfig())) {
+    for (const line of buildCacheStatusLines(cache, loadCacheConfig(), daemonRunning)) {
       console.log(line);
     }
   } catch (error) {

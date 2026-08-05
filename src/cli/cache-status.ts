@@ -25,7 +25,16 @@ interface MailboxRow {
  * judgements of the same thing is how status ends up reassuring while nothing
  * works.
  */
-export function buildCacheStatusLines(db: Database, config: CacheConfig): string[] {
+export function buildCacheStatusLines(
+  db: Database,
+  config: CacheConfig,
+  /**
+   * Whether the daemon is known to be running. `status` already established
+   * this two lines earlier, so asking again reads as though the command does
+   * not know what it just told you.
+   */
+  daemonRunning?: boolean
+): string[] {
   const rows = db
     .prepare(
       `SELECT s.account_id, s.mailbox, s.backfill_complete, s.oldest_date,
@@ -73,7 +82,7 @@ export function buildCacheStatusLines(db: Database, config: CacheConfig): string
         neverSynced.length > 0
           ? `${neverSynced.length} mailbox(es) have never synced`
           : coverage.state === 'stale'
-            ? 'the last sync is older than the freshness window — is the daemon running?'
+            ? staleReason(daemonRunning, config)
             : coverage.state;
       // Both the consequence and the state name: the consequence because
       // `unavailable` alone does not tell anyone their searches are quietly
@@ -127,6 +136,29 @@ export function buildCacheStatusLines(db: Database, config: CacheConfig): string
   }
 
   return out;
+}
+
+/**
+ * Why a sync is overdue, given what the caller already knows.
+ *
+ * `status` prints the daemon's PID before it gets here, so "is the daemon
+ * running?" is a question it has already answered — and answering it twice,
+ * differently, is what made this output read as confused. When the daemon is
+ * known to be up, the interesting cause is a sync that is failing or simply
+ * taking longer than the window allows.
+ */
+function staleReason(daemonRunning: boolean | undefined, config: CacheConfig): string {
+  const window = `${config.freshnessWindowSeconds}s`;
+  if (daemonRunning === false) {
+    return `no sync in the last ${window} and the daemon is not running`;
+  }
+  if (daemonRunning === true) {
+    return (
+      `no sync in the last ${window}, though the daemon is running — a sync is ` +
+      'either failing (see any error below) or taking longer than the window'
+    );
+  }
+  return `no sync in the last ${window} — check whether the daemon is running`;
 }
 
 /** Durations a person can read at a glance, which raw seconds are not. */
