@@ -14,6 +14,12 @@ export interface MailboxDescriptor {
   path: string;
   /** IMAP special-use flag, e.g. '\\Sent', '\\Archive', '\\All'. */
   specialUse: string | null;
+  /**
+   * The server's hierarchy separator for this mailbox. Namespaced servers
+   * (Dovecot with an INBOX. prefix, say) put every personal folder behind it,
+   * and matching a literal selector requires splitting on it.
+   */
+  delimiter?: string;
 }
 
 export interface MailboxSnapshot {

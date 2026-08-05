@@ -63,14 +63,18 @@ describe('resolveMailboxes', () => {
       { path: '[Gmail]/Sent Mail', specialUse: '\\Sent' },
       { path: '[Gmail]/All Mail', specialUse: '\\All' },
     ];
-    expect(resolveMailboxes(gmail)).toEqual(['INBOX', '[Gmail]/Sent Mail']);
+    expect(resolveMailboxes(gmail).map((m) => m.path)).toEqual(['INBOX', '[Gmail]/Sent Mail']);
 
     const icloud = [
       { path: 'INBOX', specialUse: null },
       { path: 'Sent Messages', specialUse: '\\Sent' },
       { path: 'Archive', specialUse: '\\Archive' },
     ];
-    expect(resolveMailboxes(icloud)).toEqual(['INBOX', 'Sent Messages', 'Archive']);
+    expect(resolveMailboxes(icloud).map((m) => m.path)).toEqual([
+      'INBOX',
+      'Sent Messages',
+      'Archive',
+    ]);
   });
 
   it('excludes Gmail All Mail by default (design D3)', () => {
@@ -78,7 +82,7 @@ describe('resolveMailboxes', () => {
       { path: 'INBOX', specialUse: '\\Inbox' },
       { path: '[Gmail]/All Mail', specialUse: '\\All' },
     ];
-    expect(resolveMailboxes(descriptors)).not.toContain('[Gmail]/All Mail');
+    expect(resolveMailboxes(descriptors).map((m) => m.path)).not.toContain('[Gmail]/All Mail');
   });
 
   it('includes All Mail when explicitly opted in', () => {
@@ -86,7 +90,7 @@ describe('resolveMailboxes', () => {
       { path: 'INBOX', specialUse: '\\Inbox' },
       { path: '[Gmail]/All Mail', specialUse: '\\All' },
     ];
-    expect(resolveMailboxes(descriptors, ['INBOX', '\\All'])).toEqual([
+    expect(resolveMailboxes(descriptors, ['INBOX', '\\All']).map((m) => m.path)).toEqual([
       'INBOX',
       '[Gmail]/All Mail',
     ]);
@@ -94,12 +98,16 @@ describe('resolveMailboxes', () => {
 
   it('skips selectors that match nothing rather than failing', () => {
     const descriptors = [{ path: 'INBOX', specialUse: '\\Inbox' }];
-    expect(resolveMailboxes(descriptors, DEFAULT_MAILBOX_SELECTORS)).toEqual(['INBOX']);
+    expect(
+      resolveMailboxes(descriptors, DEFAULT_MAILBOX_SELECTORS).map((m) => m.path)
+    ).toEqual(['INBOX']);
   });
 
   it('deduplicates when two selectors resolve to the same path', () => {
     const descriptors = [{ path: 'INBOX', specialUse: '\\Inbox' }];
-    expect(resolveMailboxes(descriptors, ['INBOX', '\\Inbox'])).toEqual(['INBOX']);
+    expect(resolveMailboxes(descriptors, ['INBOX', '\\Inbox']).map((m) => m.path)).toEqual([
+      'INBOX',
+    ]);
   });
 });
 

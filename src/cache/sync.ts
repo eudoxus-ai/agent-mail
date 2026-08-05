@@ -95,28 +95,66 @@ export interface SyncOptions {
  * A selector that matches nothing is skipped — plenty of accounts have no
  * Archive, and that isn't an error.
  */
+/**
+ * A mailbox to sync: where it lives on the server, and the name its rows are
+ * cached under.
+ *
+ * The two differ on namespaced servers. A Dovecot-style server prefixes every
+ * personal folder with `INBOX.`, so the holding folder is
+ * `INBOX.agent-mail-holding` — but the executor and every tool ask for
+ * `agent-mail-holding`. Caching under the server path would make those queries
+ * return nothing for that account, which is the missing-mailbox bug moved one
+ * layer up. So: talk to the server by `path`, store under `storeAs`.
+ */
+export interface ResolvedMailbox {
+  path: string;
+  storeAs: string;
+}
+
 export function resolveMailboxes(
   descriptors: MailboxDescriptor[],
   selectors: string[] = DEFAULT_MAILBOX_SELECTORS
-): string[] {
-  const resolved: string[] = [];
+): ResolvedMailbox[] {
+  const resolved: ResolvedMailbox[] = [];
+  const seen = new Set<string>();
+  const push = (entry: ResolvedMailbox) => {
+    if (!seen.has(entry.path)) {
+      seen.add(entry.path);
+      resolved.push(entry);
+    }
+  };
 
   for (const selector of selectors) {
     if (selector.startsWith('\\')) {
       const match = descriptors.find(
         (d) => d.specialUse?.toLowerCase() === selector.toLowerCase()
       );
-      if (match) resolved.push(match.path);
+      // Special-use folders keep their server path as the store name — nothing
+      // queries them by an alias, and renaming them would orphan every row
+      // already cached for existing accounts.
+      if (match) push({ path: match.path, storeAs: match.path });
       continue;
     }
 
-    const match = descriptors.find(
-      (d) => d.path.toLowerCase() === selector.toLowerCase()
-    );
-    if (match) resolved.push(match.path);
+    const wanted = selector.toLowerCase();
+    const exact = descriptors.find((d) => d.path.toLowerCase() === wanted);
+    if (exact) {
+      push({ path: exact.path, storeAs: selector });
+      continue;
+    }
+
+    // Namespaced servers hide the folder behind a prefix; the last path
+    // segment is what the selector actually names. Whole-segment match only —
+    // a substring match would sync somebody's unrelated folder into the
+    // canonical name.
+    const suffix = descriptors.find((d) => {
+      const parts = d.path.split(d.delimiter ?? '/');
+      return parts[parts.length - 1]?.toLowerCase() === wanted;
+    });
+    if (suffix) push({ path: suffix.path, storeAs: selector });
   }
 
-  return [...new Set(resolved)];
+  return resolved;
 }
 
 function backfillSince(
@@ -181,11 +219,49 @@ export async function syncAccount(
   return results;
 }
 
+/**
+ * Address the server by the real path while every internal name — db rows,
+ * state, logs, results — uses the canonical store name. One wrapper at the
+ * boundary beats threading two names through every helper, and it makes the
+ * invariant structural: nothing inside the sync can accidentally write a
+ * server path into the cache.
+ */
+function translatePath(provider: SyncProvider, storeAs: string, path: string): SyncProvider {
+  const toServer = (mailbox: string) => (mailbox === storeAs ? path : mailbox);
+  // Envelopes carry the mailbox they were fetched from, and ingest trusts
+  // that over the caller — so the translation has to cover the return leg too,
+  // or rows land in the cache under the server path after all.
+  const toStore = (envelopes: SyncEnvelope[]) =>
+    envelopes.map((env) =>
+      env.message.mailbox === path
+        ? { ...env, message: { ...env.message, mailbox: storeAs } }
+        : env
+    );
+  return {
+    listMailboxes: () => provider.listMailboxes(),
+    snapshot: (mailbox) => provider.snapshot(toServer(mailbox)),
+    listUids: (mailbox, options) => provider.listUids(toServer(mailbox), options),
+    fetchEnvelopes: async (mailbox, uids) =>
+      toStore(await provider.fetchEnvelopes(toServer(mailbox), uids)),
+    fetchBodies: (mailbox, uids) => provider.fetchBodies(toServer(mailbox), uids),
+    delta: async (mailbox, known) => {
+      const delta = await provider.delta(toServer(mailbox), known);
+      return delta === null ? null : { ...delta, changed: toStore(delta.changed) };
+    },
+  };
+}
+
 export async function syncMailbox(
   db: Database,
   options: SyncOptions,
-  mailbox: string
+  target: string | ResolvedMailbox
 ): Promise<MailboxSyncResult> {
+  const { path, storeAs } =
+    typeof target === 'string' ? { path: target, storeAs: target } : target;
+  const mailbox = storeAs;
+  if (path !== storeAs) {
+    options = { ...options, provider: translatePath(options.provider, storeAs, path) };
+  }
   const { accountId, provider } = options;
   const now = options.now ?? Date.now;
 
@@ -284,9 +360,15 @@ export async function syncMailbox(
 export async function drainMailboxBodies(
   db: Database,
   options: SyncOptions,
-  mailbox: string,
+  target: string | ResolvedMailbox,
   uidvalidity: number
 ): Promise<number> {
+  const { path, storeAs } =
+    typeof target === 'string' ? { path: target, storeAs: target } : target;
+  const mailbox = storeAs;
+  if (path !== storeAs) {
+    options = { ...options, provider: translatePath(options.provider, storeAs, path) };
+  }
   const { accountId } = options;
   try {
     return await drainBodies(db, options, mailbox, uidvalidity);

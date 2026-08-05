@@ -3,6 +3,11 @@ import { openCache, type Database } from '../../src/cache/db.js';
 import { upsertMailboxState } from '../../src/cache/state.js';
 import { orderByStaleness } from '../../src/cache/sync-loop.js';
 
+/** orderByStaleness works on resolved entries; these tests care only about names. */
+const entries = (names: string[]) => names.map((n) => ({ path: n, storeAs: n }));
+const first = (db: never, account: string, names: string[]) =>
+  orderByStaleness(db, account, entries(names))[0].storeAs;
+
 /**
  * Why some iCloud mailboxes synced and others said "Connection not available".
  *
@@ -45,7 +50,7 @@ describe('orderByStaleness', () => {
 
     // The holding folder had never synced once in a day and a half of ticks,
     // because it was always last in a list that never got that far.
-    expect(orderByStaleness(db, 'icloud', ['INBOX', 'Sent', 'holding'])[0]).toBe('holding');
+    expect(first(db as never, 'icloud', ['INBOX', 'Sent', 'holding'])).toBe('holding');
   });
 
   it('orders the rest oldest-sync-first', () => {
@@ -54,11 +59,9 @@ describe('orderByStaleness', () => {
     synced('Sent', now - 30 * MINUTE);
     synced('Archive', now - 29 * 60 * MINUTE);
 
-    expect(orderByStaleness(db, 'icloud', ['INBOX', 'Sent', 'Archive'])).toEqual([
-      'Archive',
-      'Sent',
-      'INBOX',
-    ]);
+    expect(
+      orderByStaleness(db, 'icloud', entries(['INBOX', 'Sent', 'Archive'])).map((m) => m.storeAs)
+    ).toEqual(['Archive', 'Sent', 'INBOX']);
   });
 
   it('rotates: a mailbox that just synced goes to the back', () => {
@@ -66,18 +69,18 @@ describe('orderByStaleness', () => {
     synced('INBOX', now - 10 * MINUTE);
     synced('Archive', now - 20 * MINUTE);
 
-    expect(orderByStaleness(db, 'icloud', ['INBOX', 'Archive'])[0]).toBe('Archive');
+    expect(first(db as never, 'icloud', ['INBOX', 'Archive'])).toBe('Archive');
     // ...and once Archive syncs, INBOX is the stale one. Nothing can hold the
     // front of the queue and starve the others.
     synced('Archive', now);
-    expect(orderByStaleness(db, 'icloud', ['INBOX', 'Archive'])[0]).toBe('INBOX');
+    expect(first(db as never, 'icloud', ['INBOX', 'Archive'])).toBe('INBOX');
   });
 
   it('keeps mailboxes it knows nothing about', () => {
     synced('INBOX', Date.now());
-    const ordered = orderByStaleness(db, 'icloud', ['INBOX', 'BrandNew']);
+    const ordered = orderByStaleness(db, 'icloud', entries(['INBOX', 'BrandNew']));
     expect(ordered).toHaveLength(2);
-    expect(ordered[0]).toBe('BrandNew');
+    expect(ordered[0].storeAs).toBe('BrandNew');
   });
 
   it('is scoped to the account', () => {
@@ -86,7 +89,9 @@ describe('orderByStaleness', () => {
 
     // A never-synced mailbox on a different account must not drag this
     // account's INBOX to the front.
-    expect(orderByStaleness(db, 'icloud', ['INBOX'])).toEqual(['INBOX']);
+    expect(orderByStaleness(db, 'icloud', entries(['INBOX'])).map((m) => m.storeAs)).toEqual([
+      'INBOX',
+    ]);
   });
 });
 

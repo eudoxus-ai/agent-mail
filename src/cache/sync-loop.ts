@@ -3,7 +3,7 @@ import type { Logger } from '../logger.js';
 import type { AccountConfig } from '../types.js';
 import type { ImapConnectionPool } from '../provider/imap-pool.js';
 import { ImapSyncProvider } from '../provider/imap-sync.js';
-import { resolveMailboxes, syncMailbox, drainMailboxBodies } from './sync.js';
+import { resolveMailboxes, syncMailbox, drainMailboxBodies, type ResolvedMailbox } from './sync.js';
 import { gcAttachments } from './attachment-store.js';
 import type { CacheConfig } from './config.js';
 
@@ -143,6 +143,9 @@ export class SyncLoop {
 
     for (const mailbox of mailboxes) {
       if (this.stopped) break;
+      // Logs and state use the canonical store name; the sync addresses the
+      // server by the real path internally.
+      const mailboxName = mailbox.storeAs;
       const startedAt = Date.now();
       try {
         // eslint-disable-next-line no-await-in-loop
@@ -166,7 +169,7 @@ export class SyncLoop {
               },
               mailbox
             ),
-          `cache:sync ${mailbox}`
+          `cache:sync ${mailboxName}`
         );
 
         ingested += result.ingested;
@@ -178,7 +181,7 @@ export class SyncLoop {
         // took three rounds of log-reading to get right.
         this.deps.logger.debug('cache: mailbox pass', {
           account_id: accountId,
-          mailbox,
+          mailbox: mailboxName,
           mode: result.mode,
           ingested: result.ingested,
           envelope_ms: envelopeMs,
@@ -191,7 +194,7 @@ export class SyncLoop {
         if (result.mode === 'fallback' && result.ingested > 0) {
           this.deps.logger.info('cache: fallback rescan', {
             account_id: accountId,
-            mailbox,
+            mailbox: mailboxName,
             ingested: result.ingested,
             hint: 'no HIGHESTMODSEQ recorded for this mailbox — see "cache: sync capabilities"',
           });
@@ -224,7 +227,7 @@ export class SyncLoop {
           if (fetchedHere > 0) {
             this.deps.logger.debug('cache: bodies pass', {
               account_id: accountId,
-              mailbox,
+              mailbox: mailboxName,
               fetched: fetchedHere,
               bodies_ms: Date.now() - bodiesStartedAt,
             });
@@ -234,7 +237,7 @@ export class SyncLoop {
         if (result.mode === 'error') {
           this.deps.logger.warn('cache: mailbox sync failed', {
             account_id: accountId,
-            mailbox,
+            mailbox: mailboxName,
             error: result.error,
           });
         }
@@ -243,7 +246,7 @@ export class SyncLoop {
         // mailbox alone now. The next one gets a fresh borrow.
         this.deps.logger.warn('cache: mailbox sync failed', {
           account_id: accountId,
-          mailbox,
+          mailbox: mailboxName,
           error: error instanceof Error ? error.message : String(error),
         });
       }
@@ -271,19 +274,20 @@ export class SyncLoop {
 export function orderByStaleness(
   cache: Database,
   accountId: string,
-  mailboxes: string[]
-): string[] {
+  mailboxes: ResolvedMailbox[]
+): ResolvedMailbox[] {
   const rows = cache
     .prepare(`SELECT mailbox, last_delta_at FROM mailbox_state WHERE account_id = ?`)
     .all(accountId) as Array<{ mailbox: string; last_delta_at: number | null }>;
 
+  // State rows are keyed by the store name, which is what these entries carry.
   const lastSync = new Map(rows.map((r) => [r.mailbox, r.last_delta_at]));
 
   return [...mailboxes].sort((a, b) => {
     // -1 rather than 0: a mailbox with no state at all has never synced, and
     // belongs ahead of one that synced at the epoch.
-    const at = lastSync.get(a) ?? -1;
-    const bt = lastSync.get(b) ?? -1;
+    const at = lastSync.get(a.storeAs) ?? -1;
+    const bt = lastSync.get(b.storeAs) ?? -1;
     return at - bt;
   });
 }
