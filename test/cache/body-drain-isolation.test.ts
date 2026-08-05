@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { openCache, type Database } from '../../src/cache/db.js';
-import { syncMailbox, type SyncOptions } from '../../src/cache/sync.js';
+import { syncMailbox, drainMailboxBodies, type SyncOptions } from '../../src/cache/sync.js';
 import { getMailboxState } from '../../src/cache/state.js';
 import { FakeSyncProvider, mailbox, message } from './fake-provider.js';
 
@@ -69,7 +69,8 @@ describe('a body-fetch failure', () => {
   it('says what actually failed, rather than blaming the mailbox', async () => {
     const provider = slowBodies(new FakeSyncProvider([mailbox('INBOX', [message(1)])]));
 
-    await syncMailbox(db, opts(provider), 'INBOX');
+    const result = await syncMailbox(db, opts(provider), 'INBOX');
+    await drainMailboxBodies(db, opts(provider), 'INBOX', result.uidvalidity!);
 
     const state = getMailboxState(db, 'work', 'INBOX')!;
     // "Connection not available" against a mailbox sent the last round of
@@ -80,7 +81,8 @@ describe('a body-fetch failure', () => {
   it('leaves the bodies queued for the next pass', async () => {
     const provider = slowBodies(new FakeSyncProvider([mailbox('INBOX', [message(1)])]));
 
-    await syncMailbox(db, opts(provider), 'INBOX');
+    const result = await syncMailbox(db, opts(provider), 'INBOX');
+    await drainMailboxBodies(db, opts(provider), 'INBOX', result.uidvalidity!);
 
     const pending = db
       .prepare(`SELECT COUNT(*) AS n FROM messages WHERE body_state = 'pending'`)

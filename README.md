@@ -448,6 +448,14 @@ In `shadow` the cross-check runs but does **not** hold anything — it reports `
 
 The relationship is one-way on purpose. The cache has a backfill floor and a sync interval, so it under-reports in its own way — a cache hit the server missed is evidence, but a cache miss proves nothing. So it only ever *adds* messages to a sweep, never removes them, and cached UIDs from a stale `UIDVALIDITY` are discarded rather than acted on. With the cache off, sweeps behave exactly as before and the response carries no `cache_cross_check` at all.
 
+### Servers without CONDSTORE
+
+CONDSTORE lets a server answer "what changed since I last looked". iCloud does not offer it, so those mailboxes fall back to comparing UID lists — and the only way to notice a flag change is to re-read envelopes.
+
+Re-reading them every tick is a cost that never converges: on a real account it meant re-ingesting the same 6363 messages every minute, forever, while two mailboxes timed out at 300s and never finished. So arrivals are checked every tick, which is cheap and is what freshness depends on, and the flag window is re-read every 30 minutes instead. A flag you change in another client lands within half an hour rather than within a minute; nothing else is affected.
+
+Message bodies drain on their own connection, separately from the envelope sync, so a slow body fetch gets its own timeout budget instead of consuming the sync's.
+
 ### The daemon does the syncing
 
 Sync runs in the background daemon, not in the MCP server — several MCP servers can be running at once (Claude Desktop, Claude Code, a CLI invocation), and each one syncing would duplicate every fetch. So the cache needs the daemon installed:

@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS mailbox_state (
   backfill_cursor   INTEGER,
   oldest_date       INTEGER,
   last_delta_at     INTEGER,
+  last_flag_sync_at INTEGER,
   last_error        TEXT,
   PRIMARY KEY (account_id, mailbox)
 );

@@ -3,10 +3,28 @@ import { openCache, type Database } from '../../src/cache/db.js';
 import {
   syncAccount,
   syncMailbox,
+  drainMailboxBodies,
   resolveMailboxes,
   DEFAULT_MAILBOX_SELECTORS,
   type SyncOptions,
 } from '../../src/cache/sync.js';
+
+/**
+ * Bodies are drained separately now, on their own connection, so that a slow
+ * body fetch cannot consume the envelope sync's timeout budget. These helpers
+ * do both, which is what the sync loop does per mailbox.
+ */
+async function syncAndDrain(
+  database: Database,
+  options: SyncOptions,
+  mbx: string
+): Promise<{ ingested: number; bodiesFetched: number; mode: string }> {
+  const result = await syncMailbox(database, options, mbx);
+  const bodiesFetched = result.uidvalidity
+    ? await drainMailboxBodies(database, options, mbx, result.uidvalidity)
+    : 0;
+  return { ...result, bodiesFetched };
+}
 import { getMailboxState } from '../../src/cache/state.js';
 import { FakeSyncProvider, mailbox, message } from './fake-provider.js';
 
@@ -342,7 +360,11 @@ describe('no-CONDSTORE fallback', () => {
 
     await syncMailbox(db, opts(provider), 'INBOX');
     provider.setFlags('INBOX', 1, ['\\Seen']);
-    await syncMailbox(db, opts(provider), 'INBOX');
+
+    // The flag resync is throttled: without CONDSTORE the only way to notice a
+    // flag change is to re-read envelopes, and doing that every tick is a cost
+    // that never converges. It still lands, just on an interval.
+    await syncMailbox(db, opts(provider, { now: () => NOW + 31 * 60_000 }), 'INBOX');
 
     const row = db.prepare(`SELECT seen FROM messages WHERE uid = 1`).get() as {
       seen: number;
@@ -379,7 +401,7 @@ describe('body drain', () => {
       mailbox('INBOX', [message(1, { body: 'the indemnity clause is unchanged' })]),
     ]);
 
-    const result = await syncMailbox(db, opts(provider), 'INBOX');
+    const result = await syncAndDrain(db, opts(provider), 'INBOX');
 
     expect(result.bodiesFetched).toBe(1);
     const hits = db
@@ -396,7 +418,7 @@ describe('body drain', () => {
       mailbox('INBOX', [message(1), message(2), message(3)]),
     ]);
 
-    const result = await syncMailbox(db, opts(provider, { bodyBatchSize: 2 }), 'INBOX');
+    const result = await syncAndDrain(db, opts(provider, { bodyBatchSize: 2 }), 'INBOX');
 
     expect(result.bodiesFetched).toBe(2);
     const pending = db
@@ -410,7 +432,7 @@ describe('body drain', () => {
       mailbox('INBOX', [message(1, { body: undefined, html: undefined })]),
     ]);
 
-    await syncMailbox(db, opts(provider), 'INBOX');
+    await syncAndDrain(db, opts(provider), 'INBOX');
 
     const row = db.prepare(`SELECT body_state FROM messages WHERE uid = 1`).get() as {
       body_state: string;
@@ -460,11 +482,11 @@ describe('error isolation', () => {
       mailbox('INBOX', [message(1)], { specialUse: '\\Inbox' }),
     ]);
     provider.failOn.fetchBodies = true;
-    await syncMailbox(db, opts(provider), 'INBOX');
+    await syncAndDrain(db, opts(provider), 'INBOX');
     expect(getMailboxState(db, 'work', 'INBOX')?.last_error).toBeTruthy();
 
     provider.failOn.fetchBodies = false;
-    await syncMailbox(db, opts(provider), 'INBOX');
+    await syncAndDrain(db, opts(provider), 'INBOX');
     expect(getMailboxState(db, 'work', 'INBOX')?.last_error).toBeNull();
   });
 });

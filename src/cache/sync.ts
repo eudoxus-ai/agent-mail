@@ -44,6 +44,13 @@ const DEFAULT_BODY_BATCH_SIZE = 50;
  */
 const FALLBACK_FLAG_WINDOW = 500;
 
+/**
+ * How often to re-read the flag window on a server without CONDSTORE. Long
+ * enough that it is not a per-tick cost, short enough that a flag changed in
+ * another client shows up the same session.
+ */
+const FALLBACK_FLAG_INTERVAL_MS = 30 * 60_000;
+
 export type SyncMode = 'backfill' | 'delta' | 'fallback' | 'error';
 
 export interface MailboxSyncResult {
@@ -55,6 +62,8 @@ export interface MailboxSyncResult {
   backfillComplete: boolean;
   purged: boolean;
   error?: string;
+  /** The generation the sync ran against; the body drain needs it to match. */
+  uidvalidity?: number;
 }
 
 export interface SyncOptions {
@@ -207,6 +216,7 @@ export async function syncMailbox(
       uidnext: snapshot.uidNext,
       last_error: null,
     });
+    result.uidvalidity = snapshot.uidValidity;
 
     const backfillDone = state?.backfill_complete === 1 && !result.purged;
 
@@ -232,22 +242,9 @@ export async function syncMailbox(
     refreshOldestDate(db, accountId, mailbox);
     upsertMailboxState(db, accountId, mailbox, { last_delta_at: now() });
 
-    try {
-      result.bodiesFetched = await drainBodies(db, options, mailbox, snapshot.uidValidity);
-    } catch (error) {
-      // Best-effort, and named as such: "Connection not available" recorded
-      // against a mailbox sent a whole debugging session after the wrong
-      // thing. The rows stay `pending` and the next pass picks them up.
-      const message = error instanceof Error ? error.message : String(error);
-      options.logger?.warn('cache: body fetch failed, envelopes are still current', {
-        account_id: accountId,
-        mailbox,
-        error: message,
-      });
-      upsertMailboxState(db, accountId, mailbox, {
-        last_error: `message bodies could not be fetched (envelopes are current): ${message}`,
-      });
-    }
+    // Bodies are drained separately, by the caller, on their own borrow — see
+    // drainMailboxBodies. Sharing this one meant a slow body fetch consumed the
+    // envelope sync's timeout budget and took the whole mailbox down with it.
 
     const finalState = getMailboxState(db, accountId, mailbox);
     result.backfillComplete = finalState?.backfill_complete === 1;
@@ -262,6 +259,41 @@ export async function syncMailbox(
     });
     upsertMailboxState(db, accountId, mailbox, { last_error: message });
     return { ...result, mode: 'error', error: message };
+  }
+}
+
+/**
+ * Fetch a batch of queued message bodies for one mailbox.
+ *
+ * Separate from `syncMailbox` and called with its own connection, because the
+ * pool's operation timeout applies per borrow. Sharing one meant a slow body
+ * fetch — 50 full messages against a sluggish server — consumed the envelope
+ * sync's budget, and a timeout there marked the whole mailbox failed even
+ * though its envelopes had landed perfectly.
+ *
+ * Best-effort by design: bodies only add full-text search. Failures are
+ * recorded as what they are and the rows stay `pending` for the next pass.
+ */
+export async function drainMailboxBodies(
+  db: Database,
+  options: SyncOptions,
+  mailbox: string,
+  uidvalidity: number
+): Promise<number> {
+  const { accountId } = options;
+  try {
+    return await drainBodies(db, options, mailbox, uidvalidity);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    options.logger?.warn('cache: body fetch failed, envelopes are still current', {
+      account_id: accountId,
+      mailbox,
+      error: message,
+    });
+    upsertMailboxState(db, accountId, mailbox, {
+      last_error: `message bodies could not be fetched (envelopes are current): ${message}`,
+    });
+    return 0;
   }
 }
 
@@ -306,7 +338,13 @@ async function runBackfill(
     const floor = cursor;
     const remaining = floor === null ? uids : uids.filter((u) => u < floor);
     if (remaining.length === 0) {
-      upsertMailboxState(db, accountId, mailbox, { backfill_complete: 1 });
+      // A completed backfill has just read every envelope in the mailbox, so
+      // flags are current by definition. Without this the very next fallback
+      // tick would re-read the newest 500 for no reason.
+      upsertMailboxState(db, accountId, mailbox, {
+        backfill_complete: 1,
+        last_flag_sync_at: now(),
+      });
       return { ingested, backfillComplete: true };
     }
 
@@ -443,11 +481,30 @@ async function runFallback(
     });
   }
 
-  const recent = serverUids.slice(-FALLBACK_FLAG_WINDOW);
+  // Arrivals every tick; the flag window only periodically.
+  //
+  // Without CONDSTORE there is no way to ask "what changed", so the only way to
+  // notice a flag change made elsewhere is to re-read envelopes. Doing that
+  // every tick is a fixed cost that never converges: on one real account it
+  // meant re-ingesting the same 6363 messages every minute, forever, while two
+  // mailboxes timed out at 300s and never finished at all. Arrivals are the
+  // cheap half and the half that matters for freshness, so they stay per-tick;
+  // the expensive half runs on an interval.
+  const state = getMailboxState(db, accountId, mailbox);
+  const flagsDue =
+    state?.last_flag_sync_at == null ||
+    now() - state.last_flag_sync_at >= FALLBACK_FLAG_INTERVAL_MS;
+
+  const recent = flagsDue ? serverUids.slice(-FALLBACK_FLAG_WINDOW) : [];
   const toFetch = [...new Set([...arrivals, ...recent])].sort((a, b) => a - b);
 
-  const envelopes = await provider.fetchEnvelopes(mailbox, toFetch);
-  ingestEnvelopes(db, accountId, uidvalidity, envelopes);
+  const envelopes =
+    toFetch.length > 0 ? await provider.fetchEnvelopes(mailbox, toFetch) : [];
+  if (envelopes.length > 0) ingestEnvelopes(db, accountId, uidvalidity, envelopes);
+
+  if (flagsDue) {
+    upsertMailboxState(db, accountId, mailbox, { last_flag_sync_at: now() });
+  }
 
   return { mode: 'fallback', ingested: envelopes.length, vanished };
 }

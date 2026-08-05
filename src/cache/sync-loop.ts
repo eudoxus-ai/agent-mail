@@ -3,7 +3,7 @@ import type { Logger } from '../logger.js';
 import type { AccountConfig } from '../types.js';
 import type { ImapConnectionPool } from '../provider/imap-pool.js';
 import { ImapSyncProvider } from '../provider/imap-sync.js';
-import { resolveMailboxes, syncMailbox } from './sync.js';
+import { resolveMailboxes, syncMailbox, drainMailboxBodies } from './sync.js';
 import { gcAttachments } from './attachment-store.js';
 import type { CacheConfig } from './config.js';
 
@@ -151,7 +151,31 @@ export class SyncLoop {
         );
 
         ingested += result.ingested;
-        bodies += result.bodiesFetched;
+
+        // Bodies on their own borrow, so they get their own timeout budget.
+        // Sharing the envelope sync's meant a slow body fetch consumed it and
+        // took an otherwise-successful mailbox down with it.
+        const generation = result.uidvalidity;
+        if (result.mode !== 'error' && generation != null) {
+          // eslint-disable-next-line no-await-in-loop
+          bodies += await this.deps.pool.withConnection(
+            accountId,
+            async (imap) =>
+              drainMailboxBodies(
+                this.deps.cache,
+                {
+                  accountId,
+                  provider: new ImapSyncProvider(imap),
+                  bodyBatchSize: this.deps.config.bodyBatchSize,
+                  logger: this.deps.logger,
+                },
+                mailbox,
+                generation
+              ),
+            `cache:bodies ${mailbox}`
+          );
+        }
+
         if (result.mode === 'error') {
           this.deps.logger.warn('cache: mailbox sync failed', {
             account_id: accountId,
