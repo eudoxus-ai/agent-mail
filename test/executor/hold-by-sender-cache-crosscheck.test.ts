@@ -6,6 +6,7 @@ import { upsertMessage } from '../../src/cache/store.js';
 import { upsertMailboxState } from '../../src/cache/state.js';
 import { createLogger } from '../../src/logger.js';
 import { getIntentTargets } from '../../src/ledger/intent-targets.js';
+import { getIntentProgress } from '../../src/ledger/intents.js';
 import type { AccountConfig, EmailMessage } from '../../src/types.js';
 
 vi.mock('../../src/provider/credentials.js', () => ({
@@ -328,5 +329,118 @@ describe('shadow mode measures without acting', () => {
 
     expect(payload.cache_cross_check).toMatchObject({ recovered: 0, applied: false });
     expect(payload.warning).toBeUndefined();
+  });
+});
+
+/**
+ * The verdict has to survive to the poller, because the payload does not.
+ *
+ * Reported from real use: a sweep ran with cache mode on and still produced
+ * zero matches for a sender the cache demonstrably knew about. Whether the
+ * cross-check ran and found nothing, or never ran at all (cache unusable, or a
+ * daemon still on its startup-time mode), was undecidable after the fact — the
+ * queued path discards the response payload, and the recorded no_match detail
+ * said nothing about the cache. An unanswerable "did the safety net even
+ * deploy?" is the difference between trusting a zero and re-running blind.
+ */
+describe('the cross-check verdict on the poller surface', () => {
+  async function poll(imap: ReturnType<typeof fakeImap>, intentId: string) {
+    const { result } = await makeExecutor(imap).executeImmediate({
+      tool: 'get_intent',
+      toolParams: { intent_id: intentId },
+      accountId: 'work',
+      agentId: 'test',
+      risk: 'none',
+    });
+    return JSON.parse(result[0].text);
+  }
+
+  it('records a verified zero in the ledger', async () => {
+    // Cache fresh and usable, knows only some other sender: the cross-check
+    // ran and genuinely found nothing.
+    cacheMessage(101, 'someone-else@example.com');
+
+    const { intent } = await sweep(fakeImap([]));
+
+    expect(getIntentProgress(db, intent.id)?.detail?.cache_cross_check).toMatchObject({
+      checked: true,
+      recovered: 0,
+    });
+  });
+
+  it('records that the cross-check never ran, and why', async () => {
+    // An unusable cache is the case that motivated this: without the reason in
+    // the ledger, "checked nothing" and "found nothing" are the same zero.
+    cache = openCache(':memory:');
+
+    const { intent } = await sweep(fakeImap([]));
+
+    const verdict = getIntentProgress(db, intent.id)?.detail?.cache_cross_check as {
+      checked: boolean;
+      reason?: string;
+    };
+    expect(verdict.checked).toBe(false);
+    expect(verdict.reason).toBeTruthy();
+  });
+
+  it('records what shadow mode found but did not act on', async () => {
+    cacheMessage(101, 'store@a.fanaticscommerce.com');
+
+    const { intent } = await sweep(fakeImap([]), {}, true, 'shadow');
+
+    expect(getIntentProgress(db, intent.id)?.detail?.cache_cross_check).toMatchObject({
+      checked: true,
+      recovered: 1,
+      applied: false,
+    });
+  });
+
+  it('surfaces the verdict in get_intent, where a queued sweep is read', async () => {
+    cache = openCache(':memory:');
+    const imap = fakeImap([]);
+    const { intent } = await sweep(imap);
+
+    const payload = await poll(imap, intent.id);
+
+    expect(payload.outcome.cache_cross_check).toMatchObject({ checked: false });
+    // The note has to carry the doubt, not just the structured field — the
+    // reader who skims prose must not walk away with "verified clean".
+    expect(payload.outcome.note).toMatch(/could not be cross-checked/i);
+  });
+
+  it('lets a cross-checked zero read as a real zero', async () => {
+    cacheMessage(101, 'someone-else@example.com');
+    const imap = fakeImap([]);
+    const { intent } = await sweep(imap);
+
+    const payload = await poll(imap, intent.id);
+
+    expect(payload.outcome.cache_cross_check).toMatchObject({ checked: true, recovered: 0 });
+    expect(payload.outcome.note).toMatch(/cross-checked/i);
+    expect(payload.outcome.note).not.toMatch(/could not/i);
+  });
+
+  it('shouts about messages shadow mode found but did not hold', async () => {
+    cacheMessage(101, 'store@a.fanaticscommerce.com');
+    const imap = fakeImap([]);
+    const { intent } = await sweep(imap, {}, true, 'shadow');
+
+    const payload = await poll(imap, intent.id);
+
+    expect(payload.outcome.cache_cross_check).toMatchObject({ recovered: 1, applied: false });
+    expect(payload.outcome.note).toMatch(/NOT held/);
+    expect(payload.outcome.note).toMatch(/cache on/i);
+  });
+
+  it('says nothing about a cross-check that was never in play', async () => {
+    // No cache configured: the old note, unchanged. Inventing a verdict here
+    // would be the same lie in the other direction.
+    const imap = fakeImap([]);
+    const { intent } = await sweep(imap, {}, false);
+
+    const payload = await poll(imap, intent.id);
+
+    expect(payload.outcome.cache_cross_check).toBeUndefined();
+    expect(payload.outcome.note).toMatch(/verify with search_threads/i);
   });
 });

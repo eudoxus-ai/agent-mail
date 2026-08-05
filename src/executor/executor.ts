@@ -1824,6 +1824,25 @@ export class Executor {
       const progressRecord = payload.progress as IntentProgress | null;
       if (row.status === 'executed' && progressRecord?.phase === 'no_match') {
         const detail = progressRecord.detail ?? {};
+        const crossCheck = detail.cache_cross_check as
+          | { checked: boolean; recovered: number; applied: boolean; reason?: string }
+          | undefined;
+        // The note carries the verdict in prose because a skimming reader
+        // never opens the structured field. Three zeros, three meanings:
+        // cache-verified, cache-contradicted (shadow saw messages it was not
+        // allowed to hold), and unchecked — only the first may read as clean.
+        const cacheNote = !crossCheck
+          ? ''
+          : crossCheck.recovered > 0
+            ? ` The local cache found ${crossCheck.recovered} message(s) from this sender ` +
+              "that the server's search missed, and they were NOT held (cache.mode was " +
+              "not 'on' in the process that ran this sweep). Run 'agent-mail cache on', " +
+              'restart the daemon, and re-run the sweep.'
+            : crossCheck.checked
+              ? ' The local cache was cross-checked and found nothing either, so this is ' +
+                'a verified zero.'
+              : ` The local cache could NOT be cross-checked (${crossCheck.reason}), so ` +
+                'a server-side search miss has not been ruled out.';
         payload.outcome = {
           status: 'no_match',
           matched: 0,
@@ -1832,11 +1851,13 @@ export class Executor {
             mailbox: detail.mailbox,
             ...(detail.before ? { before: detail.before } : {}),
           },
+          ...(crossCheck ? { cache_cross_check: crossCheck } : {}),
           note:
             'The sweep matched no messages — this is NOT the same as the sender being ' +
             'cleared. The server-side FROM match can miss; verify with search_threads, ' +
             'or retry with a different substring (a full address has been observed to ' +
-            'match where a domain substring did not, and vice versa).',
+            'match where a domain substring did not, and vice versa).' +
+            cacheNote,
         };
       }
 
@@ -2377,12 +2398,18 @@ export class Executor {
       // Queued sweeps never return this payload to anyone: the caller gets an
       // id and polls get_intent, which shows status and targets. Recording the
       // outcome is the only way a zero match is visible on that path at all.
+      // The cross-check verdict must survive here too: a zero the cache
+      // verified, a zero the cache contradicted, and a zero the cache never
+      // saw (unusable, or a daemon whose startup-time mode predates the flip)
+      // are three different findings, and this record is the only place a
+      // queued sweep can distinguish them after the fact.
       updateIntentProgress(this.db, intent.id, 'no_match', {
         from,
         mailbox,
         before,
         matched: 0,
         server_matched_ignoring_before: unfilteredCount,
+        ...(crossCheck ? { cache_cross_check: crossCheck } : {}),
       });
 
       const payload: {
