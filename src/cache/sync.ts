@@ -45,6 +45,13 @@ const DEFAULT_BODY_BATCH_SIZE = 50;
 const FALLBACK_FLAG_WINDOW = 500;
 
 /**
+ * Bodies fetched per provider call inside a drain. Small on purpose: iCloud
+ * in particular serves large FETCHes slowly enough to hit the borrow timeout,
+ * and the chunk is the unit of loss when that happens.
+ */
+const BODY_CHUNK = 10;
+
+/**
  * How often to re-read the flag window on a server without CONDSTORE. Long
  * enough that it is not a per-tick cost, short enough that a flag changed in
  * another client shows up the same session.
@@ -527,36 +534,64 @@ async function drainBodies(
   const uids = pendingBodyUids(db, accountId, mailbox, limit);
   if (uids.length === 0) return 0;
 
-  const bodies = await provider.fetchBodies(mailbox, uids);
-  const byUid = new Map(bodies.map((b) => [b.uid, b]));
-
+  // Small chunks, persisted as they land. One provider call for the whole
+  // batch meant one all-or-nothing wait: a timeout at message 49 of 50 threw
+  // away 48 finished downloads, and on a server slow enough to time out that
+  // is the same bodies re-downloaded and re-lost every tick, forever. A chunk
+  // that fails now costs at most BODY_CHUNK messages of progress, and the
+  // failure propagates after the earlier chunks are safely on disk.
   let fetched = 0;
-  withTransaction(db, () => {
-    for (const uid of uids) {
-      const row = db
-        .prepare(
-          `SELECT id FROM messages
-           WHERE account_id = ? AND mailbox = ? AND uidvalidity = ? AND uid = ?`
-        )
-        .get(accountId, mailbox, uidvalidity, uid) as { id: number } | undefined;
-      if (!row) continue;
-
-      const body = byUid.get(uid);
-      if (!body) {
-        // The server didn't return this part. Mark it failed rather than
-        // leaving it pending forever and re-requesting it every tick.
-        db.prepare(`UPDATE messages SET body_state = 'failed' WHERE id = ?`).run(row.id);
-        continue;
-      }
-
-      attachBody(db, row.id, {
-        text: body.text,
-        html: body.html,
-        charset: body.charset,
+  for (let start = 0; start < uids.length; start += BODY_CHUNK) {
+    const chunk = uids.slice(start, start + BODY_CHUNK);
+    let bodies;
+    try {
+      bodies = await provider.fetchBodies(mailbox, chunk);
+    } catch (error) {
+      // Stop here rather than throw: everything before this chunk is already
+      // on disk and the count has to say so. The rest stays pending for the
+      // next pass, on what will be a fresh connection.
+      const message = error instanceof Error ? error.message : String(error);
+      options.logger?.warn('cache: body chunk failed, keeping earlier chunks', {
+        account_id: accountId,
+        mailbox,
+        fetched_before_failure: fetched,
+        remaining: uids.length - start,
+        error: message,
       });
-      fetched += 1;
+      upsertMailboxState(db, accountId, mailbox, {
+        last_error: `message bodies could not be fetched (envelopes are current): ${message}`,
+      });
+      return fetched;
     }
-  });
+    const byUid = new Map(bodies.map((b) => [b.uid, b]));
+
+    withTransaction(db, () => {
+      for (const uid of chunk) {
+        const row = db
+          .prepare(
+            `SELECT id FROM messages
+             WHERE account_id = ? AND mailbox = ? AND uidvalidity = ? AND uid = ?`
+          )
+          .get(accountId, mailbox, uidvalidity, uid) as { id: number } | undefined;
+        if (!row) continue;
+
+        const body = byUid.get(uid);
+        if (!body) {
+          // The server didn't return this part. Mark it failed rather than
+          // leaving it pending forever and re-requesting it every tick.
+          db.prepare(`UPDATE messages SET body_state = 'failed' WHERE id = ?`).run(row.id);
+          continue;
+        }
+
+        attachBody(db, row.id, {
+          text: body.text,
+          html: body.html,
+          charset: body.charset,
+        });
+        fetched += 1;
+      }
+    });
+  }
 
   return fetched;
 }

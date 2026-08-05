@@ -27,6 +27,8 @@ const ATTACHMENT_GC_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 export class SyncLoop {
   private timer: NodeJS.Timeout | null = null;
+  /** Accounts whose sync capabilities have been logged this daemon run. */
+  private readonly capsLogged = new Set<string>();
   private gcTimer: NodeJS.Timeout | null = null;
   private running = false;
   private stopped = false;
@@ -111,7 +113,23 @@ export class SyncLoop {
   private async syncOneAccount(accountId: string): Promise<void> {
     const descriptors = await this.deps.pool.withConnection(
       accountId,
-      async (imap) => new ImapSyncProvider(imap).listMailboxes(),
+      async (imap) => {
+        // Once per account per daemon run: what the server offers for sync and
+        // whether the iCloud ENABLE workaround fired. This line is the answer
+        // to "why is this account on the fallback path" without a debugger.
+        if (!this.capsLogged.has(accountId)) {
+          this.capsLogged.add(accountId);
+          const caps = (imap as { syncCapabilities?: () => Record<string, unknown> })
+            .syncCapabilities?.();
+          if (caps) {
+            this.deps.logger.info('cache: sync capabilities', {
+              account_id: accountId,
+              ...caps,
+            });
+          }
+        }
+        return new ImapSyncProvider(imap).listMailboxes();
+      },
       'cache:list-mailboxes'
     );
     const mailboxes = orderByStaleness(
@@ -125,6 +143,7 @@ export class SyncLoop {
 
     for (const mailbox of mailboxes) {
       if (this.stopped) break;
+      const startedAt = Date.now();
       try {
         // eslint-disable-next-line no-await-in-loop
         const result = await this.deps.pool.withConnection(
@@ -151,14 +170,41 @@ export class SyncLoop {
         );
 
         ingested += result.ingested;
+        const envelopeMs = Date.now() - startedAt;
+
+        // Per-mailbox, per-phase timing. When a borrow times out at exactly
+        // the pool ceiling, this is what says which phase spent the budget —
+        // the alternative was inferring it from which mailboxes failed, which
+        // took three rounds of log-reading to get right.
+        this.deps.logger.debug('cache: mailbox pass', {
+          account_id: accountId,
+          mailbox,
+          mode: result.mode,
+          ingested: result.ingested,
+          envelope_ms: envelopeMs,
+        });
+
+        // A mailbox on the fallback path costs a periodic rescan; on a server
+        // that advertises CONDSTORE it should be on the delta path instead,
+        // and being here anyway means the modseq recovery is not working —
+        // exactly the state that burned 300s per mailbox per tick unnoticed.
+        if (result.mode === 'fallback' && result.ingested > 0) {
+          this.deps.logger.info('cache: fallback rescan', {
+            account_id: accountId,
+            mailbox,
+            ingested: result.ingested,
+            hint: 'no HIGHESTMODSEQ recorded for this mailbox — see "cache: sync capabilities"',
+          });
+        }
 
         // Bodies on their own borrow, so they get their own timeout budget.
         // Sharing the envelope sync's meant a slow body fetch consumed it and
         // took an otherwise-successful mailbox down with it.
         const generation = result.uidvalidity;
         if (result.mode !== 'error' && generation != null) {
+          const bodiesStartedAt = Date.now();
           // eslint-disable-next-line no-await-in-loop
-          bodies += await this.deps.pool.withConnection(
+          const fetchedHere = await this.deps.pool.withConnection(
             accountId,
             async (imap) =>
               drainMailboxBodies(
@@ -174,6 +220,15 @@ export class SyncLoop {
               ),
             `cache:bodies ${mailbox}`
           );
+          bodies += fetchedHere;
+          if (fetchedHere > 0) {
+            this.deps.logger.debug('cache: bodies pass', {
+              account_id: accountId,
+              mailbox,
+              fetched: fetchedHere,
+              bodies_ms: Date.now() - bodiesStartedAt,
+            });
+          }
         }
 
         if (result.mode === 'error') {

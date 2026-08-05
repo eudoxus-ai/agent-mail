@@ -7,8 +7,10 @@ import { FakeSyncProvider, mailbox, message } from './fake-provider.js';
 /**
  * A server without CONDSTORE must not cost a full rescan every minute.
  *
- * iCloud does not advertise CONDSTORE, so `highestmodseq` is never recorded and
- * every tick takes the fallback path. That path re-fetched the newest 500
+ * iCloud advertises CONDSTORE but botches the ENABLE handshake, which left
+ * `highestmodseq` unrecorded and every tick on the fallback path (the repair
+ * for that lives in the provider; this file is about what fallback costs when
+ * it does run). That path re-fetched the newest 500
  * envelopes per mailbox every time, purely to notice flag changes — a fixed
  * per-tick cost that never converges. The reported log shows it plainly:
  * `ingested: 6363` on three consecutive successful passes, the same number
@@ -148,5 +150,50 @@ describe('drainMailboxBodies', () => {
     // The envelope sync has to be able to finish on its own budget, whatever
     // the body queue looks like.
     expect(spy).not.toHaveBeenCalled();
+  });
+});
+
+describe('body draining under a flaky server', () => {
+  it('keeps the bodies fetched before a mid-batch failure', async () => {
+    // The batch used to be one provider call: 50 bodies downloaded, nothing
+    // persisted until all 50 were back. A timeout at message 49 threw away 48
+    // finished downloads — and on a server slow enough to time out, that means
+    // the same bodies are re-downloaded and re-lost every tick, forever.
+    const provider = await settledMailbox(25);
+    const original = provider.fetchBodies.bind(provider);
+    let calls = 0;
+    provider.fetchBodies = vi.fn(async (mbx: string, uids: number[]) => {
+      calls += 1;
+      if (calls > 1) throw new Error('Connection not available');
+      return original(mbx, uids);
+    }) as never;
+
+    const fetched = await drainMailboxBodies(
+      db,
+      opts(provider, { bodyBatchSize: 25 }),
+      'INBOX',
+      1
+    );
+
+    // The first chunk landed and stayed landed.
+    expect(fetched).toBeGreaterThan(0);
+    const stored = db
+      .prepare(`SELECT COUNT(*) AS n FROM messages WHERE body_state = 'fetched'`)
+      .get() as { n: number };
+    expect(Number(stored.n)).toBe(fetched);
+  });
+
+  it('fetches in chunks small enough to survive a slow server', async () => {
+    const provider = await settledMailbox(25);
+    const spy = vi.spyOn(provider, 'fetchBodies');
+
+    await drainMailboxBodies(db, opts(provider, { bodyBatchSize: 25 }), 'INBOX', 1);
+
+    // One giant fetch is one giant all-or-nothing wait. Several small ones
+    // bound how much a single stall can take down with it.
+    expect(spy.mock.calls.length).toBeGreaterThan(1);
+    for (const call of spy.mock.calls) {
+      expect((call[1] as number[]).length).toBeLessThanOrEqual(10);
+    }
   });
 });

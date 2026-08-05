@@ -91,6 +91,63 @@ export class ImapProvider {
     await this.client.connect();
     this.dead = false;
     this.lastError = null;
+    this.repairEnabledExtensions();
+  }
+
+  /** Whether connect() had to patch imapflow's enabled-extension set. */
+  private enableHandshakeRepaired = false;
+
+  /**
+   * Work around iCloud's broken ENABLE handshake.
+   *
+   * imapflow sends `ENABLE CONDSTORE UTF8=ACCEPT QRESYNC` on connect and
+   * records what got enabled from the untagged `* ENABLED ...` response. iCloud
+   * processes the command but replies with a bare tagged OK and no untagged
+   * response, so imapflow's `enabled` set stays empty — and imapflow silently
+   * drops the CHANGEDSINCE fetch modifier unless that set contains CONDSTORE
+   * (lib/commands/fetch.js). The result: no modseq from STATUS, no usable
+   * delta fetch, and every mailbox rescanned on the fallback path forever.
+   *
+   * The session genuinely has the extensions active server-side — the server
+   * accepted the ENABLE — so recording that fact where imapflow looks for it
+   * is correcting imapflow's model, not lying to it. Guarded three ways: the
+   * server must advertise ENABLE (or imapflow never sent the command), must
+   * advertise the specific extension (patching in one the server cannot serve
+   * would turn clean fallbacks into protocol errors), and a compliant
+   * handshake is left untouched.
+   */
+  private repairEnabledExtensions(): void {
+    this.enableHandshakeRepaired = false;
+    const caps = this.client.capabilities;
+    const enabled = (this.client as unknown as { enabled?: Set<string> }).enabled;
+    if (!enabled || !caps.has('ENABLE')) return;
+
+    for (const extension of ['CONDSTORE', 'QRESYNC']) {
+      if (caps.has(extension) && !enabled.has(extension)) {
+        enabled.add(extension);
+        this.enableHandshakeRepaired = true;
+      }
+    }
+  }
+
+  /**
+   * What this session can do for sync, and whether it needed the iCloud
+   * workaround to do it. Logged by the daemon so a mailbox stuck on the
+   * fallback path is explainable from the log alone.
+   */
+  syncCapabilities(): {
+    condstore: boolean;
+    qresync: boolean;
+    enabled: string[];
+    enable_handshake_repaired: boolean;
+  } {
+    const enabled = (this.client as unknown as { enabled?: Set<string> }).enabled;
+    return {
+      condstore: this.client.capabilities.has('CONDSTORE'),
+      qresync: this.client.capabilities.has('QRESYNC'),
+      enabled: enabled ? [...enabled] : [],
+      enable_handshake_repaired: this.enableHandshakeRepaired,
+    };
   }
 
   async disconnect(): Promise<void> {
@@ -622,13 +679,40 @@ export class ImapProvider {
       messages: true,
     });
 
+    // A server without CONDSTORE simply omits HIGHESTMODSEQ. Reporting null
+    // rather than 0 is what routes the sync engine to its fallback path.
+    let highestModseq =
+      status.highestModseq == null ? null : Number(status.highestModseq);
+
+    // iCloud: CONDSTORE is advertised but the ENABLE handshake is broken — the
+    // server replies with a bare tagged OK and omits the untagged `* ENABLED`,
+    // so imapflow records the extension as off and STATUS comes back without a
+    // modseq. The server did process the ENABLE, though, and SELECT responses
+    // carry HIGHESTMODSEQ regardless. Opening the mailbox recovers it, which
+    // is the difference between the cheap delta path and rescanning thousands
+    // of envelopes every tick forever. Only attempted when the capability is
+    // advertised: without it, SELECT cannot answer either and the extra round
+    // trip per tick would be pure waste.
+    if (highestModseq == null && this.client.capabilities.has('CONDSTORE')) {
+      try {
+        const lock = await this.client.getMailboxLock(mailbox);
+        try {
+          const box = this.client.mailbox;
+          if (box && typeof box !== 'boolean' && box.highestModseq != null) {
+            highestModseq = Number(box.highestModseq);
+          }
+        } finally {
+          lock.release();
+        }
+      } catch {
+        // Degraded, not broken: the fallback sync works without a modseq.
+      }
+    }
+
     return {
       uidValidity: Number(status.uidValidity ?? 0),
       uidNext: Number(status.uidNext ?? 0),
-      // A server without CONDSTORE simply omits HIGHESTMODSEQ. Reporting null
-      // rather than 0 is what routes the sync engine to its fallback path.
-      highestModseq:
-        status.highestModseq == null ? null : Number(status.highestModseq),
+      highestModseq,
       exists: Number(status.messages ?? 0),
     };
   }

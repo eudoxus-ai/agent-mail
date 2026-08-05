@@ -448,9 +448,17 @@ In `shadow` the cross-check runs but does **not** hold anything — it reports `
 
 The relationship is one-way on purpose. The cache has a backfill floor and a sync interval, so it under-reports in its own way — a cache hit the server missed is evidence, but a cache miss proves nothing. So it only ever *adds* messages to a sweep, never removes them, and cached UIDs from a stale `UIDVALIDITY` are discarded rather than acted on. With the cache off, sweeps behave exactly as before and the response carries no `cache_cross_check` at all.
 
+### iCloud
+
+Three iCloud-specific behaviours this codebase works around, all observed on real accounts or documented publicly:
+
+- **Broken ENABLE handshake.** iCloud advertises CONDSTORE/QRESYNC but replies to `ENABLE` with a bare tagged OK, omitting the untagged `* ENABLED` response the RFC requires. Strict clients (imapflow included) then treat the extensions as off: no HIGHESTMODSEQ from STATUS, and the CHANGEDSINCE fetch modifier silently dropped. agent-mail repairs the session after connect — the server did process the ENABLE — and logs `enable_handshake_repaired: true` in the `cache: sync capabilities` line when it had to. Apple appears to have fixed some of this in newer server revisions, so whether the repair fires can vary by account.
+- **~5 simultaneous connections per account**, the strictest of the major providers. agent-mail holds one connection per account, but Mail.app, an iPhone, and the daemon all share that budget — "Connection not available" storms can simply mean the budget is spent elsewhere.
+- **Slow large FETCHes.** Bodies are fetched in chunks of 10 and persisted per chunk, so a stall costs one chunk of progress rather than the whole batch.
+
 ### Servers without CONDSTORE
 
-CONDSTORE lets a server answer "what changed since I last looked". iCloud does not offer it, so those mailboxes fall back to comparing UID lists — and the only way to notice a flag change is to re-read envelopes.
+CONDSTORE lets a server answer "what changed since I last looked". Without it (or when a server's support cannot be used), mailboxes fall back to comparing UID lists — and the only way to notice a flag change is to re-read envelopes.
 
 Re-reading them every tick is a cost that never converges: on a real account it meant re-ingesting the same 6363 messages every minute, forever, while two mailboxes timed out at 300s and never finished. So arrivals are checked every tick, which is cheap and is what freshness depends on, and the flag window is re-read every 30 minutes instead. A flag you change in another client lands within half an hour rather than within a minute; nothing else is affected.
 
