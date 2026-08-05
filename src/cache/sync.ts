@@ -111,50 +111,66 @@ export interface ResolvedMailbox {
   storeAs: string;
 }
 
+function matchSelector(
+  descriptors: MailboxDescriptor[],
+  selector: string
+): ResolvedMailbox | null {
+  if (selector.startsWith('\\')) {
+    const match = descriptors.find(
+      (d) => d.specialUse?.toLowerCase() === selector.toLowerCase()
+    );
+    // Special-use folders keep their server path as the store name — nothing
+    // queries them by an alias, and renaming them would orphan every row
+    // already cached for existing accounts.
+    return match ? { path: match.path, storeAs: match.path } : null;
+  }
+
+  const wanted = selector.toLowerCase();
+  const exact = descriptors.find((d) => d.path.toLowerCase() === wanted);
+  if (exact) return { path: exact.path, storeAs: selector };
+
+  // Namespaced servers hide the folder behind a prefix; the last path
+  // segment is what the selector actually names. Whole-segment match only —
+  // a substring match would sync somebody's unrelated folder into the
+  // canonical name.
+  const suffix = descriptors.find((d) => {
+    const parts = d.path.split(d.delimiter ?? '/');
+    return parts[parts.length - 1]?.toLowerCase() === wanted;
+  });
+  return suffix ? { path: suffix.path, storeAs: selector } : null;
+}
+
 export function resolveMailboxes(
   descriptors: MailboxDescriptor[],
   selectors: string[] = DEFAULT_MAILBOX_SELECTORS
 ): ResolvedMailbox[] {
   const resolved: ResolvedMailbox[] = [];
   const seen = new Set<string>();
-  const push = (entry: ResolvedMailbox) => {
-    if (!seen.has(entry.path)) {
-      seen.add(entry.path);
-      resolved.push(entry);
-    }
-  };
 
   for (const selector of selectors) {
-    if (selector.startsWith('\\')) {
-      const match = descriptors.find(
-        (d) => d.specialUse?.toLowerCase() === selector.toLowerCase()
-      );
-      // Special-use folders keep their server path as the store name — nothing
-      // queries them by an alias, and renaming them would orphan every row
-      // already cached for existing accounts.
-      if (match) push({ path: match.path, storeAs: match.path });
-      continue;
+    const match = matchSelector(descriptors, selector);
+    if (match && !seen.has(match.path)) {
+      seen.add(match.path);
+      resolved.push(match);
     }
-
-    const wanted = selector.toLowerCase();
-    const exact = descriptors.find((d) => d.path.toLowerCase() === wanted);
-    if (exact) {
-      push({ path: exact.path, storeAs: selector });
-      continue;
-    }
-
-    // Namespaced servers hide the folder behind a prefix; the last path
-    // segment is what the selector actually names. Whole-segment match only —
-    // a substring match would sync somebody's unrelated folder into the
-    // canonical name.
-    const suffix = descriptors.find((d) => {
-      const parts = d.path.split(d.delimiter ?? '/');
-      return parts[parts.length - 1]?.toLowerCase() === wanted;
-    });
-    if (suffix) push({ path: suffix.path, storeAs: selector });
   }
 
   return resolved;
+}
+
+/**
+ * Configured selectors that matched no folder on this server.
+ *
+ * Shares matchSelector with resolveMailboxes so the two can never disagree
+ * about what counts as matched. A selector in this list is a folder the user
+ * believes is being synced and is not — the exact silence that kept a holding
+ * folder invisible for days — so the sync loop reports these by name.
+ */
+export function unresolvedSelectors(
+  descriptors: MailboxDescriptor[],
+  selectors: string[] = DEFAULT_MAILBOX_SELECTORS
+): string[] {
+  return selectors.filter((selector) => matchSelector(descriptors, selector) === null);
 }
 
 function backfillSince(

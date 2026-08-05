@@ -104,7 +104,21 @@ export async function cacheCommand(requested?: string): Promise<void> {
     console.log(`Cache mode: ${report.mode}  (from ${report.source})`);
     console.log(`  ${report.summary}`);
     console.log('');
-    console.log(`Change it with: agent-mail cache <${MODES.join('|')}>`);
+    // The selector list is the answer to "why isn't folder X searchable" often
+    // enough that it belongs here rather than only in the YAML.
+    const config = loadCacheConfig();
+    console.log(`Synced mailboxes: ${config.mailboxes.join(', ')}`);
+    console.log(
+      '  Add folders under `mailboxes:` in ~/.agent-mail/cache.yaml — literal names,'
+    );
+    console.log(
+      '  or special-use selectors like "\\Sent". Literal names also match behind a'
+    );
+    console.log(
+      '  namespace prefix (INBOX.Receipts matches Receipts). Restart the daemon after.'
+    );
+    console.log('');
+    console.log(`Change the mode with: agent-mail cache <${MODES.join('|')}>`);
     console.log('');
     const { printCacheStatus } = await import('./daemon.js');
     await printCacheStatus();

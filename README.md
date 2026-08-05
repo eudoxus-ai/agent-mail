@@ -427,6 +427,20 @@ cache:
 
 Shadow mode exists because the failure that matters for a mail cache is silently *missing* a message. Watch the log for `cache: shadow divergence` before switching to `on`.
 
+### Choosing which folders sync
+
+The `mailboxes:` list in the same file controls what gets cached. The default is the inbox, sent, archive, and agent-mail's holding folder:
+
+```yaml
+cache:
+  mode: shadow
+  mailboxes: [INBOX, "\\Sent", "\\Archive", agent-mail-holding, Receipts]
+```
+
+Entries are either literal folder names or special-use selectors (backslash-prefixed, quoted — `"\\Sent"` resolves to `Sent Messages` on iCloud and `[Gmail]/Sent Mail` on Gmail). A literal name also matches behind a namespace prefix: `Receipts` finds `INBOX.Receipts` on a Dovecot-style server, and its messages are cached under the plain name you configured. `agent-mail cache` shows the active list.
+
+A configured folder that matches nothing on a server is reported in the daemon log (`cache: configured mailbox matched no mailbox on the server`, with the server's real folder list) rather than silently skipped — a typo'd name would otherwise just never appear, and nothing would say why.
+
 Either way, restart the daemon afterwards — the mode is read once at startup, so a running daemon stays on the old one until it restarts:
 
 ```bash

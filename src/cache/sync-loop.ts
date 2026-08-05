@@ -3,7 +3,7 @@ import type { Logger } from '../logger.js';
 import type { AccountConfig } from '../types.js';
 import type { ImapConnectionPool } from '../provider/imap-pool.js';
 import { ImapSyncProvider } from '../provider/imap-sync.js';
-import { resolveMailboxes, syncMailbox, drainMailboxBodies, type ResolvedMailbox } from './sync.js';
+import { resolveMailboxes, unresolvedSelectors, syncMailbox, drainMailboxBodies, type ResolvedMailbox } from './sync.js';
 import { gcAttachments } from './attachment-store.js';
 import type { CacheConfig } from './config.js';
 
@@ -29,6 +29,8 @@ export class SyncLoop {
   private timer: NodeJS.Timeout | null = null;
   /** Accounts whose sync capabilities have been logged this daemon run. */
   private readonly capsLogged = new Set<string>();
+  /** account+selector pairs already reported as matching nothing. */
+  private readonly unmatchedReported = new Set<string>();
   private gcTimer: NodeJS.Timeout | null = null;
   private running = false;
   private stopped = false;
@@ -132,6 +134,22 @@ export class SyncLoop {
       },
       'cache:list-mailboxes'
     );
+    // A configured folder that matches nothing is a folder the user believes
+    // is being synced and is not — the silence that kept a holding folder
+    // invisible for days. Named once per account per run, with the real folder
+    // list, so a typo is findable from the log alone.
+    for (const selector of unresolvedSelectors(descriptors, this.deps.config.mailboxes)) {
+      const key = `${accountId}\u0000${selector}`;
+      if (this.unmatchedReported.has(key)) continue;
+      this.unmatchedReported.add(key);
+      this.deps.logger.warn('cache: configured mailbox matched no mailbox on the server', {
+        account_id: accountId,
+        selector,
+        available: descriptors.map((d) => d.path),
+        hint: 'check the spelling in cache.yaml `mailboxes:`; literal names also match the last path segment on namespaced servers',
+      });
+    }
+
     const mailboxes = orderByStaleness(
       this.deps.cache,
       accountId,
