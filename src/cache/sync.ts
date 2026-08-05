@@ -407,28 +407,45 @@ async function runDelta(
       ? await reconcileDeletions(db, options, mailbox, uidvalidity)
       : delta.vanished;
 
-  // A vanished set in the tens of thousands is the fingerprint of iCloud's
-  // documented QRESYNC bug (responses spanning the whole mailbox) rather than
-  // a real mass deletion. It is survivable either way — deleteMessages only
-  // touches rows this mailbox has cached, so the worst case is a cache purge
-  // that re-backfills — but it should never pass unremarked.
-  if (goneUids.length > 5_000) {
+  // Only the part of the vanished list we actually hold means anything here.
+  //
+  // iCloud re-announces a mailbox's entire lifetime expunge history on every
+  // SELECT — observed as 37164 UIDs on a 5957-message INBOX, the identical
+  // number every tick, none of them cached. Deleting that list is a no-op by
+  // construction, and warning about it every tick is an alarm that cries wolf
+  // on schedule. So the reported list is intersected with the cache first,
+  // and everything downstream — the deletion, the warning, the counts — works
+  // on the intersection. The full reported size still lands in the debug line,
+  // because a divergence between reported and cached is itself the signal.
+  const goneCached =
+    goneUids.length === 0
+      ? goneUids
+      : (() => {
+          const held = new Set(cachedUids(db, accountId, mailbox, uidvalidity));
+          return goneUids.filter((uid) => held.has(uid));
+        })();
+
+  // A *cached* vanished set this large is a real mass deletion, or corruption
+  // reaching rows we hold — either deserves a human's attention, and filtering
+  // must not silence it.
+  if (goneCached.length > 5_000) {
     options.logger?.warn('cache: unusually large vanished set in delta', {
       account_id: accountId,
       mailbox,
-      vanished: goneUids.length,
-      hint: 'possible iCloud QRESYNC server bug; only cached rows can be affected',
+      vanished_cached: goneCached.length,
+      vanished_reported: goneUids.length,
+      hint: 'a large share of the cached mailbox was deleted server-side',
     });
   }
 
   let vanished = 0;
-  if (goneUids.length > 0) {
+  if (goneCached.length > 0) {
     withTransaction(db, () => {
       vanished = deleteMessages(db, {
         accountId,
         mailbox,
         uidvalidity,
-        uids: goneUids,
+        uids: goneCached,
       });
     });
   }
@@ -438,6 +455,7 @@ async function runDelta(
     mailbox,
     changed: delta.changed.length,
     vanished_reported: goneUids.length,
+    vanished_cached: goneCached.length,
     vanished_deleted: vanished,
   });
 

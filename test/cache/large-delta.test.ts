@@ -89,13 +89,22 @@ describe('deleteMessages with a giant UID list', () => {
 });
 
 describe('a delta with an absurd vanished list', () => {
-  async function syncWithHugeVanished(vanishedCount: number, warn: ReturnType<typeof vi.fn>) {
-    const provider = new FakeSyncProvider([mailbox('INBOX', [message(1), message(2)])]);
-    // Establish state so the next pass takes the delta path.
+  async function syncWithVanished(
+    vanished: number[],
+    warn: ReturnType<typeof vi.fn>,
+    seedCount = 2
+  ) {
+    const provider = new FakeSyncProvider([
+      mailbox(
+        'INBOX',
+        Array.from({ length: seedCount }, (_, i) => message(i + 1))
+      ),
+    ]);
     const options: SyncOptions = {
       accountId: 'work',
       provider,
       backfillDays: null,
+      batchSize: 10_000,
       logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn() } as never,
     };
     await syncMailbox(db, options, 'INBOX');
@@ -103,37 +112,80 @@ describe('a delta with an absurd vanished list', () => {
     provider.delta = vi.fn(async () => ({
       uidValidity: 1,
       highestModseq: 99,
-      vanished: Array.from({ length: vanishedCount }, (_, i) => i + 1000),
+      vanished,
       changed: [],
       vanishedReliable: true,
     })) as never;
 
-    return syncMailbox(db, options, 'INBOX');
+    const result = await syncMailbox(db, options, 'INBOX');
+    return { result, options };
   }
 
-  it('survives it and says so', async () => {
+  it('ignores vanished UIDs that were never cached, quietly', async () => {
     const warn = vi.fn();
 
-    const result = await syncWithHugeVanished(40_000, warn);
+    // Observed on a real iCloud account: the server re-announces the entire
+    // lifetime expunge history on every SELECT — 37164 UIDs, none of them in
+    // the cache, the identical number every tick. Warning about it each time
+    // is an alarm that cries wolf on schedule; deleting is a no-op anyway.
+    // The only part of a vanished list that means anything to us is the part
+    // we hold.
+    const historical = Array.from({ length: 40_000 }, (_, i) => i + 100_000);
+    const { result } = await syncWithVanished(historical, warn);
 
-    // Surviving quietly is not enough: a vanished set bigger than the mailbox
-    // is the fingerprint of the documented iCloud QRESYNC bug, and the log is
-    // where that gets noticed.
     expect(result.mode).toBe('delta');
-    expect(warn).toHaveBeenCalledWith(
-      expect.stringMatching(/vanished/i),
-      expect.objectContaining({ vanished: 40_000 })
-    );
-  });
-
-  it('does not warn about ordinary deletions', async () => {
-    const warn = vi.fn();
-
-    await syncWithHugeVanished(3, warn);
-
+    expect(result.vanished).toBe(0);
+    expect(
+      (db.prepare(`SELECT COUNT(*) AS n FROM messages`).get() as { n: number }).n
+    ).toBe(2);
     const vanishedWarnings = warn.mock.calls.filter(([msg]) =>
       /vanished/i.test(String(msg))
     );
     expect(vanishedWarnings).toEqual([]);
+  });
+
+  it('stays quiet on the second tick too', async () => {
+    // The reported failure mode was the same warning on every tick, forever.
+    const warn = vi.fn();
+    const historical = Array.from({ length: 40_000 }, (_, i) => i + 100_000);
+    const { options } = await syncWithVanished(historical, warn);
+
+    await syncMailbox(db, options, 'INBOX');
+
+    expect(warn.mock.calls.filter(([msg]) => /vanished/i.test(String(msg)))).toEqual([]);
+  });
+
+  it('still deletes and still warns when the cache is genuinely affected', async () => {
+    const warn = vi.fn();
+
+    // 6000 cached messages all reported vanished: a real mass deletion (or
+    // the bug actually reaching cached rows). This is the case the warning
+    // exists for, and filtering must not silence it.
+    const { result } = await syncWithVanished(
+      Array.from({ length: 6_000 }, (_, i) => i + 1),
+      warn,
+      6_000
+    );
+
+    expect(result.vanished).toBe(6_000);
+    expect(
+      (db.prepare(`SELECT COUNT(*) AS n FROM messages`).get() as { n: number }).n
+    ).toBe(0);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringMatching(/vanished/i),
+      expect.objectContaining({ vanished_cached: 6_000 })
+    );
+  });
+
+  it('deletes ordinary small vanishes without ceremony', async () => {
+    const warn = vi.fn();
+
+    const { result } = await syncWithVanished([1, 2], warn, 5);
+
+    expect(result.vanished).toBe(2);
+    expect(
+      (db.prepare(`SELECT COUNT(*) AS n FROM messages`).get() as { n: number }).n
+    ).toBe(3);
+    expect(warn.mock.calls.filter(([msg]) => /vanished/i.test(String(msg)))).toEqual([]);
   });
 });
