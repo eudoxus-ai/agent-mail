@@ -36,7 +36,7 @@ import {
   getIntentTargets,
   updateIntentTargetDestinations,
 } from '../ledger/intent-targets.js';
-import { updateIntentProgress, getIntentProgress } from '../ledger/intents.js';
+import { updateIntentProgress, getIntentProgress, type IntentProgress } from '../ledger/intents.js';
 import { checkStuckExecuting } from '../ledger/db.js';
 import {
   describeWorkerState,
@@ -217,6 +217,14 @@ export async function assertGenerationMatches(
     throw new GenerationMismatchError(mailbox, recorded, current);
   }
 }
+
+/**
+ * Progress older than this on an unclaimed executing intent means nothing is
+ * writing it any more. Live jobs update progress at least once per mailbox per
+ * pass, bounded by the pool's 5-minute operation timeout — 10 minutes is past
+ * anything a healthy job produces, with slack for a slow provider.
+ */
+const PROGRESS_STALE_AFTER_MS = 10 * 60_000;
 
 /**
  * Tools that change mail. Only these can be meaningfully orphaned by a restart
@@ -1190,26 +1198,61 @@ export class Executor {
     // when someone reaches for this. Only mutations can be meaningfully
     // orphaned: a read that vanished with the process changed nothing and has
     // nothing to re-run.
-    const stuck = checkStuckExecuting(this.db)
-      .filter((intent) => MUTATING_TOOLS.has(intent.tool))
-      .map((intent) => {
-        const targets = getIntentTargets(this.db, intent.id);
-        return {
-          intent_id: intent.id,
-          tool: intent.tool,
-          account_id: intent.account_id,
-          created_at: intent.created_at,
-          age_seconds: Math.round(
-            (Date.now() - new Date(`${intent.created_at}Z`).getTime()) / 1000
-          ),
-          progress: getIntentProgress(this.db, intent.id),
-          targets_recorded: targets.length,
-          targets_unconfirmed: targets.filter((t) => t.destination_uid === null).length,
-        };
-      });
+    //
+    // Alive versus orphaned is decided from the LEDGER, not from this
+    // process's connection pool. Queued jobs execute in the daemon, whose pool
+    // this process cannot see — so "no operation in flight here" is
+    // structurally blind, and it produced false orphans on actively-working
+    // jobs whose attached advice was "re-run them". Two signals mean alive: a
+    // live worker lease (the daemon owns it and is heartbeating), or progress
+    // fresh enough that something is clearly still writing it. Orphaned means
+    // both are dead — the fingerprint of the old in-process path dying
+    // mid-action, which is the one case re-running is the right advice for.
+    const now = Date.now();
+    const inProgress: Array<Record<string, unknown>> = [];
+    const orphaned: Array<Record<string, unknown>> = [];
+
+    for (const intent of checkStuckExecuting(this.db)) {
+      if (!MUTATING_TOOLS.has(intent.tool)) continue;
+
+      const progress = getIntentProgress(this.db, intent.id);
+      const targets = getIntentTargets(this.db, intent.id);
+      const progressAgeMs =
+        progress?.updated_at != null ? now - new Date(progress.updated_at).getTime() : null;
+
+      const liveLease =
+        intent.claimed_by != null &&
+        intent.lease_expires_at != null &&
+        new Date(intent.lease_expires_at).getTime() > now;
+      // Progress lands at least once per mailbox per pass, well inside the
+      // operation timeout; anything fresher than this window is being written
+      // by a live job.
+      const freshProgress =
+        progressAgeMs != null && progressAgeMs < PROGRESS_STALE_AFTER_MS;
+
+      const entry: Record<string, unknown> = {
+        intent_id: intent.id,
+        tool: intent.tool,
+        account_id: intent.account_id,
+        created_at: intent.created_at,
+        age_seconds: Math.round((now - new Date(`${intent.created_at}Z`).getTime()) / 1000),
+        progress,
+        targets_recorded: targets.length,
+        targets_unconfirmed: targets.filter((t) => t.destination_uid === null).length,
+      };
+
+      if (liveLease || freshProgress) {
+        entry.alive_because = liveLease
+          ? `worker ${intent.claimed_by} holds a live lease`
+          : `progress updated ${Math.round((progressAgeMs ?? 0) / 1000)}s ago`;
+        inProgress.push(entry);
+      } else {
+        orphaned.push(entry);
+      }
+    }
 
     const busy = pool.accounts.filter((a) => a.in_flight !== null);
-    const queued = pool.accounts.filter((a) => a.queue_depth > 0);
+    const queued = pool.accounts.filter((a) => a.borrow_queue_depth > 0);
 
     const worker = describeWorkerState(this.db);
 
@@ -1233,16 +1276,28 @@ export class Executor {
         accounts_configured: this.accounts.length,
         leaked: pool.opened - pool.closed !== pool.live || pool.live > this.accounts.length,
       },
-      accounts: pool.accounts,
-      operation_timeout_ms: pool.operation_timeout_ms,
+      // Two different queues exist and they must not share a name.
+      // worker.queued_count is the DURABLE queue: accepted work in the ledger,
+      // visible from every process, drained by the daemon. This block is the
+      // IMAP borrow queue: operations waiting for THIS process's connection to
+      // an account — the daemon's pool is separate and not visible here. After
+      // the durable queue landed, these depths sit at zero in the MCP process
+      // almost always, and that is normal rather than a contradiction.
+      imap_pool: {
+        scope: 'this process only — the daemon has its own pool',
+        accounts: pool.accounts,
+        operation_timeout_ms: pool.operation_timeout_ms,
+      },
       // Accepted work waiting on the daemon. Durable: it is in the ledger, so
       // a restart delays it rather than losing it.
       queue: this.queueLoad(),
-      executing_intents: stuck,
+      in_progress_intents: inProgress,
+      orphaned_intents: orphaned,
       interpretation: buildInterpretation({
         busyCount: busy.length,
         queuedCount: queued.length,
-        stuckCount: stuck.length,
+        inProgressCount: inProgress.length,
+        stuckCount: orphaned.length,
         longestElapsedMs: Math.max(0, ...busy.map((a) => a.in_flight!.elapsed_ms)),
         timeoutMs: pool.operation_timeout_ms,
         worker,
@@ -1758,6 +1813,31 @@ export class Executor {
         const worker = describeWorkerState(this.db);
         payload.daemon_running = worker.alive;
         if (worker.warning) payload.warning = worker.warning;
+      }
+
+      // A queued sweep's response payload is discarded — the caller gets an id
+      // and polls here. "executed" with empty targets is indistinguishable from
+      // a clean sweep on this surface, and a real sweep that matched zero (the
+      // server's FROM search misses; confirmed: a domain substring matched 0
+      // where the full address matched 18) was being read as the inbox coming
+      // up clean. Promote the recorded no-match outcome to the top level.
+      const progressRecord = payload.progress as IntentProgress | null;
+      if (row.status === 'executed' && progressRecord?.phase === 'no_match') {
+        const detail = progressRecord.detail ?? {};
+        payload.outcome = {
+          status: 'no_match',
+          matched: 0,
+          searched: {
+            from: detail.from,
+            mailbox: detail.mailbox,
+            ...(detail.before ? { before: detail.before } : {}),
+          },
+          note:
+            'The sweep matched no messages — this is NOT the same as the sender being ' +
+            'cleared. The server-side FROM match can miss; verify with search_threads, ' +
+            'or retry with a different substring (a full address has been observed to ' +
+            'match where a domain substring did not, and vice versa).',
+        };
       }
 
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
@@ -2547,6 +2627,7 @@ export class Executor {
 function buildInterpretation(input: {
   busyCount: number;
   queuedCount: number;
+  inProgressCount: number;
   stuckCount: number;
   longestElapsedMs: number;
   timeoutMs: number;
@@ -2564,17 +2645,27 @@ function buildInterpretation(input: {
       `Nothing has been lost; it will drain once the daemon starts. ${INSTALL_HINT}`
     );
   }
+  if (input.stuckCount > 0) {
+    const alive =
+      input.inProgressCount > 0
+        ? ` ${input.inProgressCount} other action(s) are in progress and healthy — do not re-run those.`
+        : '';
+    return (
+      `${input.stuckCount} mutating action(s) are orphaned: no worker holds a lease on them ` +
+      'and their progress has been stale for over ten minutes. A process died while they ' +
+      'were in flight — they will never complete on their own. Re-run them; hold_by_sender ' +
+      `is idempotent.${alive}`
+    );
+  }
+  if (input.inProgressCount > 0 && input.busyCount === 0) {
+    return (
+      `${input.inProgressCount} action(s) are executing in the daemon (live lease or fresh ` +
+      'progress). This process cannot see the daemon\'s IMAP connections, so its own pool ' +
+      'reading idle is expected. Poll get_intent for completion; nothing needs re-running.'
+    );
+  }
   if (input.busyCount === 0 && input.stuckCount === 0) {
     return 'Idle. No IMAP operation in flight and nothing mid-execution.';
-  }
-  if (input.busyCount === 0 && input.stuckCount > 0) {
-    return (
-      `${input.stuckCount} mutating action(s) are marked executing with no IMAP operation ` +
-      'running. That means the process restarted while they were in flight — they will ' +
-      'never complete on their own. Re-run them; hold_by_sender is idempotent. ' +
-      '(Read-only calls, including this one, are excluded — they change nothing and ' +
-      'cannot be orphaned.)'
-    );
   }
   const seconds = Math.round(input.longestElapsedMs / 1000);
   const timeoutSeconds = Math.round(input.timeoutMs / 1000);

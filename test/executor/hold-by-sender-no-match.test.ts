@@ -175,4 +175,49 @@ describe('a sweep that matched nothing', () => {
     expect(payload.total_messages).toBe(2);
     expect(getIntentProgress(db, intent.id)?.phase).not.toBe('no_match');
   });
+
+  it('is legible to a poller as no_match, not as a successful sweep', async () => {
+    // The reproduction from real use: hold_by_sender('fanaticscommerce.com')
+    // matched zero while the full address matched 18 — same sender, same
+    // mailbox. The response payload said no_match, but a QUEUED sweep's
+    // payload is discarded: the caller gets an id and polls get_intent, which
+    // showed status "executed" with empty targets — indistinguishable from a
+    // clean sweep, on the only surface the queued path has.
+    const imap = fakeImap();
+    const { intent } = await sweep(imap, { from: 'fanaticscommerce.com' });
+
+    const executor = makeExecutor(imap);
+    const { result } = await executor.executeImmediate({
+      tool: 'get_intent',
+      toolParams: { intent_id: intent.id },
+      accountId: 'icloud',
+      agentId: 'test',
+      risk: 'none',
+    });
+    const payload = JSON.parse(result[0].text);
+
+    expect(payload.status).toBe('executed');
+    // The verdict, at top level — not buried in a progress object the reader
+    // has to know to dig into.
+    expect(payload.outcome).toMatchObject({ status: 'no_match', matched: 0 });
+    expect(payload.outcome.searched.from).toBe('fanaticscommerce.com');
+  });
+
+  it('does not stamp an outcome on a sweep that held messages', async () => {
+    const imap = fakeImap({ search: [{ uid: 101 }] });
+    const { intent } = await sweep(imap);
+
+    const executor = makeExecutor(imap);
+    const { result } = await executor.executeImmediate({
+      tool: 'get_intent',
+      toolParams: { intent_id: intent.id },
+      accountId: 'icloud',
+      agentId: 'test',
+      risk: 'none',
+    });
+    const payload = JSON.parse(result[0].text);
+
+    expect(payload.outcome).toBeUndefined();
+    expect(payload.targets.length).toBeGreaterThan(0);
+  });
 });

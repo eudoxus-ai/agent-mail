@@ -301,11 +301,13 @@ After a `hold_messages` call you can restore just a subset of the held messages 
 
 Call `get_diagnostics`. The IMAP connection pool lives inside the MCP server process, so no CLI command can see it — this tool is the only window in.
 
-It distinguishes the three cases that look identical from outside:
+Two queues appear in the payload and they are different things. `worker.queued_count` is the **durable queue** — accepted work in the ledger, visible from every process, drained by the daemon. `imap_pool.accounts[].borrow_queue_depth` is operations waiting for **this process's** IMAP connection; the daemon has its own pool, which the MCP process cannot see, so these depths sitting at zero while work executes in the daemon is normal, not a contradiction.
 
-- **Queued.** `queue_depth` above 1 on an account with an `in_flight` operation. Borrows serialize per account, so a one-message job behind a full-history sweep waits for it. Not stuck — just behind something.
-- **Wedged.** An `in_flight` operation whose `elapsed_ms` is climbing toward `operation_timeout_ms`. It will be abandoned at that point and the account will recover.
-- **Orphaned.** Intents at `executing` with *no* operation in flight and no worker claim. These predate the queue: the process restarted mid-action and nothing will finish them. Re-run them — `hold_by_sender` is idempotent. Queued work does not end up here; a claim whose worker dies is requeued when its lease expires.
+Executing intents are split by evidence:
+
+- **`in_progress_intents`** — a worker holds a live lease on it, or its `progress.updated_at` is fresh (under ten minutes). Each entry says which (`alive_because`). Do not re-run these.
+- **`orphaned_intents`** — no live lease *and* progress stale past ten minutes (or absent). A process died mid-action and nothing will finish them. Re-run these — `hold_by_sender` is idempotent. Queued work does not end up here; a claim whose worker dies is requeued when its lease expires.
+- **Wedged.** An `in_flight` operation in `imap_pool` whose `elapsed_ms` is climbing toward `operation_timeout_ms`. It will be abandoned at that point and the account will recover.
 
 `connections.leaked` is a computed check: `opened - closed` should equal `live`, and `live` should never exceed the number of configured accounts.
 

@@ -63,7 +63,7 @@ interface PoolEntry {
 export interface AccountDiagnostics {
   account_id: string;
   connected: boolean;
-  queue_depth: number;
+  borrow_queue_depth: number;
   in_flight: { label: string; elapsed_ms: number } | null;
 }
 
@@ -400,7 +400,7 @@ export class ImapConnectionPool {
       accounts: [...this.entries.entries()].map(([account_id, entry]) => ({
         account_id,
         connected: entry.provider != null && !entry.provider.isDead(),
-        queue_depth: entry.queueDepth,
+        borrow_queue_depth: entry.queueDepth,
         in_flight: entry.inFlight
           ? {
               label: entry.inFlight.label,
