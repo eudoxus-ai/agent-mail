@@ -407,6 +407,20 @@ async function runDelta(
       ? await reconcileDeletions(db, options, mailbox, uidvalidity)
       : delta.vanished;
 
+  // A vanished set in the tens of thousands is the fingerprint of iCloud's
+  // documented QRESYNC bug (responses spanning the whole mailbox) rather than
+  // a real mass deletion. It is survivable either way — deleteMessages only
+  // touches rows this mailbox has cached, so the worst case is a cache purge
+  // that re-backfills — but it should never pass unremarked.
+  if (goneUids.length > 5_000) {
+    options.logger?.warn('cache: unusually large vanished set in delta', {
+      account_id: accountId,
+      mailbox,
+      vanished: goneUids.length,
+      hint: 'possible iCloud QRESYNC server bug; only cached rows can be affected',
+    });
+  }
+
   let vanished = 0;
   if (goneUids.length > 0) {
     withTransaction(db, () => {
@@ -418,6 +432,14 @@ async function runDelta(
       });
     });
   }
+
+  options.logger?.debug?.('cache: delta sizes', {
+    account_id: accountId,
+    mailbox,
+    changed: delta.changed.length,
+    vanished_reported: goneUids.length,
+    vanished_deleted: vanished,
+  });
 
   ingestEnvelopes(db, accountId, uidvalidity, delta.changed);
 

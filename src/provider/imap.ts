@@ -758,8 +758,13 @@ export class ImapProvider {
     const lock = await this.client.getMailboxLock(mailbox);
     try {
       const results = [];
+      // Chunked: the UID set becomes the literal FETCH command line, and a
+      // delta after the iCloud ENABLE repair has been seen to carry tens of
+      // thousands of UIDs — a command hundreds of KB long, which servers may
+      // reject outright. 1000 UIDs keeps each command a few KB.
+      for (let start = 0; start < uids.length; start += 1000) {
       for await (const msg of this.client.fetch(
-        uids.join(','),
+        uids.slice(start, start + 1000).join(','),
         {
           uid: true,
           envelope: true,
@@ -810,6 +815,7 @@ export class ImapProvider {
           attachments: collectAttachments(msg.bodyStructure),
           message,
         });
+      }
       }
       return results;
     } finally {
