@@ -133,6 +133,34 @@ describe('a sweep that matched nothing', () => {
     expect(filteredOut.payload.diagnosis).toContain('4');
   });
 
+  /**
+   * The retry advice has to point at a query shape that can actually work.
+   *
+   * It used to say "try a shorter distinctive substring (the domain alone,
+   * say)". Measured against iCloud, that is backwards. iCloud only matches
+   * within roughly the first 29 characters of the sender address:
+   *
+   *   MattressFirm@email.mattressfirm.com  -> 24
+   *   email.mattressfi                     -> 24   (ends at offset 29)
+   *   email.mattressfir                    ->  0   (ends at offset 30)
+   *   email.mattressfirm.com               ->  0
+   *   mattressfirm.com                     ->  0
+   *
+   * So the bare domain is the *least* reliable form on exactly the senders
+   * that provoke a no_match, and an agent following the old advice retried
+   * itself straight back into the same zero.
+   */
+  it('does not send the caller back to the query shape that just failed', async () => {
+    const { payload } = await sweep(fakeImap(), {
+      from: 'email.mattressfirm.com',
+    });
+
+    expect(payload.diagnosis).not.toMatch(/shorter/i);
+    expect(payload.diagnosis).not.toMatch(/domain alone/i);
+    // The full address, or a prefix of it, is what survives a truncated index.
+    expect(payload.diagnosis).toMatch(/full|complete|prefix/i);
+  });
+
   it('does not bother probing when no date cursor was given', async () => {
     // With no `before` there is nothing for the second search to rule out, and
     // an extra IMAP round trip per empty sweep is not free.

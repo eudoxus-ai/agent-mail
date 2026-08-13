@@ -386,11 +386,16 @@ export class Executor {
   /**
    * Find messages from this sender that the server's FROM search did not return.
    *
-   * The match in `hold_by_sender` is performed by the IMAP server, and it has
-   * been observed to miss — a long sender address returned nothing while ten
-   * messages from it sat in the inbox. The local cache stores the address
-   * parsed out of the IMAP ENVELOPE and matches it with a plain LIKE, so it can
-   * find what the server's index did not.
+   * The match in `hold_by_sender` is performed by the IMAP server, and it does
+   * not always mean what the spec says. iCloud's covers only the first ~29
+   * characters of the sender address, measured across four senders: for
+   * `MattressFirm@email.mattressfirm.com`, `email.mattressfi` matched all 24
+   * messages and `email.mattressfir` — one character longer, ending at offset
+   * 30 — matched none. Nor does it fail cleanly to zero: a sweep for
+   * `mail.zillow.com` came back with 1 of 59, which looks like a result.
+   *
+   * The local cache stores the address parsed out of the IMAP ENVELOPE and
+   * matches it with a plain LIKE, so it finds what the server's index cannot.
    *
    * Strictly one-way. The cache has a backfill floor and a sync interval, so it
    * under-reports in its own way: a cache hit the server missed is evidence,
@@ -2338,9 +2343,10 @@ export class Executor {
       // sitting in the inbox. Two very different things produce zero and they
       // have opposite fixes, so the payload has to say which:
       //
-      //   - the server's FROM search matched nothing (try a different or
-      //     shorter substring; the match happens server-side and long
-      //     addresses have been seen to miss), or
+      //   - the server's FROM search matched nothing (retry with the full
+      //     address; the match happens server-side and iCloud's only covers
+      //     the first ~29 characters of the address, so a bare domain misses
+      //     precisely when the address is long), or
       //   - it matched, and our own `before` cursor filtered every hit away.
       //
       // The second is only worth a round trip when a cursor was actually given.
@@ -2390,9 +2396,13 @@ export class Executor {
             `them are at or after before=${before}, so none were eligible. Widen or drop ` +
             '`before`.'
           : `No message in ${mailbox} matched from="${from}". The match is performed by the ` +
-            'IMAP server, not locally, and it is a substring match on the From header. If ' +
-            'you can see messages from this sender, try a shorter distinctive substring ' +
-            '(the domain alone, say) — long addresses have been observed not to match.') +
+            'IMAP server, not locally, and not every server implements it as the substring ' +
+            'match the spec describes. iCloud matches only within roughly the first 29 ' +
+            'characters of the sender address, so a bare domain — or any fragment from the ' +
+            'tail of a long address — silently returns nothing while the full address ' +
+            'returns everything. If you can see messages from this sender, retry with the ' +
+            'COMPLETE address, or a prefix of it (a prefix matches at any length). A bare ' +
+            'domain is the least reliable form here, not the most.') +
         cacheNote;
 
       // Queued sweeps never return this payload to anyone: the caller gets an
