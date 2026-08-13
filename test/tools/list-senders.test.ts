@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { Executor } from '../../src/executor/executor.js';
+import { listSendersTool } from '../../src/tools/list-senders.js';
 import { openDatabase } from '../../src/ledger/db.js';
 import { createLogger } from '../../src/logger.js';
 
@@ -51,5 +52,10 @@ describe('list_senders', () => {
     expect(row.is_list_mail_ratio).toBeGreaterThanOrEqual(0);
     expect(row.is_list_mail_ratio).toBeLessThanOrEqual(1);
     expect(row.is_automated_ratio).toBeUndefined();
+  });
+
+  it('schema accepts an `async` boolean', () => {
+    expect(listSendersTool.inputSchema.parse({ async: true }).async).toBe(true);
+    expect(listSendersTool.inputSchema.parse({}).async).toBeUndefined();
   });
 });

@@ -6,6 +6,17 @@ import { computeSignals, type MessageSignals } from '../attention/signals.js';
 
 const DEFAULT_WINDOW_DAYS = 7;
 const DEFAULT_LIMIT_PER_CATEGORY = 25;
+
+/**
+ * Hard upper bound on the number of envelope UIDs fetched per mailbox in a
+ * single `fetchEnvelopes` call. Without this the union of per-category UID sets
+ * could grow unbounded on a wide window, and `fetchEnvelopes` would block the
+ * IMAP connection for minutes (the original 4-minute-timeout offender). The
+ * per-category `slice(-limitPerCategory)` already trims each set, but the union
+ * across categories/overlaps still needs a ceiling. Newest UIDs are preferred
+ * (we keep the tail). For larger scans, callers should pass `async: true`.
+ */
+export const MAX_OVERVIEW_FETCH_UIDS = 200;
 const SUPPORTED_CATEGORIES = ['unread', 'flagged', 'recent_direct', 'awaiting_you'] as const;
 type Category = (typeof SUPPORTED_CATEGORIES)[number];
 
@@ -35,6 +46,10 @@ export const getOverviewTool: ToolDefinition = {
       .number()
       .optional()
       .describe('Max threads per category per account. Default 25.'),
+    async: z
+      .boolean()
+      .optional()
+      .describe('If true, run the scan in the background and return immediately with `{ job_id, status: "running" }`. Poll `get_scan_result` with the job_id for the result. Use for wide windows or many accounts where a synchronous call risks timing out. Default false.'),
   }),
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   async execute() {
@@ -50,6 +65,7 @@ export interface OverviewInput {
   mailboxes?: string[];
   include?: Category[];
   limit_per_category?: number;
+  async?: boolean;
 }
 
 export interface OverviewThread {
@@ -232,15 +248,47 @@ async function collectAccountBundle(deps: CollectDeps): Promise<OverviewAccountB
     for (const mailbox of deps.mailboxes) {
       const catUidLists = await gatherCandidateUids(imap, mailbox, deps);
 
-      // Union UIDs for a single fetch call per mailbox
+      // Bound the envelope fetch PER CATEGORY before unioning. A single global
+      // newest-by-UID slice across the union could wholly starve a category
+      // that carries older/lower UIDs (e.g. `flagged`), silently dropping it
+      // (`envelopesByUid.get(uid)` returns undefined and those items vanish
+      // with no truncation signal). Capping each category's contribution first
+      // guarantees every category gets representation regardless of its UID
+      // range.
+      //
+      // The per-category cap divides the overall ceiling evenly across the
+      // active categories, so the union can never exceed MAX_OVERVIEW_FETCH_UIDS
+      // and the final safety slice below never has to drop a per-category UID —
+      // no category can be starved. The cap comfortably exceeds the default
+      // per-category clip (4 categories → 50 ≥ the default limit_per_category of
+      // 25), so default behavior is unchanged. Within each category, newest
+      // (highest) UIDs are preferred.
+      const activeCategories = Object.values(catUidLists).filter(
+        (uids): uids is number[] => uids != null && uids.length > 0
+      ).length;
+      const perCategoryCap =
+        activeCategories > 0
+          ? Math.max(1, Math.floor(MAX_OVERVIEW_FETCH_UIDS / activeCategories))
+          : MAX_OVERVIEW_FETCH_UIDS;
+
       const allUids = new Set<number>();
       for (const uids of Object.values(catUidLists)) {
         if (!uids) continue;
-        for (const u of uids) allUids.add(u);
+        const capped = [...uids]
+          .sort((a, b) => b - a)
+          .slice(0, perCategoryCap);
+        for (const u of capped) allUids.add(u);
       }
       if (allUids.size === 0) continue;
 
-      const envelopes = await imap.fetchEnvelopes(mailbox, Array.from(allUids));
+      // Overall safety ceiling. The per-category caps already keep the union
+      // within MAX_OVERVIEW_FETCH_UIDS, but a single pathological category
+      // (perCategoryCap === MAX) still gets clamped here. Keep the newest UIDs.
+      const boundedUids = Array.from(allUids)
+        .sort((a, b) => b - a)
+        .slice(0, MAX_OVERVIEW_FETCH_UIDS);
+
+      const envelopes = await imap.fetchEnvelopes(mailbox, boundedUids);
       const envelopesByUid = new Map(envelopes.map((e) => [e.uid, e]));
 
       for (const [cat, uids] of Object.entries(catUidLists) as Array<[Category, number[]]>) {

@@ -24,6 +24,31 @@ describe('ledger schema v3', () => {
     );
   });
 
+  it('creates the scan_jobs table with the expected columns and CHECK status', () => {
+    const db = openDatabase(':memory:');
+    const cols = db.prepare(`PRAGMA table_info(scan_jobs)`).all() as Array<{ name: string }>;
+    const names = cols.map((c) => c.name).sort();
+    expect(names).toEqual(
+      ['id', 'tool', 'params', 'status', 'result', 'error_detail', 'agent_id', 'created_at', 'completed_at'].sort()
+    );
+    // status CHECK rejects out-of-enum values
+    expect(() =>
+      db
+        .prepare(`INSERT INTO scan_jobs (id, tool, params, status) VALUES (?, ?, ?, ?)`)
+        .run('s1', 'get_overview', '{}', 'bogus')
+    ).toThrow();
+  });
+
+  it('creates scan_jobs idempotently on a pre-existing DB via runMigrations', () => {
+    const db = openDatabase(':memory:');
+    db.exec('DROP TABLE scan_jobs');
+    runMigrations(db);
+    const cols = db.prepare(`PRAGMA table_info(scan_jobs)`).all() as Array<{ name: string }>;
+    expect(cols.map((c) => c.name)).toContain('completed_at');
+    // running twice is a no-op (idempotent)
+    expect(() => runMigrations(db)).not.toThrow();
+  });
+
   it('has reverses_intent_id and reversed_by_intent_id columns on intents', () => {
     const db = openDatabase(':memory:');
     const cols = db.prepare(`PRAGMA table_info(intents)`).all() as Array<{ name: string }>;

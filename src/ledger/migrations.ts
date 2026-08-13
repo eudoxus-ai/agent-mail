@@ -276,4 +276,27 @@ export function runMigrations(db: Database): void {
       last_seen_at DATETIME NOT NULL
     )
   `);
+
+  // Migration 11: create scan_jobs table for async read scans (long reads that
+  // return a pollable handle instead of blocking the MCP request). Separate
+  // from intents — scans are idempotent reads with a result blob, not gated
+  // reversible side effects.
+  //
+  // Numbered 5 on the branch that introduced it, which predates migrations 5-10
+  // on main; renumbered on merge. The step itself is order-independent — it
+  // guards with IF NOT EXISTS on a table no other migration touches.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS scan_jobs (
+      id           TEXT PRIMARY KEY,
+      tool         TEXT NOT NULL,
+      params       JSON NOT NULL,
+      status       TEXT NOT NULL DEFAULT 'running'
+        CHECK (status IN ('running', 'done', 'failed')),
+      result       JSON,
+      error_detail JSON,
+      agent_id     TEXT,
+      created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+      completed_at DATETIME
+    )
+  `);
 }

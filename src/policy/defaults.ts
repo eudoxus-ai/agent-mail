@@ -20,6 +20,7 @@ tools:
   get_pending_actions: { risk: none, gate: ungated, reversible: false }
   get_audit_log:       { risk: none, gate: ungated, reversible: false }
   get_intent:          { risk: none, gate: ungated, reversible: false }
+  get_scan_result:     { risk: none, gate: ungated, reversible: false }
   get_diagnostics:     { risk: none, gate: ungated, reversible: false }
   undo_intent:         { risk: low, gate: ungated, reversible: false }
 
