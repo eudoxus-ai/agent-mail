@@ -12,6 +12,7 @@ export interface MailboxState {
   backfill_cursor: number | null;
   oldest_date: number | null;
   last_delta_at: number | null;
+  last_flag_sync_at: number | null;
   last_error: string | null;
 }
 

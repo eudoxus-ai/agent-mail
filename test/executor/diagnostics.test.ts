@@ -94,7 +94,7 @@ describe('pool diagnostics', () => {
 
     const icloud = pool.diagnostics().accounts.find((a) => a.account_id === 'icloud')!;
     // Two borrows outstanding, one running: the second is waiting on the first.
-    expect(icloud.queue_depth).toBe(2);
+    expect(icloud.borrow_queue_depth).toBe(2);
     expect(icloud.in_flight?.label).toBe('hold:move');
     expect(icloud.in_flight?.elapsed_ms).toBeGreaterThanOrEqual(0);
 
@@ -128,7 +128,7 @@ describe('pool diagnostics', () => {
 
     const icloud = pool.diagnostics().accounts.find((a) => a.account_id === 'icloud')!;
     expect(icloud.in_flight).toBeNull();
-    expect(icloud.queue_depth).toBe(0);
+    expect(icloud.borrow_queue_depth).toBe(0);
   });
 });
 

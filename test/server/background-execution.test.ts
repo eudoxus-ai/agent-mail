@@ -4,16 +4,20 @@ import { openDatabase } from '../../src/ledger/db.js';
 import type { Database } from '../../src/ledger/sqlite.js';
 import { createLogger } from '../../src/logger.js';
 import { holdBySenderTool } from '../../src/tools/hold-by-sender.js';
-import { BackgroundQueueFullError } from '../../src/executor/executor.js';
 import { searchThreadsTool } from '../../src/tools/search-threads.js';
+import { recordWorkerHeartbeat } from '../../src/ledger/worker-heartbeat.js';
 import type { AccountConfig, PolicyConfig } from '../../src/types.js';
 
 /**
- * `background: true` returns an intent id before the work starts.
+ * A bulk sweep is written to the queue and an intent id comes back at once.
  *
  * A client-side timeout on a synchronous bulk hold says nothing about what
  * happened server-side — the same timeout has meant both "finished, response
  * lost" and "never ran" — and left the caller no intent id to undo with.
+ *
+ * Until now the id came back but the work ran in this process, so a restart
+ * vaporized it while leaving the intent reading `executing` forever. The work
+ * now lives in the ledger, and the daemon performs it.
  */
 
 let db: Database;
@@ -53,12 +57,11 @@ function parse(result: { content: Array<{ text: string }> }) {
   return JSON.parse(result.content[0].text);
 }
 
-describe('background execution', () => {
-  it('returns an intent_id immediately without waiting for the work', async () => {
+describe('enqueueing a bulk sweep', () => {
+  it('returns an intent_id without doing the work here', async () => {
     const executor = {
-      executeInBackground: vi.fn().mockResolvedValue({ id: 'intent-123' }),
+      enqueue: vi.fn().mockResolvedValue({ id: 'intent-123' }),
       executeImmediate: vi.fn(),
-      backgroundLoad: () => ({ in_flight: 1, limit: 8 }),
       threadHasReplies: vi.fn().mockResolvedValue(false),
     };
 
@@ -68,16 +71,17 @@ describe('background execution', () => {
     });
 
     const payload = parse(result);
-    expect(payload.status).toBe('executing');
+    // `queued`, not `executing`: nothing is running it yet, and saying
+    // otherwise is what made a stopped daemon look like a slow provider.
+    expect(payload.status).toBe('queued');
     expect(payload.intent_id).toBe('intent-123');
-    expect(executor.executeInBackground).toHaveBeenCalledTimes(1);
+    expect(executor.enqueue).toHaveBeenCalledTimes(1);
     expect(executor.executeImmediate).not.toHaveBeenCalled();
   });
 
   it('tells the caller how to check the outcome and how to undo it', async () => {
     const executor = {
-      executeInBackground: vi.fn().mockResolvedValue({ id: 'intent-abc' }),
-      backgroundLoad: () => ({ in_flight: 1, limit: 8 }),
+      enqueue: vi.fn().mockResolvedValue({ id: 'intent-abc' }),
       threadHasReplies: vi.fn().mockResolvedValue(false),
     };
 
@@ -95,11 +99,47 @@ describe('background execution', () => {
     expect(payload.how_to_undo).toContain('undo_intent');
   });
 
-  it('backgrounds a sender sweep by default', async () => {
+  it('warns when nothing is running the queue', async () => {
     const executor = {
-      executeInBackground: vi.fn().mockResolvedValue({ id: 'intent-default' }),
+      enqueue: vi.fn().mockResolvedValue({ id: 'intent-1' }),
+      threadHasReplies: vi.fn().mockResolvedValue(false),
+    };
+
+    const payload = parse(
+      await handlerFor(holdBySenderTool, executor)({
+        from: 'news@example.com',
+        background: true,
+      })
+    );
+
+    // The whole point of Phase 4, on the surface that matters most: this
+    // response is the moment a user believes their work has been filed.
+    expect(payload.daemon_running).toBe(false);
+    expect(payload.warning).toContain('install-daemon');
+  });
+
+  it('says nothing extra when the daemon is running', async () => {
+    recordWorkerHeartbeat(db, { workerId: 'w', pid: 1 });
+    const executor = {
+      enqueue: vi.fn().mockResolvedValue({ id: 'intent-1' }),
+      threadHasReplies: vi.fn().mockResolvedValue(false),
+    };
+
+    const payload = parse(
+      await handlerFor(holdBySenderTool, executor)({
+        from: 'news@example.com',
+        background: true,
+      })
+    );
+
+    expect(payload.daemon_running).toBe(true);
+    expect(payload.warning).toBeUndefined();
+  });
+
+  it('queues a sender sweep by default', async () => {
+    const executor = {
+      enqueue: vi.fn().mockResolvedValue({ id: 'intent-default' }),
       executeImmediate: vi.fn(),
-      backgroundLoad: () => ({ in_flight: 1, limit: 8 }),
       threadHasReplies: vi.fn().mockResolvedValue(false),
     };
 
@@ -109,13 +149,13 @@ describe('background execution', () => {
 
     // A sender sweep has no upper bound on size, and relying on the tool
     // description to get background requested did not work in practice.
-    expect(executor.executeInBackground).toHaveBeenCalledTimes(1);
+    expect(executor.enqueue).toHaveBeenCalledTimes(1);
     expect(executor.executeImmediate).not.toHaveBeenCalled();
   });
 
   it('still runs synchronously when explicitly asked to', async () => {
     const executor = {
-      executeInBackground: vi.fn(),
+      enqueue: vi.fn(),
       executeImmediate: vi.fn().mockResolvedValue({ result: [{ type: 'text', text: '{}' }] }),
       threadHasReplies: vi.fn().mockResolvedValue(false),
     };
@@ -127,22 +167,22 @@ describe('background execution', () => {
     await handlerFor(holdBySenderTool, executor)(params);
 
     expect(executor.executeImmediate).toHaveBeenCalledTimes(1);
-    expect(executor.executeInBackground).not.toHaveBeenCalled();
+    expect(executor.enqueue).not.toHaveBeenCalled();
   });
 
   it('ignores background on tools that do not support it', async () => {
     const executor = {
-      executeInBackground: vi.fn(),
+      enqueue: vi.fn(),
       executeImmediate: vi.fn().mockResolvedValue({ result: [{ type: 'text', text: '{}' }] }),
       threadHasReplies: vi.fn().mockResolvedValue(false),
     };
 
-    // search_threads is bounded and cheap; silently backgrounding it would
-    // change its contract for no benefit.
+    // search_threads is bounded and cheap; silently queueing it would change
+    // its contract for no benefit.
     await handlerFor(searchThreadsTool as never, executor)({ query: 'x', background: true });
 
     expect(executor.executeImmediate).toHaveBeenCalledTimes(1);
-    expect(executor.executeInBackground).not.toHaveBeenCalled();
+    expect(executor.enqueue).not.toHaveBeenCalled();
   });
 });
 
@@ -169,56 +209,37 @@ describe('hold tool schemas', () => {
   });
 });
 
-describe('background queue cap', () => {
+describe('runaway bound', () => {
   /**
-   * Queued background work is not durable — the pool queue is a promise chain
-   * in process memory and nothing records "waiting to run". A restart
-   * vaporizes everything queued while leaving each intent marked `executing`
-   * forever. The cap bounds how much can be lost that way.
+   * The old cap existed because queued background work was not durable: it was
+   * a promise chain in process memory, so a restart vaporized it while leaving
+   * every intent marked `executing` forever. Bounding the depth bounded the
+   * loss. Queued work is now on disk and survives a restart, so that reason is
+   * gone and the cap with it — fifty holds can be filed in one go.
    *
-   * It is not a throughput control: per-account serialization means the queue
-   * drains at the same rate however fast it is filled.
+   * What remains is a much higher bound whose only job is to stop a runaway
+   * loop filling the ledger. Hitting it means a bug, not backpressure.
    */
-  const savedLimit = process.env.AGENT_MAIL_MAX_BACKGROUND;
-  afterEach(() => {
-    // Restore rather than delete: leaking this into later tests would change
-    // the cap out from under them and fail somewhere unrelated.
-    if (savedLimit === undefined) delete process.env.AGENT_MAIL_MAX_BACKGROUND;
-    else process.env.AGENT_MAIL_MAX_BACKGROUND = savedLimit;
-  });
-
-  it('refuses once too much is outstanding, without creating an intent', async () => {
-    process.env.AGENT_MAIL_MAX_BACKGROUND = '2';
-
-    let inFlight = 0;
+  it('accepts far more than the old cap allowed', async () => {
     const executor = {
-      backgroundLoad: () => ({ in_flight: inFlight, limit: 2 }),
-      executeInBackground: vi.fn().mockImplementation(async () => {
-        if (inFlight >= 2) throw new BackgroundQueueFullError(inFlight, 2);
-        inFlight += 1;
-        return { id: `intent-${inFlight}` };
-      }),
+      enqueue: vi.fn().mockImplementation(async () => ({ id: 'intent-x' })),
       threadHasReplies: vi.fn().mockResolvedValue(false),
     };
-
     const handler = handlerFor(holdBySenderTool, executor);
-    const params = () => holdBySenderTool.inputSchema.parse({ from: 'news@example.com' });
 
-    expect(parse(await handler(params())).status).toBe('executing');
-    expect(parse(await handler(params())).status).toBe('executing');
-
-    const refused = parse(await handler(params()));
-    expect(refused.status).toBe('queue_full');
-    expect(refused.limit).toBe(2);
-    // Critical: a refusal must leave nothing behind to reconcile or undo.
-    expect(refused.nothing_happened).toBe(true);
-    expect(refused.intent_id).toBeUndefined();
+    for (let i = 0; i < 50; i++) {
+      const payload = parse(
+        await handler(holdBySenderTool.inputSchema.parse({ from: `s${i}@example.com` }))
+      );
+      expect(payload.status, `job ${i}`).toBe('queued');
+    }
+    expect(executor.enqueue).toHaveBeenCalledTimes(50);
   });
 
-  it('tells the caller to poll and retry rather than to queue harder', async () => {
+  it('surfaces the runaway bound as a refusal that left nothing behind', async () => {
+    const { QueueOverflowError } = await import('../../src/executor/executor.js');
     const executor = {
-      backgroundLoad: () => ({ in_flight: 8, limit: 8 }),
-      executeInBackground: vi.fn().mockRejectedValue(new BackgroundQueueFullError(8, 8)),
+      enqueue: vi.fn().mockRejectedValue(new QueueOverflowError(1000, 1000)),
       threadHasReplies: vi.fn().mockResolvedValue(false),
     };
 
@@ -228,23 +249,10 @@ describe('background queue cap', () => {
       )
     );
 
-    expect(refused.what_to_do).toContain('get_intent');
-    expect(refused.what_to_do).toContain('serialized');
-  });
-
-  it('reports queue load on an accepted job so the caller can pace itself', async () => {
-    const executor = {
-      backgroundLoad: () => ({ in_flight: 3, limit: 8 }),
-      executeInBackground: vi.fn().mockResolvedValue({ id: 'intent-x' }),
-      threadHasReplies: vi.fn().mockResolvedValue(false),
-    };
-
-    const payload = parse(
-      await handlerFor(holdBySenderTool, executor)(
-        holdBySenderTool.inputSchema.parse({ from: 'news@example.com' })
-      )
-    );
-
-    expect(payload.queue).toEqual({ in_flight: 3, limit: 8 });
+    expect(refused.status).toBe('queue_overflow');
+    // A refusal must leave nothing to reconcile or undo.
+    expect(refused.nothing_happened).toBe(true);
+    expect(refused.intent_id).toBeUndefined();
+    expect(refused.what_to_do).toContain('get_diagnostics');
   });
 });

@@ -7,9 +7,17 @@ import type { Database } from '../ledger/sqlite.js';
  * migration that can't be expressed additively is allowed to drop and re-sync
  * rather than contort. Use `resetCache` for those.
  */
-export function runCacheMigrations(_db: Database): void {
-  // No migrations yet — the schema is new. Additive column adds go here,
-  // guarded by PRAGMA table_info checks the way ledger/migrations.ts does.
+export function runCacheMigrations(db: Database): void {
+  // Additive column adds go here, guarded by PRAGMA table_info checks the way
+  // ledger/migrations.ts does.
+
+  // When flags were last re-read for a mailbox on a server without CONDSTORE.
+  // Without it the fallback path re-fetched its flag window every single tick,
+  // which on one real account meant thousands of envelopes a minute, forever.
+  const cols = db.prepare(`PRAGMA table_info(mailbox_state)`).all() as Array<{ name: string }>;
+  if (!cols.map((c) => c.name).includes('last_flag_sync_at')) {
+    db.exec(`ALTER TABLE mailbox_state ADD COLUMN last_flag_sync_at INTEGER`);
+  }
 }
 
 /**

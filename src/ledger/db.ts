@@ -10,15 +10,26 @@ CREATE TABLE IF NOT EXISTS intents (
   tool TEXT NOT NULL,
   params JSON NOT NULL,
   risk TEXT NOT NULL CHECK (risk IN ('none', 'low', 'medium', 'high')),
+  -- 'queued' means accepted and durable but not yet started. It is the state
+  -- that lets accepted work survive a restart: anything only ever held in
+  -- memory vanished with the process while still reading 'executing'.
   status TEXT NOT NULL DEFAULT 'pending'
-    CHECK (status IN ('pending', 'approved', 'executing', 'executed', 'rejected', 'failed', 'undone')),
+    CHECK (status IN ('pending', 'queued', 'approved', 'executing', 'executed', 'rejected', 'failed', 'undone')),
   error_detail JSON,
   agent_id TEXT,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   resolved_at DATETIME,
   resolved_by TEXT,
   undo_token TEXT,
-  undo_expires_at DATETIME
+  undo_expires_at DATETIME,
+  -- Claim bookkeeping. A worker takes ownership by setting claimed_by and a
+  -- lease; the lease is what lets a dead worker's job be picked up again.
+  claimed_by TEXT,
+  claimed_at DATETIME,
+  lease_expires_at DATETIME,
+  -- NOT NULL DEFAULT 0 on purpose: the claim increments this, and NULL + 1 is
+  -- NULL, which would silently disable the give-up-after-N rule.
+  attempts INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -66,5 +77,9 @@ export function rowToIntent(row: Record<string, unknown>): Intent {
     resolved_by: (row.resolved_by as string) ?? null,
     undo_token: (row.undo_token as string) ?? null,
     undo_expires_at: (row.undo_expires_at as string) ?? null,
+    claimed_by: (row.claimed_by as string) ?? null,
+    claimed_at: (row.claimed_at as string) ?? null,
+    lease_expires_at: (row.lease_expires_at as string) ?? null,
+    attempts: Number(row.attempts ?? 0),
   };
 }

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { openCache, type Database } from '../../src/cache/db.js';
-import { syncAccount } from '../../src/cache/sync.js';
+import { syncAccount, drainMailboxBodies } from '../../src/cache/sync.js';
 import { searchCache } from '../../src/cache/query.js';
 import { getCoverage } from '../../src/cache/coverage.js';
 import { invalidate } from '../../src/cache/invalidate.js';
@@ -57,12 +57,22 @@ function provider() {
 }
 
 async function sync(p: FakeSyncProvider) {
-  return syncAccount(db, {
+  const options = {
     accountId: 'work',
     provider: p,
     now: () => NOW,
     backfillDays: null,
-  });
+  };
+  const results = await syncAccount(db, options);
+  // Bodies drain on their own connection now, so an end-to-end test has to do
+  // both — the same two steps the sync loop performs per mailbox.
+  for (const result of results) {
+    if (result.uidvalidity != null) {
+      // eslint-disable-next-line no-await-in-loop
+      await drainMailboxBodies(db, options, result.mailbox, result.uidvalidity);
+    }
+  }
+  return results;
 }
 
 describe('sync to search', () => {

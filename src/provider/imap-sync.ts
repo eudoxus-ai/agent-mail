@@ -20,7 +20,7 @@ export class ImapSyncProvider implements SyncProvider {
 
   async listMailboxes(): Promise<MailboxDescriptor[]> {
     const boxes = await this.imap.listMailboxes();
-    return boxes.map((b) => ({ path: b.path, specialUse: b.specialUse }));
+    return boxes.map((b) => ({ path: b.path, specialUse: b.specialUse, delimiter: b.delimiter }));
   }
 
   async snapshot(mailbox: string): Promise<MailboxSnapshot> {

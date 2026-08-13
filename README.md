@@ -301,40 +301,54 @@ After a `hold_messages` call you can restore just a subset of the held messages 
 
 Call `get_diagnostics`. The IMAP connection pool lives inside the MCP server process, so no CLI command can see it — this tool is the only window in.
 
-It distinguishes the three cases that look identical from outside:
+Two queues appear in the payload and they are different things. `worker.queued_count` is the **durable queue** — accepted work in the ledger, visible from every process, drained by the daemon. `imap_pool.accounts[].borrow_queue_depth` is operations waiting for **this process's** IMAP connection; the daemon has its own pool, which the MCP process cannot see, so these depths sitting at zero while work executes in the daemon is normal, not a contradiction.
 
-- **Queued.** `queue_depth` above 1 on an account with an `in_flight` operation. Borrows serialize per account, so a one-message job behind a full-history sweep waits for it. Not stuck — just behind something.
-- **Wedged.** An `in_flight` operation whose `elapsed_ms` is climbing toward `operation_timeout_ms`. It will be abandoned at that point and the account will recover.
-- **Orphaned.** Intents at `executing` with *no* operation in flight. The process restarted mid-action; they will never finish on their own. Re-run them — `hold_by_sender` is idempotent.
+Executing intents are split by evidence:
+
+- **`in_progress_intents`** — a worker holds a live lease on it, or its `progress.updated_at` is fresh (under ten minutes). Each entry says which (`alive_because`). Do not re-run these.
+- **`orphaned_intents`** — no live lease *and* progress stale past ten minutes (or absent). A process died mid-action and nothing will finish them. Re-run these — `hold_by_sender` is idempotent. Queued work does not end up here; a claim whose worker dies is requeued when its lease expires.
+- **Wedged.** An `in_flight` operation in `imap_pool` whose `elapsed_ms` is climbing toward `operation_timeout_ms`. It will be abandoned at that point and the account will recover.
 
 `connections.leaked` is a computed check: `opened - closed` should equal `live`, and `live` should never exceed the number of configured accounts.
 
 `get_intent` also reports a `progress` field for running actions (`searching`, then `moving` with a message count), so a long job is distinguishable from one that never started.
 
-### Pacing a large batch
+### How work is executed
 
-Background actions are capped at **8 outstanding** (`AGENT_MAIL_MAX_BACKGROUND` to change). Past that, the call is refused with `status: "queue_full"` and `nothing_happened: true` — no intent is created, so there is nothing to reconcile or undo. Poll your outstanding ids, then retry the identical call.
+Mutations are performed by the **daemon**, not by the MCP server. A tool that changes mail writes the action into the ledger at `status: "queued"`, hands back an `intent_id`, and returns. The daemon claims queued work, performs it, and settles the intent to `executed` or `failed`.
 
-The cap is not a throughput control. Work is serialized per account, so a queue of 50 drains at exactly the same rate as a queue of 8 — the cap exists because **queued background work is not durable**. The pool queue is a promise chain in process memory; nothing records "waiting to run". If the server restarts, everything queued is lost while each intent stays marked `executing` forever. Capping the depth bounds how much a restart can strand.
+That split is the point: the queue is on disk, so accepted work survives a restart of either process. It also means **nothing happens if the daemon is not running.** Every surface says so —
 
-So: work through a long list in batches of about eight, polling between. Firing everything at once is no faster and risks far more.
+- the tool response carries `daemon_running: false` and a `warning`,
+- `get_intent` on a queued action says the same,
+- `get_diagnostics` leads with a `worker` block and names it in the `interpretation`,
+- `agent-mail status` opens with a banner,
+- the MCP server logs it at `error` on startup.
+
+Nothing is lost while the daemon is down. Queued work drains as soon as it starts, which is why **re-running an action that is merely slow will duplicate it** — poll `get_intent` instead.
+
+There is no batch-size limit. Filing fifty holds at once is fine: they queue durably and drain one at a time per account. (An earlier version capped outstanding background work at 8, because it ran in the MCP process' memory and a restart lost it. That reason is gone.) A `status: "queue_overflow"` refusal at 1000 queued actions is a runaway-loop backstop, not backpressure — it means something is filing in a loop. Nothing is queued by a refused call, so there is nothing to reconcile or undo.
 
 ### Long bulk sweeps
 
-`hold_messages` and `hold_by_sender` accept `background: true`. The call returns an `intent_id` right away and the move runs in the background:
+`hold_messages` and `hold_by_sender` take `background: true` (the default for `hold_by_sender`). The call queues the work and returns an `intent_id` right away:
 
 ```json
 {
-  "status": "executing",
+  "status": "queued",
   "intent_id": "3f9a…",
+  "queue_depth": 3,
+  "daemon_running": true,
   "how_to_check": "Poll get_intent with intent_id \"3f9a…\" until status is \"executed\" or \"failed\".",
   "how_to_undo": "undo_intent with intent_id \"3f9a…\" once it reports \"executed\"."
 }
 ```
 
-Use it for full-history sweeps — anything with no `since` floor over a large mailbox, especially on iCloud. A synchronous call that outruns the client's patience gives you a timeout, and a timeout tells you nothing: the move may have completed with the response lost, or never have run at all. Worse, you get no `intent_id`, so the batch can't be undone. With `background: true` the id exists before any mail moves, so the outcome is always knowable and always reversible.
+Use it for full-history sweeps — anything with no `since` floor over a large mailbox, especially on iCloud. A synchronous call that outruns the client's patience gives you a timeout, and a timeout tells you nothing: the move may have completed with the response lost, or never have run at all. Worse, you get no `intent_id`, so the batch can't be undone. Queued, the id exists before any mail moves, so the outcome is always knowable and always reversible.
 
-Targets are recorded in the ledger *before* each move and confirmed after, so even a sweep interrupted partway leaves a restorable record. `agent-mail status` lists any actions that died mid-execution, with the intent id to undo them.
+Targets are recorded in the ledger *before* each move and confirmed after, so even a sweep interrupted partway leaves a restorable record. If the daemon dies mid-job, the lease on its claim expires and another worker picks the job up — up to three attempts, after which the intent is marked `failed` with an explanation rather than retried forever.
+
+`agent-mail status` lists any actions that died mid-execution, with the intent id to undo them.
 
 ## Policy
 
@@ -395,18 +409,76 @@ To delete it, stop the daemon and `rm ~/.agent-mail/cache.db`. Nothing is lost: 
 
 ### Turning it on
 
-Create `~/.agent-mail/cache.yaml`:
+```bash
+./bin/agent-mail.mjs cache            # what mode am I in, and what does it mean
+./bin/agent-mail.mjs cache shadow     # change it
+```
+
+`cache` with no argument prints the current mode, where it came from, what it does, and the per-mailbox sync state. Setting a mode edits `~/.agent-mail/cache.yaml` in place, leaving any other settings there alone.
+
+Or write the file yourself:
 
 ```yaml
 cache:
   mode: shadow    # off (default) | shadow | on
 ```
 
-- **`off`** — the cache is never read. The daemon still syncs it in the background, so it warms up.
-- **`shadow`** — every search runs against both the cache and IMAP. IMAP's answer is what you get; the two are compared and any difference is logged to `~/.agent-mail/agent-mail.log`. Run here for a few days first.
+- **`off`** (default) — the cache is neither read nor written. The daemon does **not** sync it, so nothing warms up in the background; there is no cache until you pick another mode.
+- **`shadow`** — the daemon syncs, and every search runs against both the cache and IMAP. IMAP's answer is what you get; the two are compared and any difference is logged to `~/.agent-mail/agent-mail.log`. Sender sweeps report what the cache would have recovered without holding it. **Nothing the cache says changes what happens.** Run here for a few days first.
 - **`on`** — searches are served from the cache, falling back to IMAP when the cache is stale or a mailbox hasn't finished backfilling.
 
 Shadow mode exists because the failure that matters for a mail cache is silently *missing* a message. Watch the log for `cache: shadow divergence` before switching to `on`.
+
+### Choosing which folders sync
+
+The `mailboxes:` list in the same file controls what gets cached. The default is the inbox, sent, archive, and agent-mail's holding folder:
+
+```yaml
+cache:
+  mode: shadow
+  mailboxes: [INBOX, "\\Sent", "\\Archive", agent-mail-holding, Receipts]
+```
+
+Entries are either literal folder names or special-use selectors (backslash-prefixed, quoted — `"\\Sent"` resolves to `Sent Messages` on iCloud and `[Gmail]/Sent Mail` on Gmail). A literal name also matches behind a namespace prefix: `Receipts` finds `INBOX.Receipts` on a Dovecot-style server, and its messages are cached under the plain name you configured. `agent-mail cache` shows the active list.
+
+A configured folder that matches nothing on a server is reported in the daemon log (`cache: configured mailbox matched no mailbox on the server`, with the server's real folder list) rather than silently skipped — a typo'd name would otherwise just never appear, and nothing would say why.
+
+Either way, restart the daemon afterwards — the mode is read once at startup, so a running daemon stays on the old one until it restarts:
+
+```bash
+./bin/agent-mail.mjs install-daemon   # reinstalls and restarts
+```
+
+### The cache also fixes sender sweeps
+
+`hold_by_sender` matches via the IMAP server's `SEARCH FROM`, and that search has been observed to miss — a long sender address returned nothing while ten messages from it sat in the inbox. The cache stores the address parsed out of the IMAP ENVELOPE and matches it locally, so once it is on (`shadow` or `on`), every sender sweep cross-checks the server's result against it and **holds anything the server missed**, reporting what it recovered:
+
+```json
+{
+  "cache_cross_check": { "checked": true, "recovered": 10 },
+  "warning": "The IMAP server's FROM search missed 10 message(s) that the local cache found; they were included in this hold."
+}
+```
+
+In `shadow` the cross-check runs but does **not** hold anything — it reports `applied: false` and tells you what it would have caught. That is the point of running shadow first: measure how badly the server's search actually misses across your real senders, then switch to `on` knowing the number.
+
+The relationship is one-way on purpose. The cache has a backfill floor and a sync interval, so it under-reports in its own way — a cache hit the server missed is evidence, but a cache miss proves nothing. So it only ever *adds* messages to a sweep, never removes them, and cached UIDs from a stale `UIDVALIDITY` are discarded rather than acted on. With the cache off, sweeps behave exactly as before and the response carries no `cache_cross_check` at all.
+
+### iCloud
+
+Three iCloud-specific behaviours this codebase works around, all observed on real accounts or documented publicly:
+
+- **Broken ENABLE handshake.** iCloud advertises CONDSTORE/QRESYNC but replies to `ENABLE` with a bare tagged OK, omitting the untagged `* ENABLED` response the RFC requires. Strict clients (imapflow included) then treat the extensions as off: no HIGHESTMODSEQ from STATUS, and the CHANGEDSINCE fetch modifier silently dropped. agent-mail repairs the session after connect — the server did process the ENABLE — and logs `enable_handshake_repaired: true` in the `cache: sync capabilities` line when it had to. Apple appears to have fixed some of this in newer server revisions, so whether the repair fires can vary by account.
+- **~5 simultaneous connections per account**, the strictest of the major providers. agent-mail holds one connection per account, but Mail.app, an iPhone, and the daemon all share that budget — "Connection not available" storms can simply mean the budget is spent elsewhere.
+- **Slow large FETCHes.** Bodies are fetched in chunks of 10 and persisted per chunk, so a stall costs one chunk of progress rather than the whole batch.
+
+### Servers without CONDSTORE
+
+CONDSTORE lets a server answer "what changed since I last looked". Without it (or when a server's support cannot be used), mailboxes fall back to comparing UID lists — and the only way to notice a flag change is to re-read envelopes.
+
+Re-reading them every tick is a cost that never converges: on a real account it meant re-ingesting the same 6363 messages every minute, forever, while two mailboxes timed out at 300s and never finished. So arrivals are checked every tick, which is cheap and is what freshness depends on, and the flag window is re-read every 30 minutes instead. A flag you change in another client lands within half an hour rather than within a minute; nothing else is affected.
+
+Message bodies drain on their own connection, separately from the envelope sync, so a slow body fetch gets its own timeout budget instead of consuming the sync's.
 
 ### The daemon does the syncing
 

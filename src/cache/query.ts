@@ -27,6 +27,12 @@ export interface CachedSearchRow {
   account_id: string;
   mailbox: string;
   uid: number;
+  /**
+   * The generation the UID belongs to. A cached UID is only meaningful while
+   * this still matches the mailbox, so anything that acts on one by UID has to
+   * check it first.
+   */
+  uidvalidity: number;
   envelope: {
     message_id: string;
     subject: string;
@@ -55,6 +61,7 @@ interface RawRow {
   account_id: string;
   mailbox: string;
   uid: number;
+  uidvalidity: number;
   message_id: string | null;
   subject: string;
   snippet: string;
@@ -145,6 +152,7 @@ function hydrate(db: Database, row: RawRow): CachedSearchRow {
     account_id: row.account_id,
     mailbox: row.mailbox,
     uid: row.uid,
+    uidvalidity: row.uidvalidity,
     envelope: {
       message_id: row.message_id ?? '',
       subject: row.subject,

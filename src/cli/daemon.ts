@@ -208,11 +208,21 @@ export function uninstallDaemon(): void {
 }
 
 export async function daemonStatus(): Promise<void> {
+  // First, before the launchd check and before its early return.
+  //
+  // "Daemon: not installed" reads like a note about setup; it does not say
+  // that accepted work is piling up unperformed. Someone running this command
+  // is usually already wondering why nothing happened, and the answer has to be
+  // the first thing on the screen rather than something below three sections of
+  // healthy-looking output.
+  await printWorkerBanner();
+
   if (!existsSync(PLIST_PATH)) {
     console.log('Daemon: not installed');
     return;
   }
 
+  let daemonRunning = false;
   try {
     const output = execSync(`launchctl print gui/$(id -u)/${PLIST_NAME} 2>&1`, {
       encoding: 'utf-8',
@@ -220,6 +230,7 @@ export async function daemonStatus(): Promise<void> {
     const pidMatch = output.match(/pid = (\d+)/);
     if (pidMatch) {
       console.log(`Daemon: running (PID ${pidMatch[1]})`);
+      daemonRunning = true;
     } else {
       console.log('Daemon: installed but not running');
     }
@@ -264,7 +275,27 @@ export async function daemonStatus(): Promise<void> {
     }
   }
 
-  await printCacheStatus();
+  await printCacheStatus(daemonRunning);
+}
+
+/**
+ * Print the queue-is-going-nowhere banner, if there is one to print.
+ *
+ * Best-effort: a locked or missing ledger means we cannot tell, and failing to
+ * report a problem must not turn `status` into a command that errors out.
+ */
+async function printWorkerBanner(): Promise<void> {
+  if (!existsSync(LEDGER_DB_PATH)) return;
+  try {
+    const { openDatabase } = await import('../ledger/db.js');
+    const { describeWorkerState } = await import('../ledger/worker-heartbeat.js');
+    const { buildWorkerBanner } = await import('./worker-banner.js');
+
+    const banner = buildWorkerBanner(describeWorkerState(openDatabase()));
+    if (banner) console.log(`${banner}\n`);
+  } catch {
+    // Cannot read the ledger — say nothing rather than fail the command.
+  }
 }
 
 /**
@@ -322,7 +353,7 @@ function reportRuntime(): void {
  * Per-mailbox cache coverage. First backfill of a large account takes a while,
  * and without this it's indistinguishable from the daemon having hung.
  */
-async function printCacheStatus(): Promise<void> {
+export async function printCacheStatus(daemonRunning?: boolean): Promise<void> {
   const { CACHE_DB_PATH } = await import('../config.js');
   if (!existsSync(CACHE_DB_PATH)) {
     console.log('Local cache: not created yet');
@@ -332,42 +363,11 @@ async function printCacheStatus(): Promise<void> {
   try {
     const { openCache } = await import('../cache/db.js');
     const { loadCacheConfig } = await import('../cache/config.js');
-    const config = loadCacheConfig();
+    const { buildCacheStatusLines } = await import('./cache-status.js');
+
     const cache = openCache(CACHE_DB_PATH, { readOnly: true });
-
-    const rows = cache
-      .prepare(
-        `SELECT s.account_id, s.mailbox, s.backfill_complete, s.oldest_date, s.last_delta_at,
-                (SELECT COUNT(*) FROM messages m
-                 WHERE m.account_id = s.account_id AND m.mailbox = s.mailbox) AS messages,
-                (SELECT COUNT(*) FROM messages m
-                 WHERE m.account_id = s.account_id AND m.mailbox = s.mailbox
-                   AND m.body_state = 'pending') AS pending_bodies
-         FROM mailbox_state s
-         ORDER BY s.account_id, s.mailbox`
-      )
-      .all() as Array<Record<string, number | string | null>>;
-
-    console.log(`Local cache: mode=${config.mode}`);
-    if (rows.length === 0) {
-      console.log('  (no mailboxes synced yet)');
-      return;
-    }
-
-    for (const row of rows) {
-      const complete = row.backfill_complete === 1;
-      const oldest = row.oldest_date
-        ? new Date(Number(row.oldest_date)).toISOString().slice(0, 10)
-        : '—';
-      const synced = row.last_delta_at
-        ? `${Math.round((Date.now() - Number(row.last_delta_at)) / 1000)}s ago`
-        : 'pending';
-      const bodies = Number(row.pending_bodies) > 0 ? `, ${row.pending_bodies} bodies queued` : '';
-
-      console.log(
-        `  ${row.account_id}/${row.mailbox}: ${row.messages} messages, ` +
-          `${complete ? 'backfill complete' : 'backfilling'}, back to ${oldest}, synced ${synced}${bodies}`
-      );
+    for (const line of buildCacheStatusLines(cache, loadCacheConfig(), daemonRunning)) {
+      console.log(line);
     }
   } catch (error) {
     console.log(

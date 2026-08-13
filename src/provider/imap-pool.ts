@@ -63,7 +63,7 @@ interface PoolEntry {
 export interface AccountDiagnostics {
   account_id: string;
   connected: boolean;
-  queue_depth: number;
+  borrow_queue_depth: number;
   in_flight: { label: string; elapsed_ms: number } | null;
 }
 
@@ -378,6 +378,15 @@ export class ImapConnectionPool {
   }
 
   /**
+   * The per-operation ceiling, in ms. The queue worker needs it to check that
+   * its lease outlives it — a lease that can expire mid-operation gets the job
+   * reclaimed and re-run underneath the worker still performing it.
+   */
+  getOperationTimeoutMs(): number {
+    return this.operationTimeoutMs;
+  }
+
+  /**
    * Live pool state. The pool exists only inside this process, so a separate
    * CLI can never observe it — this is the only way to see whether an account
    * is wedged, how deep its queue is, and how long the current operation has
@@ -391,7 +400,7 @@ export class ImapConnectionPool {
       accounts: [...this.entries.entries()].map(([account_id, entry]) => ({
         account_id,
         connected: entry.provider != null && !entry.provider.isDead(),
-        queue_depth: entry.queueDepth,
+        borrow_queue_depth: entry.queueDepth,
         in_flight: entry.inFlight
           ? {
               label: entry.inFlight.label,

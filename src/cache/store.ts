@@ -240,31 +240,46 @@ export function readBodyHtml(db: Database, id: number): string | null {
 }
 
 /** Remove messages the server reported as VANISHED, keeping FTS in step. */
+/**
+ * One bind parameter per UID, and SQLite caps a statement at 32766 of them
+ * (SQLITE_MAX_VARIABLE_NUMBER; verified against node:sqlite). The vanished
+ * list comes from the network — a QRESYNC VANISHED (EARLIER) can cover a
+ * mailbox's whole expunge history, and one iCloud server bug emits responses
+ * spanning the entire mailbox — so its size is not ours to assume. Well under
+ * the cap, and small enough that no single statement gets slow.
+ */
+const DELETE_CHUNK = 500;
+
 export function deleteMessages(
   db: Database,
   params: { accountId: string; mailbox: string; uidvalidity: number; uids: number[] }
 ): number {
   if (params.uids.length === 0) return 0;
 
-  const placeholders = params.uids.map(() => '?').join(', ');
-  const rows = db
-    .prepare(
-      `SELECT id FROM messages
-       WHERE account_id = ? AND mailbox = ? AND uidvalidity = ? AND uid IN (${placeholders})`
-    )
-    .all(params.accountId, params.mailbox, params.uidvalidity, ...params.uids) as Array<{
-    id: number;
-  }>;
+  let deleted = 0;
+  for (let start = 0; start < params.uids.length; start += DELETE_CHUNK) {
+    const chunk = params.uids.slice(start, start + DELETE_CHUNK);
+    const placeholders = chunk.map(() => '?').join(', ');
+    const rows = db
+      .prepare(
+        `SELECT id FROM messages
+         WHERE account_id = ? AND mailbox = ? AND uidvalidity = ? AND uid IN (${placeholders})`
+      )
+      .all(params.accountId, params.mailbox, params.uidvalidity, ...chunk) as Array<{
+      id: number;
+    }>;
 
-  for (const { id } of rows) {
-    db.prepare(`DELETE FROM messages_fts WHERE rowid = ?`).run(id);
-    db.prepare(`DELETE FROM messages WHERE id = ?`).run(id);
+    for (const { id } of rows) {
+      db.prepare(`DELETE FROM messages_fts WHERE rowid = ?`).run(id);
+      db.prepare(`DELETE FROM messages WHERE id = ?`).run(id);
+    }
+    deleted += rows.length;
   }
 
   // thread_links rows are intentionally left behind: a message vanishing from
   // one mailbox (moved to holding, archived) shouldn't dissolve the thread it
   // belonged to, and a stale link costs one row.
-  return rows.length;
+  return deleted;
 }
 
 /**
