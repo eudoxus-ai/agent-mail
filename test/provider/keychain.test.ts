@@ -32,6 +32,33 @@ describe('storePassword', () => {
       'Failed to store password in Keychain for account "gmail"'
     );
   });
+
+  it('retries when a concurrent store wins the race', () => {
+    let calls = 0;
+    mockExecFileSync.mockImplementation(() => {
+      if (++calls === 1) {
+        const err = new Error(
+          'security: SecKeychainItemCreateFromContent (<default>): The specified item already exists in the keychain.'
+        );
+        (err as any).status = 45;
+        throw err;
+      }
+      return Buffer.from('');
+    });
+    expect(() => storePassword('agent-mail', 'gmail', 'x')).not.toThrow();
+    expect(calls).toBe(2);
+  });
+
+  it('gives up if the duplicate error never clears', () => {
+    mockExecFileSync.mockImplementation(() => {
+      const err = new Error('The specified item already exists in the keychain.');
+      (err as any).status = 45;
+      throw err;
+    });
+    expect(() => storePassword('agent-mail', 'gmail', 'x')).toThrow(
+      'Failed to store password in Keychain for account "gmail"'
+    );
+  });
 });
 
 describe('getPassword', () => {
@@ -106,6 +133,28 @@ describe('verifyKeychainAccess', () => {
       return Buffer.from('');
     });
     expect(() => verifyKeychainAccess()).toThrow('Keychain integration check failed');
+  });
+
+  it('uses a probe account unique to this process', () => {
+    const accounts: string[] = [];
+    mockExecFileSync.mockImplementation((cmd, args) => {
+      if (Array.isArray(args)) {
+        const i = args.indexOf('-a');
+        if (i !== -1) accounts.push(String(args[i + 1]));
+        if (args[0] === 'find-generic-password') return Buffer.from('agent-mail-keychain-test\n');
+      }
+      return Buffer.from('');
+    });
+
+    verifyKeychainAccess();
+    const first = [...new Set(accounts)];
+    expect(first).toHaveLength(1);
+    expect(first[0]).toContain(`__agent-mail-verify__${process.pid}-`);
+
+    accounts.length = 0;
+    verifyKeychainAccess();
+    // A fresh probe per call, so a concurrent server's cleanup cannot delete ours.
+    expect(new Set(accounts).has(first[0]!)).toBe(false);
   });
 
   it('throws when store fails', () => {
