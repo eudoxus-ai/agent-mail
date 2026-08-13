@@ -5,3 +5,5 @@ dist/
 .context/
 .worktrees/
 .superpowers/
+.serena/
+_bmad/
