@@ -2,11 +2,21 @@ import type { Database } from '../ledger/sqlite.js';
 import type { AccountConfig, PolicyConfig, ToolDefinition, RiskLevel } from '../types.js';
 import type { Logger } from '../logger.js';
 import type { Executor } from '../executor/executor.js';
+import { QueueOverflowError } from '../executor/executor.js';
+import { describeWorkerState } from '../ledger/worker-heartbeat.js';
 import { evaluatePolicy } from '../policy/engine.js';
 import { getAccount, getDefaultAccount } from '../provider/accounts.js';
 import { describeIntent } from '../ledger/audit-summary.js';
 import { DEFAULT_REVIEWER_PORT } from '../config.js';
 import { buildApprovalUrl } from '../reviewer/urls.js';
+
+/**
+ * Tools that accept `background: true`.
+ *
+ * Only the bulk mutations. Read tools are bounded and cheap enough to await,
+ * and queue_send is always gated — it already returns an intent id up front.
+ */
+const BACKGROUNDABLE_TOOLS = new Set(['hold_messages', 'hold_by_sender']);
 
 export interface MiddlewareDeps {
   db: Database;
@@ -119,6 +129,68 @@ export function wrapToolHandler(
             },
           ],
         };
+      }
+
+      // Long bulk sweeps go to the queue rather than running inline. Only for
+      // tools that declare support: returning an id before the work happens is
+      // only useful when the caller can poll for the outcome, and only safe
+      // when the action records enough to be undone.
+      if (params.background === true && BACKGROUNDABLE_TOOLS.has(canonicalToolName)) {
+        try {
+          const intent = await deps.executor.enqueue({
+            tool: canonicalToolName,
+            toolParams: params,
+            accountId: resolvedAccountId,
+            agentId: deps.agentId,
+            risk: policyResult.risk,
+          });
+
+          // This response is the moment a user believes their work has been
+          // filed. If nothing is going to perform it, this is the last chance
+          // to say so before they walk away.
+          const worker = describeWorkerState(deps.db);
+
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({
+                  status: 'queued',
+                  intent_id: intent.id,
+                  // Depth comes from the same read as the liveness check, so
+                  // the two can never disagree in one response.
+                  queue_depth: worker.queued_count,
+                  daemon_running: worker.alive,
+                  ...(worker.warning ? { warning: worker.warning } : {}),
+                  message: `${toolDef.name} queued. The agent-mail daemon performs it.`,
+                  how_to_check: `Poll get_intent with intent_id "${intent.id}" until status is "executed" or "failed".`,
+                  how_to_undo: `undo_intent with intent_id "${intent.id}" once it reports "executed".`,
+                }),
+              },
+            ],
+          };
+        } catch (error) {
+          if (!(error instanceof QueueOverflowError)) throw error;
+
+          // A refusal, not a failure: nothing was queued and nothing needs
+          // undoing. Retry the identical call verbatim once the queue drains.
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({
+                  status: 'queue_overflow',
+                  queued: error.queued,
+                  limit: error.limit,
+                  message: error.message,
+                  nothing_happened: true,
+                  what_to_do:
+                    'This bound is a runaway-loop backstop, not backpressure — a queue this deep almost always means something is filing actions in a loop. Call get_diagnostics to see the queue depth and whether the daemon is draining it.',
+                }),
+              },
+            ],
+          };
+        }
       }
 
       // Execute immediately

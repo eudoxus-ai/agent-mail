@@ -11,6 +11,9 @@ tools:
   list_senders:        { risk: none, gate: ungated, reversible: false }
   list_mailboxes:      { risk: none, gate: ungated, reversible: false }
   read_thread:         { risk: none, gate: ungated, reversible: false }
+  # Reading is risk: none elsewhere, but this one writes a file to disk.
+  # Set gate: configurable if you want approval before attachments are saved.
+  get_attachment:      { risk: low, gate: ungated, reversible: false }
   get_overview:        { risk: none, gate: ungated, reversible: false }
   draft_reply:         { risk: low, gate: ungated, reversible: false }
   label_thread:        { risk: low, gate: ungated, reversible: true }
@@ -18,6 +21,7 @@ tools:
   get_audit_log:       { risk: none, gate: ungated, reversible: false }
   get_intent:          { risk: none, gate: ungated, reversible: false }
   get_scan_result:     { risk: none, gate: ungated, reversible: false }
+  get_diagnostics:     { risk: none, gate: ungated, reversible: false }
   undo_intent:         { risk: low, gate: ungated, reversible: false }
 
   unsubscribe_sender:

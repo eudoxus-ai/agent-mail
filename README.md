@@ -237,6 +237,7 @@ Notifications are posted with `osascript` instead of `node-notifier`/`terminal-n
 |------|-------------|------|------|
 | `search_threads` | Search emails across all accounts (or scoped via `account_ids`) | None | Immediate |
 | `read_thread` | Read a single message identified by `target: {account_id, uid}` | None | Immediate |
+| `get_attachment` | Download one attachment to a private staging directory and return its path | Low | Immediate |
 | `get_overview` | Cross-account summary of recent mail that needs attention | None | Immediate |
 | `draft_reply` | Create a draft (saved to Drafts, not sent) | Low | Immediate |
 | `label_thread` | Add/remove IMAP flags on `targets: [{account_id, uid}]` | Low | Immediate |
@@ -244,8 +245,9 @@ Notifications are posted with `osascript` instead of `node-notifier`/`terminal-n
 | `get_pending_actions` | Check the approval queue (cross-account) | None | Immediate |
 | `get_audit_log` | View action history (cross-account) | None | Immediate |
 | `queue_send` | Queue an email for sending | High | **Always requires approval** |
-| `hold_messages` | Move targets to `agent-mail-holding`; reversible for 30 days; supports `dry_run: true` and `include_summary: true` | Medium | Configurable |
+| `hold_messages` | Move targets to `agent-mail-holding`; reversible for 30 days; supports `dry_run: true`, `include_summary: true`, `background: true` | Medium | Configurable |
 | `restore_messages` | Move held messages back to their original mailbox using the ledger snapshot captured at hold time | Low | Immediate |
+| `get_diagnostics` | Live server state: connection pool health, per-account queue depth, in-flight operation and its elapsed time, actions stuck mid-execution | None | Immediate |
 | `get_intent` | Return the full record of a past intent: targets with captured subject/from, status, and reversal links; useful for partial-restore workflows | None | Immediate |
 | `undo_intent` | Reverse a previous action | Low | Immediate |
 
@@ -295,6 +297,59 @@ After a `hold_messages` call you can restore just a subset of the held messages 
 
 `get_intent` also surfaces `reversed_by_intent_id` once a restore intent links back to the hold, so you can track the full reversal chain.
 
+### When something hangs
+
+Call `get_diagnostics`. The IMAP connection pool lives inside the MCP server process, so no CLI command can see it — this tool is the only window in.
+
+Two queues appear in the payload and they are different things. `worker.queued_count` is the **durable queue** — accepted work in the ledger, visible from every process, drained by the daemon. `imap_pool.accounts[].borrow_queue_depth` is operations waiting for **this process's** IMAP connection; the daemon has its own pool, which the MCP process cannot see, so these depths sitting at zero while work executes in the daemon is normal, not a contradiction.
+
+Executing intents are split by evidence:
+
+- **`in_progress_intents`** — a worker holds a live lease on it, or its `progress.updated_at` is fresh (under ten minutes). Each entry says which (`alive_because`). Do not re-run these.
+- **`orphaned_intents`** — no live lease *and* progress stale past ten minutes (or absent). A process died mid-action and nothing will finish them. Re-run these — `hold_by_sender` is idempotent. Queued work does not end up here; a claim whose worker dies is requeued when its lease expires.
+- **Wedged.** An `in_flight` operation in `imap_pool` whose `elapsed_ms` is climbing toward `operation_timeout_ms`. It will be abandoned at that point and the account will recover.
+
+`connections.leaked` is a computed check: `opened - closed` should equal `live`, and `live` should never exceed the number of configured accounts.
+
+`get_intent` also reports a `progress` field for running actions (`searching`, then `moving` with a message count), so a long job is distinguishable from one that never started.
+
+### How work is executed
+
+Mutations are performed by the **daemon**, not by the MCP server. A tool that changes mail writes the action into the ledger at `status: "queued"`, hands back an `intent_id`, and returns. The daemon claims queued work, performs it, and settles the intent to `executed` or `failed`.
+
+That split is the point: the queue is on disk, so accepted work survives a restart of either process. It also means **nothing happens if the daemon is not running.** Every surface says so —
+
+- the tool response carries `daemon_running: false` and a `warning`,
+- `get_intent` on a queued action says the same,
+- `get_diagnostics` leads with a `worker` block and names it in the `interpretation`,
+- `agent-mail status` opens with a banner,
+- the MCP server logs it at `error` on startup.
+
+Nothing is lost while the daemon is down. Queued work drains as soon as it starts, which is why **re-running an action that is merely slow will duplicate it** — poll `get_intent` instead.
+
+There is no batch-size limit. Filing fifty holds at once is fine: they queue durably and drain one at a time per account. (An earlier version capped outstanding background work at 8, because it ran in the MCP process' memory and a restart lost it. That reason is gone.) A `status: "queue_overflow"` refusal at 1000 queued actions is a runaway-loop backstop, not backpressure — it means something is filing in a loop. Nothing is queued by a refused call, so there is nothing to reconcile or undo.
+
+### Long bulk sweeps
+
+`hold_messages` and `hold_by_sender` take `background: true` (the default for `hold_by_sender`). The call queues the work and returns an `intent_id` right away:
+
+```json
+{
+  "status": "queued",
+  "intent_id": "3f9a…",
+  "queue_depth": 3,
+  "daemon_running": true,
+  "how_to_check": "Poll get_intent with intent_id \"3f9a…\" until status is \"executed\" or \"failed\".",
+  "how_to_undo": "undo_intent with intent_id \"3f9a…\" once it reports \"executed\"."
+}
+```
+
+Use it for full-history sweeps — anything with no `since` floor over a large mailbox, especially on iCloud. A synchronous call that outruns the client's patience gives you a timeout, and a timeout tells you nothing: the move may have completed with the response lost, or never have run at all. Worse, you get no `intent_id`, so the batch can't be undone. Queued, the id exists before any mail moves, so the outcome is always knowable and always reversible.
+
+Targets are recorded in the ledger *before* each move and confirmed after, so even a sweep interrupted partway leaves a restorable record. If the daemon dies mid-job, the lease on its claim expires and another worker picks the job up — up to three attempts, after which the intent is marked `failed` with an explanation rather than retried forever.
+
+`agent-mail status` lists any actions that died mid-execution, with the intent id to undo them.
+
 ## Policy
 
 Edit `~/.agent-mail/policy.yaml` to customize which actions need approval. The default policy:
@@ -311,6 +366,172 @@ hold_messages:
   gate: always_gated
 ```
 
+## Node version
+
+**Use Node 24 (Active LTS).** The repo pins it in `.tool-versions` and `.nvmrc`:
+
+```bash
+asdf install    # or: nvm use
+```
+
+Any 24.x works. If `asdf list all nodejs` shows an older ceiling than you expect, its version index is cached — refresh it with `asdf plugin update nodejs`.
+
+Node 22 also works and remains the `engines` floor — the full test suite passes on both. Node 24 is the better target for two reasons:
+
+- **`node:sqlite` is stable there.** On Node 22 it still emits an experimental warning; on 24 it does not. Given the intent ledger and the local message cache both sit on `node:sqlite`, that matters more here than in most projects.
+- **Longer support runway.** Node 22 is the older LTS line; 24 is Active LTS.
+
+Do not run this on an odd-numbered release (23, 25, …). Those never become LTS and stop receiving security fixes after roughly six months — Node 25 reached end-of-life in March 2026. The daemon and MCP server both warn at startup if they find themselves on one.
+
+### How the daemon picks its Node
+
+`install-daemon` pins the daemon to the exact Node binary you ran the install with (`process.execPath`), not to whatever `node` resolves to later.
+
+This matters if you use a version manager. `which node` under asdf, nvm, or volta returns a *shim* — a script that picks a version at runtime from `.tool-versions` and the manager's environment variables. launchd provides neither: it starts the daemon with a stripped `PATH` and none of your shell's environment. The shim then falls through to whatever `node` it can find, usually Homebrew's, which tracks *current* rather than LTS. The result is a daemon quietly running a Node major you never installed.
+
+That's not cosmetic here: `node:sqlite` is still experimental, and its feature set — FTS5 support in particular — varies between majors. The daemon and the MCP server disagreeing about the runtime can mean they disagree about whether the local cache works at all.
+
+`agent-mail status` prints both versions and flags a mismatch. If you switch Node versions, re-run `install-daemon` to re-pin.
+
+## Local cache
+
+By default agent-mail reads everything over IMAP, live. That is correct but slow: IMAP has no aggregate operations, so a broad question ("what's still unanswered from June") costs one network round trip per account per query, and body search is either unavailable or unrankable.
+
+The optional local cache mirrors your mail into a SQLite database on your Mac and serves searches from disk instead.
+
+### What gets stored, and where
+
+`~/.agent-mail/cache.db`, created `0600` inside the `0700` agent-mail directory. It holds message envelopes, flags, **full message bodies** (text and HTML), and attachment *metadata* — filename, type and size. Attachment payloads are not stored; `get_attachment` fetches those on demand.
+
+Be aware of what that means: **two years of your full message bodies sit at rest in a file on your disk.** Nothing leaves your machine — the same local-first guarantee as the rest of agent-mail — but this is meaningfully more of your mail sitting in one readable place than before. Budget roughly 300–400 MB per account for a two-year window.
+
+To delete it, stop the daemon and `rm ~/.agent-mail/cache.db`. Nothing is lost: the cache is derived from your mail server and rebuilds itself. The intent ledger, which is the actual record of what agents did, is a separate file and is untouched.
+
+### Turning it on
+
+```bash
+./bin/agent-mail.mjs cache            # what mode am I in, and what does it mean
+./bin/agent-mail.mjs cache shadow     # change it
+```
+
+`cache` with no argument prints the current mode, where it came from, what it does, and the per-mailbox sync state. Setting a mode edits `~/.agent-mail/cache.yaml` in place, leaving any other settings there alone.
+
+Or write the file yourself:
+
+```yaml
+cache:
+  mode: shadow    # off (default) | shadow | on
+```
+
+- **`off`** (default) — the cache is neither read nor written. The daemon does **not** sync it, so nothing warms up in the background; there is no cache until you pick another mode.
+- **`shadow`** — the daemon syncs, and every search runs against both the cache and IMAP. IMAP's answer is what you get; the two are compared and any difference is logged to `~/.agent-mail/agent-mail.log`. Sender sweeps report what the cache would have recovered without holding it. **Nothing the cache says changes what happens.** Run here for a few days first.
+- **`on`** — searches are served from the cache, falling back to IMAP when the cache is stale or a mailbox hasn't finished backfilling.
+
+Shadow mode exists because the failure that matters for a mail cache is silently *missing* a message. Watch the log for `cache: shadow divergence` before switching to `on`.
+
+### Choosing which folders sync
+
+The `mailboxes:` list in the same file controls what gets cached. The default is the inbox, sent, archive, and agent-mail's holding folder:
+
+```yaml
+cache:
+  mode: shadow
+  mailboxes: [INBOX, "\\Sent", "\\Archive", agent-mail-holding, Receipts]
+```
+
+Entries are either literal folder names or special-use selectors (backslash-prefixed, quoted — `"\\Sent"` resolves to `Sent Messages` on iCloud and `[Gmail]/Sent Mail` on Gmail). A literal name also matches behind a namespace prefix: `Receipts` finds `INBOX.Receipts` on a Dovecot-style server, and its messages are cached under the plain name you configured. `agent-mail cache` shows the active list.
+
+A configured folder that matches nothing on a server is reported in the daemon log (`cache: configured mailbox matched no mailbox on the server`, with the server's real folder list) rather than silently skipped — a typo'd name would otherwise just never appear, and nothing would say why.
+
+Either way, restart the daemon afterwards — the mode is read once at startup, so a running daemon stays on the old one until it restarts:
+
+```bash
+./bin/agent-mail.mjs install-daemon   # reinstalls and restarts
+```
+
+### The cache also fixes sender sweeps
+
+`hold_by_sender` matches via the IMAP server's `SEARCH FROM`, and that search has been observed to miss — a long sender address returned nothing while ten messages from it sat in the inbox. The cache stores the address parsed out of the IMAP ENVELOPE and matches it locally, so once it is on (`shadow` or `on`), every sender sweep cross-checks the server's result against it and **holds anything the server missed**, reporting what it recovered:
+
+```json
+{
+  "cache_cross_check": { "checked": true, "recovered": 10 },
+  "warning": "The IMAP server's FROM search missed 10 message(s) that the local cache found; they were included in this hold."
+}
+```
+
+In `shadow` the cross-check runs but does **not** hold anything — it reports `applied: false` and tells you what it would have caught. That is the point of running shadow first: measure how badly the server's search actually misses across your real senders, then switch to `on` knowing the number.
+
+The relationship is one-way on purpose. The cache has a backfill floor and a sync interval, so it under-reports in its own way — a cache hit the server missed is evidence, but a cache miss proves nothing. So it only ever *adds* messages to a sweep, never removes them, and cached UIDs from a stale `UIDVALIDITY` are discarded rather than acted on. With the cache off, sweeps behave exactly as before and the response carries no `cache_cross_check` at all.
+
+### iCloud
+
+Three iCloud-specific behaviours this codebase works around, all observed on real accounts or documented publicly:
+
+- **Broken ENABLE handshake.** iCloud advertises CONDSTORE/QRESYNC but replies to `ENABLE` with a bare tagged OK, omitting the untagged `* ENABLED` response the RFC requires. Strict clients (imapflow included) then treat the extensions as off: no HIGHESTMODSEQ from STATUS, and the CHANGEDSINCE fetch modifier silently dropped. agent-mail repairs the session after connect — the server did process the ENABLE — and logs `enable_handshake_repaired: true` in the `cache: sync capabilities` line when it had to. Apple appears to have fixed some of this in newer server revisions, so whether the repair fires can vary by account.
+- **~5 simultaneous connections per account**, the strictest of the major providers. agent-mail holds one connection per account, but Mail.app, an iPhone, and the daemon all share that budget — "Connection not available" storms can simply mean the budget is spent elsewhere.
+- **Slow large FETCHes.** Bodies are fetched in chunks of 10 and persisted per chunk, so a stall costs one chunk of progress rather than the whole batch.
+
+### Servers without CONDSTORE
+
+CONDSTORE lets a server answer "what changed since I last looked". Without it (or when a server's support cannot be used), mailboxes fall back to comparing UID lists — and the only way to notice a flag change is to re-read envelopes.
+
+Re-reading them every tick is a cost that never converges: on a real account it meant re-ingesting the same 6363 messages every minute, forever, while two mailboxes timed out at 300s and never finished. So arrivals are checked every tick, which is cheap and is what freshness depends on, and the flag window is re-read every 30 minutes instead. A flag you change in another client lands within half an hour rather than within a minute; nothing else is affected.
+
+Message bodies drain on their own connection, separately from the envelope sync, so a slow body fetch gets its own timeout budget instead of consuming the sync's.
+
+### The daemon does the syncing
+
+Sync runs in the background daemon, not in the MCP server — several MCP servers can be running at once (Claude Desktop, Claude Code, a CLI invocation), and each one syncing would duplicate every fetch. So the cache needs the daemon installed:
+
+```bash
+./bin/agent-mail.mjs install-daemon
+```
+
+If the daemon isn't running, searches report `cache.state: "stale"` and fall back to IMAP. Degraded, not broken.
+
+### First sync
+
+The first backfill walks your mail newest-first, so recent mail is searchable within seconds while older mail fills in behind it. Responses carry a coverage block so an agent can tell "nothing matched" from "nothing matched in what I have locally":
+
+```json
+"cache": {
+  "state": "backfilling",
+  "last_synced_at": "2026-07-31T18:04:11Z",
+  "coverage": { "work": { "INBOX": { "complete": false, "oldest": "2025-02-14T…", "messages": 8412 } } }
+}
+```
+
+Check progress any time with `./bin/agent-mail.mjs status`.
+
+### Settings
+
+```yaml
+cache:
+  mode: off
+
+  # Entries starting with a backslash are IMAP special-use flags, resolved per
+  # provider — Gmail's "[Gmail]/Sent Mail" and iCloud's "Sent Messages" both
+  # match "\Sent".
+  #
+  # Gmail's All Mail ("\All") is excluded on purpose: it holds a near-copy of
+  # every message, roughly doubling cache size and backfill time for very
+  # little extra reach. Add "\All" if you want it anyway.
+  mailboxes: [INBOX, "\Sent", "\Archive", agent-mail-holding]
+
+  # How far back to backfill. null means your entire mail history — a
+  # decade-old account can take hours and several GB.
+  backfill_days: 730
+
+  attachments: metadata          # none | metadata | full
+  max_attachment_bytes: 26214400 # 25 MB
+  sync_interval_seconds: 60
+```
+
+### Attachments
+
+Attachment payloads are never cached, so `get_attachment` always fetches from the server. By default it writes the file to `~/.agent-mail/attachments/<date>/<random>/` and returns the path — your agent can open it with its own file tools, and a large PDF doesn't get base64'd into the conversation. Staged files are written `0600`, never executable regardless of type, and deleted after 7 days.
+
 ## Architecture
 
 **Intent Ledger.** Every action is an intent stored in SQLite. Intents go through a lifecycle: `pending` → `approved` → `executing` → `executed` (or `rejected`, `failed`, `undone`). The `executing` intermediate status prevents duplicate execution on crash.
@@ -320,6 +541,8 @@ hold_messages:
 **IMAP threading.** Threads are reconstructed from `In-Reply-To` and `References` headers (RFC 2822). No provider-specific thread support needed.
 
 **SQLite WAL.** Multiple processes (MCP server instances + reviewer UI) share one database file with WAL mode, `busy_timeout(5000)`, and `wal_autocheckpoint(1000)`.
+
+**Local cache (optional).** A second SQLite database, `cache.db`, mirrors mail for fast local search with an FTS5 full-text index. It is strictly derived state: the daemon is its only writer, MCP servers open it read-only, and every mutation still executes against IMAP first. Deleting it loses nothing. See [Local cache](#local-cache).
 
 ## Development
 
@@ -337,6 +560,13 @@ To remove the background daemon:
 
 ```bash
 ./bin/agent-mail.mjs uninstall-daemon
+```
+
+That stops cache syncing but leaves the cached mail on disk. To remove that too:
+
+```bash
+rm ~/.agent-mail/cache.db
+rm -rf ~/.agent-mail/attachments
 ```
 
 To remove local files after uninstalling the daemon:

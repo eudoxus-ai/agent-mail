@@ -25,6 +25,8 @@ export type RiskLevel = 'none' | 'low' | 'medium' | 'high';
 export type GateType = 'ungated' | 'configurable' | 'always_gated';
 export type IntentStatus =
   | 'pending'
+  /** Accepted and durable, waiting for a worker to claim it. */
+  | 'queued'
   | 'approved'
   | 'executing'
   | 'executed'
@@ -48,6 +50,13 @@ export interface Intent {
   resolved_by: string | null;
   undo_token: string | null;
   undo_expires_at: string | null;
+  /** Worker holding the claim, or null if unclaimed. */
+  claimed_by: string | null;
+  claimed_at: string | null;
+  /** When the claim lapses and the job becomes reclaimable. */
+  lease_expires_at: string | null;
+  /** How many times a worker has taken this on. Bounded to stop a poison job. */
+  attempts: number;
 }
 
 // === Audit ===

@@ -5,7 +5,9 @@ import { ImapConnectionPool } from '../provider/imap-pool.js';
 import { Executor } from '../executor/executor.js';
 import { createReviewerApp } from '../reviewer/app.js';
 import { createLogger } from '../logger.js';
-import { ACCOUNTS_YAML_PATH, LEDGER_DB_PATH, DEFAULT_REVIEWER_PORT } from '../config.js';
+import { ACCOUNTS_YAML_PATH, LEDGER_DB_PATH, DEFAULT_REVIEWER_PORT, CACHE_DB_PATH } from '../config.js';
+import { openCache } from '../cache/db.js';
+import { loadCacheConfig } from '../cache/config.js';
 
 export async function startReviewer(port: number = DEFAULT_REVIEWER_PORT): Promise<void> {
   const logger = createLogger('cli');
@@ -28,7 +30,22 @@ export async function startReviewer(port: number = DEFAULT_REVIEWER_PORT): Promi
   const db = openDatabase();
   const accounts = loadAccounts();
   const pool = new ImapConnectionPool({ accounts, logger });
-  const executor = new Executor({ db, accounts, pool, logger });
+  // Approvals executed here mutate mail too, so the cache needs the same echo
+  // the MCP path gets. This process doesn't sync — the daemon owns that — so
+  // the cache is opened only if it already exists.
+  const cacheConfig = loadCacheConfig();
+  let cache;
+  if (existsSync(CACHE_DB_PATH)) {
+    try {
+      cache = openCache(CACHE_DB_PATH);
+    } catch (error) {
+      logger.warn(
+        `Local cache unavailable: ${error instanceof Error ? error.message : error}`
+      );
+    }
+  }
+
+  const executor = new Executor({ db, accounts, pool, logger, cache, cacheConfig });
   const app = createReviewerApp({ db, executor, logger });
 
   const shutdown = async (code = 0) => {

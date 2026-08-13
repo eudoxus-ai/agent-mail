@@ -1,5 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { openDatabase, checkStuckExecuting } from '../ledger/db.js';
+import { describeWorkerState } from '../ledger/worker-heartbeat.js';
 import { loadAccounts } from '../provider/accounts.js';
 import { verifyKeychainAccess } from '../provider/keychain.js';
 import { ImapConnectionPool } from '../provider/imap-pool.js';
@@ -30,11 +31,18 @@ import { listMailboxesTool } from '../tools/list-mailboxes.js';
 import { getIntentTool } from '../tools/get-intent.js';
 import { getScanResultTool } from '../tools/get-scan-result.js';
 import { ScanJobRunner, withTimeout } from '../executor/scan-jobs-runner.js';
+import { getAttachmentTool } from '../tools/get-attachment.js';
+import { getDiagnosticsTool } from '../tools/get-diagnostics.js';
 
 import { runStartupMigrations, runStartupScanCleanup } from './startup.js';
+import { openCache } from '../cache/db.js';
+import { checkNodeRuntime } from '../lib/node-runtime.js';
+import { loadCacheConfig } from '../cache/config.js';
+import { existsSync } from 'node:fs';
+import { CACHE_DB_PATH } from '../config.js';
 import type { ToolDefinition } from '../types.js';
 
-const SERVER_PREAMBLE = `agent-mail design contract. This server is built so that no action it exposes can cause irreversible harm. Every mutation (hold, label, draft) is reversible for 30 days via \`undo_intent\` or \`restore_messages\`, and every action is recorded in \`get_audit_log\`. Sending email and permanent deletion are deliberately not exposed — those operations require a separate human-in-the-loop flow outside this server. Agents should treat this as a low-stakes environment: prefer acting and reconciling afterward over asking permission per action. Over-holding-then-restoring is a normal interaction pattern, not a failure mode.`;
+const SERVER_PREAMBLE = `agent-mail design contract. This server is built so that no action it exposes can cause irreversible harm. Every mutation (hold, label, draft) is reversible for 30 days via \`undo_intent\` or \`restore_messages\`, and every action is recorded in \`get_audit_log\`. Sending email and permanent deletion are deliberately not exposed — those operations require a separate human-in-the-loop flow outside this server. Agents should treat this as a low-stakes environment: prefer acting and reconciling afterward over asking permission per action. Over-holding-then-restoring is a normal interaction pattern, not a failure mode. Mutations are performed by a background daemon, so a tool may return an intent id with status \`queued\` before the work has happened — poll \`get_intent\` for the terminal status. If an action stays \`queued\`, call \`get_diagnostics\`: it reports whether the daemon is running and says how to start it. Queued work is durable and is never lost, so re-running an action that is merely slow will duplicate it.`;
 
 export function buildServerOptions() {
   return {
@@ -47,6 +55,8 @@ export function buildServerOptions() {
 const ALL_TOOLS: ToolDefinition[] = [
   searchThreadsTool,
   readThreadTool,
+  getAttachmentTool,
+  getDiagnosticsTool,
   draftReplyTool,
   labelThreadTool,
   unsubscribeSenderTool,
@@ -107,8 +117,25 @@ export async function createMcpServer(
     process.exit(1);
   }
 
+  const runtime = checkNodeRuntime();
+  if (runtime.warning) logger.warn(runtime.warning);
+
   // Open database
   const db = openDatabase();
+
+  // Is anything going to perform what this server accepts?
+  //
+  // Logged at error, not warn: this server records mutations and hands back an
+  // id, which looks identical whether or not a daemon exists to run them. If
+  // nobody is draining the queue, every mutation this process accepts is a
+  // promise it cannot keep, and that is not a warning-level fact.
+  const workerState = describeWorkerState(db);
+  if (!workerState.alive) {
+    logger.error(workerState.warning!, {
+      queued_count: workerState.queued_count,
+      oldest_queued_age_seconds: workerState.oldest_queued_age_seconds,
+    });
+  }
 
   // Check for stuck executing intents (crash recovery)
   const stuck = checkStuckExecuting(db);
@@ -143,8 +170,22 @@ export async function createMcpServer(
     logger.warn(`holding-folder migration failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
+  // Open the local cache read-only. The daemon owns writes; MCP servers only
+  // read. A missing or unreadable cache means reads go to IMAP as before.
+  const cacheConfig = loadCacheConfig();
+  let cache;
+  if (cacheConfig.mode !== 'off' && existsSync(CACHE_DB_PATH)) {
+    try {
+      cache = openCache(CACHE_DB_PATH, { readOnly: true });
+    } catch (error) {
+      logger.warn(
+        `Local cache unavailable, falling back to IMAP: ${error instanceof Error ? error.message : error}`
+      );
+    }
+  }
+
   // Create executor
-  const executor = new Executor({ db, accounts, pool, logger });
+  const executor = new Executor({ db, accounts, pool, logger, cache, cacheConfig });
 
   // Runner for async (background) scan jobs
   const scanRunner = new ScanJobRunner({ db, logger });

@@ -7,16 +7,31 @@ const instances: Array<{
   connect: ReturnType<typeof vi.fn>;
   disconnect: ReturnType<typeof vi.fn>;
   noop: ReturnType<typeof vi.fn>;
+  isDead: ReturnType<typeof vi.fn>;
+  destroy: ReturnType<typeof vi.fn>;
+  getLastError: ReturnType<typeof vi.fn>;
   connected: boolean;
+  dead: boolean;
 }> = [];
 
 vi.mock('../../src/provider/imap.js', () => ({
   ImapProvider: vi.fn().mockImplementation(function () {
     const inst = {
-      connect: vi.fn(async function (this: typeof inst) { this.connected = true; }),
+      connect: vi.fn(async function (this: typeof inst) {
+        this.connected = true;
+        this.dead = false;
+      }),
       disconnect: vi.fn(async function (this: typeof inst) { this.connected = false; }),
       noop: vi.fn().mockResolvedValue(undefined),
+      // The pool checks these before reusing a pooled connection; a socket
+      // that died asynchronously must not be handed out again.
+      isDead: vi.fn(function (this: typeof inst) { return this.dead; }),
+      // Teardown always destroys the socket, so a hung LOGOUT cannot leave an
+      // orphaned connection behind.
+      destroy: vi.fn(function (this: typeof inst) { this.connected = false; this.dead = true; }),
+      getLastError: vi.fn().mockReturnValue(null),
       connected: false,
+      dead: false,
     };
     instances.push(inst);
     return inst;
@@ -66,6 +81,23 @@ describe('ImapConnectionPool', () => {
     await pool.withConnection('test', async () => 'b');
     expect(instances).toHaveLength(1);
     expect(instances[0].connect).toHaveBeenCalledTimes(1);
+  });
+
+  it('replaces a connection that died between borrows', async () => {
+    // The ECONNRESET case: the socket dies asynchronously while the pool is
+    // idle, so no in-flight call fails and nothing tears the entry down. The
+    // next borrow must notice and reconnect rather than hand out a dead client.
+    await pool.withConnection('test', async () => 'first');
+    expect(instances).toHaveLength(1);
+
+    instances[0].dead = true;
+
+    const result = await pool.withConnection('test', async () => 'second');
+
+    expect(result).toBe('second');
+    expect(instances).toHaveLength(2);
+    expect(instances[0].disconnect).toHaveBeenCalled();
+    expect(instances[1].connect).toHaveBeenCalledTimes(1);
   });
 
   it('serializes concurrent borrows on the same account', async () => {
