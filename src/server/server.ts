@@ -29,6 +29,7 @@ import { getOverviewTool, runGetOverview } from '../tools/get-overview.js';
 import { listSendersTool } from '../tools/list-senders.js';
 import { listMailboxesTool } from '../tools/list-mailboxes.js';
 import { getIntentTool } from '../tools/get-intent.js';
+import { cancelIntentTool } from '../tools/cancel-intent.js';
 import { getScanResultTool } from '../tools/get-scan-result.js';
 import { ScanJobRunner, withTimeout } from '../executor/scan-jobs-runner.js';
 import { getAttachmentTool } from '../tools/get-attachment.js';
@@ -71,6 +72,7 @@ const ALL_TOOLS: ToolDefinition[] = [
   listSendersTool,
   listMailboxesTool,
   getIntentTool,
+  cancelIntentTool,
   getScanResultTool,
 ];
 

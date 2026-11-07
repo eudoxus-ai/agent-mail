@@ -38,6 +38,9 @@ const PREVIEW_QUERY = {
   bodyParts: [{ key: 'TEXT', start: 0, maxLength: 2048 }],
 };
 
+/** Message-Ids per reply SEARCH. Two OR terms each, so 40 terms per command. */
+const REPLY_SEARCH_CHUNK = 20;
+
 function readPreview(msg: {
   headers?: Buffer;
   bodyParts?: Map<string, Buffer>;
@@ -225,6 +228,7 @@ export class ImapProvider {
     try {
       const searchQuery: Record<string, unknown> = {};
       if (criteria.from) searchQuery.from = criteria.from;
+      if (criteria.listId) searchQuery.header = { 'list-id': criteria.listId };
       if (criteria.to) searchQuery.to = criteria.to;
       if (criteria.subject) searchQuery.subject = criteria.subject;
       if (criteria.body) searchQuery.body = criteria.body;
@@ -242,7 +246,13 @@ export class ImapProvider {
 
       // Phase 1: cheap UID-only search. imapflow returns ascending UIDs (or false on failure).
       const searchResult = await this.client.search(query as any, { uid: true });
-      const allUids: number[] = Array.isArray(searchResult) ? searchResult : [];
+      // imapflow reports a refused search as `false`. iCloud refuses HEADER
+      // List-Id, and reading that as an empty result told callers the mailbox
+      // had no such mail.
+      if (!Array.isArray(searchResult)) {
+        throw new Error(`IMAP search failed in ${mailbox}`);
+      }
+      const allUids: number[] = searchResult;
       if (allUids.length === 0) return [];
 
       const uidsToFetch = pickNewestUids(allUids, limit);
@@ -387,6 +397,62 @@ export class ImapProvider {
         });
       }
       return results;
+    } finally {
+      lock.release();
+    }
+  }
+
+  /**
+   * True if a message outside `excludeUids` replies to any of `messageIds`.
+   *
+   * Backs the `when_thread_has_replies` gate, which runs on every sweep. One
+   * SEARCH per chunk rather than per message: this was ~95% of a large sender's
+   * sweep time. A server hit is confirmed against the parsed headers because
+   * HEADER search matches substrings.
+   */
+  async hasRepliesTo(
+    mailbox: string,
+    messageIds: string[],
+    excludeUids: number[]
+  ): Promise<boolean> {
+    const wanted = new Set(messageIds);
+    const excluded = new Set(excludeUids);
+
+    for (let start = 0; start < messageIds.length; start += REPLY_SEARCH_CHUNK) {
+      const chunk = messageIds.slice(start, start + REPLY_SEARCH_CHUNK);
+      const hits = await this.searchReferencing(mailbox, chunk);
+      const candidates = hits.filter((uid) => !excluded.has(uid));
+      if (candidates.length === 0) continue;
+
+      const messages = await this.fetchEnvelopes(mailbox, candidates);
+      const replied = messages.some(
+        (m) =>
+          (m.inReplyTo !== undefined && wanted.has(m.inReplyTo)) ||
+          m.references.some((reference) => wanted.has(reference))
+      );
+      if (replied) return true;
+    }
+    return false;
+  }
+
+  private async searchReferencing(mailbox: string, messageIds: string[]): Promise<number[]> {
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      const result = await this.client.search(
+        {
+          or: messageIds.flatMap((id) => [
+            { header: { References: id } },
+            { header: { 'In-Reply-To': id } },
+          ]),
+        } as any,
+        { uid: true }
+      );
+      // imapflow reports a failed search as `false`. Reading that as "no hits"
+      // would let a sweep through the replies gate unchecked.
+      if (!Array.isArray(result)) {
+        throw new Error(`Reply search failed in ${mailbox}`);
+      }
+      return result;
     } finally {
       lock.release();
     }

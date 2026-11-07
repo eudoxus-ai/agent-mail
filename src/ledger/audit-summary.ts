@@ -71,10 +71,10 @@ export function buildAuditSummary(
     }
 
     case 'hold_by_sender': {
-      const from = params.from as string | undefined;
+      const from = sweepLabel(params);
       const verb = dryRun ? 'Previewed hold of messages from' : 'Held messages from';
       return {
-        summary: `${verb} ${from ?? 'unknown sender'}`,
+        summary: `${verb} ${from}`,
         from,
         dry_run: dryRun,
       };
@@ -128,10 +128,9 @@ export function describeIntent(tool: string, params: Record<string, unknown>): s
       return `${verb} ${count} message${count !== 1 ? 's' : ''}`;
     }
     case 'hold_by_sender': {
-      const from = params.from as string | undefined;
       const dryRun = params.dry_run === true;
       const verb = dryRun ? 'Preview hold of messages from' : 'Hold messages from';
-      return `${verb} ${from ?? 'unknown sender'}`;
+      return `${verb} ${sweepLabel(params)}`;
     }
     case 'restore_messages': {
       const targets = params.targets as Target[] | undefined;
@@ -152,4 +151,11 @@ export function describeIntent(tool: string, params: Record<string, unknown>): s
     default:
       return tool;
   }
+}
+
+function sweepLabel(params: Record<string, unknown>): string {
+  const from = params.from as string | string[] | undefined;
+  if (Array.isArray(from)) return from.length === 1 ? from[0] : `${from.length} senders`;
+  if (from) return from;
+  return params.list_id ? `list ${params.list_id as string}` : 'unknown sender';
 }

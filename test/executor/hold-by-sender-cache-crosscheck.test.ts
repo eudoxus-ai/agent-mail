@@ -115,8 +115,7 @@ function fakeImap(imapUids: number[], generation = GENERATION) {
     moveMessages: vi.fn(async (uids: number[]) => ({
       uidMap: new Map(uids.map((u) => [u, u + 9000])),
     })),
-    fetchMessages: vi.fn(async () => []),
-    fetchThreadContext: vi.fn(async () => []),
+    hasRepliesTo: vi.fn(async () => false),
   };
 }
 
@@ -442,5 +441,56 @@ describe('the cross-check verdict on the poller surface', () => {
 
     expect(payload.outcome.cache_cross_check).toBeUndefined();
     expect(payload.outcome.note).toMatch(/verify with search_threads/i);
+  });
+});
+
+describe('a server that refuses HEADER List-Id', () => {
+  const LIST = 'news.example.com';
+  const listSweep = { from: undefined, list_id: LIST, account_ids: ['work'] };
+
+  function refusingImap() {
+    const imap = fakeImap([]);
+    imap.search.mockRejectedValue(new Error('IMAP search failed in INBOX'));
+    return imap;
+  }
+
+  function cacheListMessage(uid: number) {
+    upsertMessage(cache, {
+      accountId: 'work',
+      message: cachedMessage(uid, 'member@example.com', daysAgo(30)),
+      uidvalidity: GENERATION,
+      listId: `News <${LIST}>`,
+    });
+  }
+
+  it('holds what the cache has and says the sweep was cache-only', async () => {
+    cacheListMessage(201);
+    cacheListMessage(202);
+    cacheMessage(203, 'someone-else@example.com');
+    const imap = refusingImap();
+
+    const { payload } = await sweep(imap, listSweep);
+
+    expect(imap.moveMessages.mock.calls[0][0]).toEqual(expect.arrayContaining([201, 202]));
+    expect(imap.moveMessages.mock.calls[0][0]).not.toContain(203);
+    expect(payload.warning).toMatch(/work refused the List-Id search/);
+  });
+
+  it('fails, rather than reporting no_match, when the cache cannot answer either', async () => {
+    await expect(sweep(refusingImap(), listSweep, false)).rejects.toThrow(/search failed/);
+  });
+
+  it('does not act on cached UIDs from an old mailbox generation', async () => {
+    cacheListMessage(201);
+    const imap = fakeImap([], GENERATION + 1);
+    imap.search.mockRejectedValue(new Error('IMAP search failed in INBOX'));
+
+    await sweep(imap, listSweep);
+
+    expect(imap.moveMessages).not.toHaveBeenCalled();
+  });
+
+  it('still fails a sender sweep when the server search fails', async () => {
+    await expect(sweep(refusingImap())).rejects.toThrow(/search failed/);
   });
 });

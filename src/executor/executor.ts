@@ -14,6 +14,7 @@ import {
   withImmediateTransaction,
 } from '../ledger/intents.js';
 import { extractSnippetFromPart } from '../provider/mime.js';
+import { parseSweep } from '../tools/hold-by-sender.js';
 import { logAudit } from '../ledger/audit.js';
 import { buildAuditSummary } from '../ledger/audit-summary.js';
 import { getAccount } from '../provider/accounts.js';
@@ -448,7 +449,8 @@ export class Executor {
   private async recoverMissedBySender(args: {
     accountId: string;
     mailbox: string;
-    from: string;
+    from?: string;
+    listId?: string;
     before?: Date;
     limit: number;
     alreadyFound: number[];
@@ -467,6 +469,7 @@ export class Executor {
       accountIds: [args.accountId],
       mailbox: args.mailbox,
       from: args.from,
+      listId: args.listId,
       before: args.before,
       limit: args.limit,
     });
@@ -788,6 +791,32 @@ export class Executor {
     });
   }
 
+  /**
+   * Withdraw work no worker has claimed. The compare-and-swap is what makes
+   * this safe against the drain loop: claiming also moves an intent out of
+   * `queued`, so exactly one of the two wins.
+   */
+  private cancelQueued(
+    id: string,
+    actor: string
+  ): { intent_id: string; cancelled: boolean; status: string } {
+    const cancelled = updateIntentStatusIfCurrent(this.db, id, 'queued', 'rejected', {
+      resolved_by: actor,
+      error_detail: { code: 'cancelled', message: 'Cancelled before it started.' },
+    });
+    const latest = getIntent(this.db, id);
+    if (cancelled && latest) {
+      logAudit(this.db, {
+        intent_id: id,
+        account_id: latest.account_id,
+        action: 'rejected',
+        actor,
+        detail: buildAuditSummary(latest.tool, 'rejected', latest.params),
+      });
+    }
+    return { intent_id: id, cancelled, status: latest?.status ?? 'not_found' };
+  }
+
   async undoIntent(
     intentId: string
   ): Promise<{ success: boolean; message: string }> {
@@ -872,32 +901,12 @@ export class Executor {
     uids: number[]
   ): Promise<boolean> {
     return this.pool.withConnection(accountId, async (imap) => {
-      const selected = await imap.fetchMessages(mailbox, uids);
-      const selectedIds = new Set(
-        selected.map((message) => message.messageId).filter(Boolean)
-      );
-
-      if (selectedIds.size === 0) {
-        return false;
-      }
-
-      const context = await imap.fetchThreadContext(
-        mailbox,
-        Array.from(selectedIds),
-        100
-      );
-
-      return context.some((message) => {
-        if (uids.includes(message.uid)) {
-          return false;
-        }
-
-        if (message.inReplyTo && selectedIds.has(message.inReplyTo)) {
-          return true;
-        }
-
-        return message.references.some((reference) => selectedIds.has(reference));
-      });
+      // Envelopes rather than full messages: the gate needs only Message-Ids,
+      // and a UID that has since gone simply isn't returned. It can't be moved
+      // either, so it has no thread to protect and must not fail the rest.
+      const selected = await imap.fetchEnvelopes(mailbox, uids);
+      const selectedIds = selected.map((message) => message.messageId).filter(Boolean);
+      return imap.hasRepliesTo(mailbox, selectedIds, uids);
     });
   }
 
@@ -1151,6 +1160,7 @@ export class Executor {
     mailbox: string;
     query?: string;
     from?: string;
+    listId?: string;
     to?: string;
     subject?: string;
     since?: Date;
@@ -1823,6 +1833,14 @@ export class Executor {
     }
 
     // Read-only DB lookup: return full intent record with targets and reversal links
+    if (intent.tool === 'cancel_intent') {
+      const results = (intent.params.intent_ids as string[]).map((id) =>
+        this.cancelQueued(id, intent.agent_id ?? 'agent')
+      );
+      const payload = { cancelled: results.filter((r) => r.cancelled).length, results };
+      return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
+    }
+
     if (intent.tool === 'get_intent') {
       const id = intent.params.intent_id as string;
       const row = getIntent(this.db, id);
@@ -2042,8 +2060,9 @@ export class Executor {
 
         // uidMap accumulates source→destination UID mappings for all mailboxes
         const combinedUidMap = new Map<number, number>();
+        const errors: Array<{ uid: number; account_id: string; mailbox: string; reason: string }> = [];
 
-        for (const [mailbox, uids] of byMailbox) {
+        for (const [mailbox, requested] of byMailbox) {
           // The generation these UIDs belong to. Captured before the move, in
           // the same borrow, so it describes the mailbox the UIDs were read
           // from rather than whatever it may become later.
@@ -2059,20 +2078,34 @@ export class Executor {
             }
           }
 
-          if (includeSummary || !dryRun) {
-            const envs = await imap.fetchEnvelopes(mailbox, uids);
-            for (const env of envs) {
-              envelopeSnapshots.push({
-                account_id: accountId,
-                uid: env.uid,
-                mailbox,
-                subject: env.subject,
-                from: env.from.address,
-                uidvalidity,
-              });
-            }
+          const envs = await imap.fetchEnvelopes(mailbox, requested);
+          for (const env of envs) {
+            envelopeSnapshots.push({
+              account_id: accountId,
+              uid: env.uid,
+              mailbox,
+              subject: env.subject,
+              from: env.from.address,
+              uidvalidity,
+            });
           }
-          if (!dryRun) {
+
+          // Only what the server returned goes forward. A UID with no envelope
+          // is gone, and moving it anyway would leave no restorable record if
+          // it did exist. One such target must not cost the others their move.
+          const found = new Set(envs.map((env) => env.uid));
+          const uids = requested.filter((uid) => found.has(uid));
+          for (const uid of requested) {
+            if (found.has(uid)) continue;
+            errors.push({
+              uid,
+              account_id: accountId,
+              mailbox,
+              reason: `Message not found: UID ${uid} in ${mailbox}`,
+            });
+          }
+
+          if (!dryRun && uids.length > 0) {
             // Write the restorable record BEFORE touching mail.
             //
             // Previously targets were persisted only after every account's
@@ -2141,6 +2174,7 @@ export class Executor {
           per_mailbox: perMailbox,
           envelopes: envelopeSnapshots,
           uidMap: combinedUidMap,
+          errors,
           message_count: perMailbox.reduce((n, m) => n + m.message_count, 0),
         };
       },
@@ -2150,6 +2184,7 @@ export class Executor {
 
     // Aggregate envelopes from all accounts (internal scaffolding — not exposed)
     const allEnvelopes = perAccountRaw.flatMap((a: any) => a.envelopes ?? []);
+    const targetErrors = perAccountRaw.flatMap((a: any) => a.errors ?? []);
 
     // Aggregate uidMaps from all per-account results
     const allUidMaps: Map<string, Map<number, number>> = new Map();
@@ -2172,7 +2207,7 @@ export class Executor {
 
     // Strip internal `envelopes` and `uidMap` fields before building the public payload
     const perAccount = perAccountRaw.map(
-      ({ envelopes: _envs, uidMap: _um, ...rest }: any) => rest
+      ({ envelopes: _envs, uidMap: _um, errors: _errs, ...rest }: any) => rest
     );
     const totalMessages = perAccount.reduce(
       (n: number, a: any) => n + a.message_count,
@@ -2183,6 +2218,7 @@ export class Executor {
       accounts_searched: string[];
       accounts_available: string[];
       per_account_errors?: Record<string, string>;
+      errors?: typeof targetErrors;
       dry_run: boolean;
       total_messages: number;
       per_account: typeof perAccount;
@@ -2206,6 +2242,12 @@ export class Executor {
     if (Object.keys(fanResult.errors).length > 0) {
       payload.per_account_errors = fanResult.errors;
     }
+    if (targetErrors.length > 0) payload.errors = targetErrors;
+    // A queued caller never sees this payload, only what get_intent reads back.
+    updateIntentProgress(this.db, intent.id, dryRun ? 'previewed' : 'held', {
+      total_messages: totalMessages,
+      ...(targetErrors.length > 0 ? { errors: targetErrors } : {}),
+    });
     if (includeSummary) {
       payload.moved = allEnvelopes.map((e: any) => ({
         uid: e.uid,
@@ -2226,14 +2268,85 @@ export class Executor {
     return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
   }
 
-  /**
-   * Expand a sender+before search into UIDs, then hold them via holdTargets.
-   * Reuses the IMAP search path so we don't duplicate FROM/BEFORE semantics.
-   */
   private async holdBySender(
     intent: Intent
   ): Promise<Array<{ type: 'text'; text: string }>> {
-    const from = intent.params.from as string;
+    const sweep = parseSweep(intent.params);
+    if (sweep.listId !== undefined) return this.holdSweep(intent, { listId: sweep.listId });
+    if (sweep.batch) return this.holdSenders(intent, sweep.senders);
+    return this.holdSweep(intent, { from: sweep.senders[0] });
+  }
+
+  /**
+   * Sweep several senders under one intent, so a cleanup is one queue entry
+   * that can be undone as a whole.
+   *
+   * Each sender settles on its own: one with replied threads is blocked by the
+   * gate exactly as it would be alone, and the others still go ahead. Failing
+   * every sender is the exception, because that is the batch failing.
+   */
+  private async holdSenders(
+    intent: Intent,
+    senders: string[]
+  ): Promise<Array<{ type: 'text'; text: string }>> {
+    const outcomes: Array<{
+      from: string;
+      status: 'held' | 'no_match' | 'blocked' | 'failed';
+      messages: number;
+      detail?: string;
+      errors?: unknown[];
+      per_account_errors?: Record<string, string>;
+    }> = [];
+
+    for (const [done, from] of senders.entries()) {
+      try {
+        const [{ text }] = await this.holdSweep(intent, { from }, { done, total: senders.length });
+        const result = JSON.parse(text);
+        outcomes.push({
+          from,
+          status: result.status === 'no_match' ? 'no_match' : 'held',
+          messages: result.total_messages,
+          ...(result.status === 'no_match' ? { detail: result.diagnosis } : {}),
+          ...(result.errors ? { errors: result.errors } : {}),
+          ...(result.per_account_errors ? { per_account_errors: result.per_account_errors } : {}),
+        });
+      } catch (error) {
+        if (error instanceof HoldBySenderBlockedError) {
+          outcomes.push({ from, status: 'blocked', messages: 0, detail: error.errorDetail.message });
+        } else {
+          outcomes.push({
+            from,
+            status: 'failed',
+            messages: 0,
+            detail: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    }
+
+    const summary = {
+      dry_run: intent.params.dry_run === true,
+      total_messages: outcomes.reduce((n, o) => n + o.messages, 0),
+      senders: outcomes,
+    };
+    updateIntentProgress(this.db, intent.id, 'batch_complete', summary);
+
+    if (outcomes.every((o) => o.status === 'failed')) {
+      throw new Error(`Every sender failed. First error: ${outcomes[0].detail}`);
+    }
+    return [{ type: 'text', text: JSON.stringify(summary, null, 2) }];
+  }
+
+  /**
+   * Expand a sender or list search into UIDs, then hold them via holdTargets.
+   * Reuses the IMAP search path so we don't duplicate FROM/BEFORE semantics.
+   */
+  private async holdSweep(
+    intent: Intent,
+    match: { from: string; listId?: undefined } | { from?: undefined; listId: string },
+    batch?: { done: number; total: number }
+  ): Promise<Array<{ type: 'text'; text: string }>> {
+    const { from, listId } = match;
     const before = intent.params.before as string | undefined;
     const requestedIds = intent.params.account_ids as string[] | undefined;
     const mailbox = (intent.params.mailbox as string | undefined) ?? 'INBOX';
@@ -2254,31 +2367,60 @@ export class Executor {
 
     const criteria = {
       from,
+      listId,
       before: before ? new Date(before) : undefined,
     };
 
-    updateIntentProgress(this.db, intent.id, 'searching', {
-      from,
-      accounts: targetIds,
-      mailbox,
-    });
+    const searched: string[] = [];
+    const cacheOnlyAccounts: string[] = [];
+    const cacheOnlyNote = () =>
+      cacheOnlyAccounts.length === 0
+        ? ''
+        : ` ${cacheOnlyAccounts.join(', ')} refused the List-Id search, so this sweep used ` +
+          'the local cache there. That covers only the mail the cache has backfilled.';
+    const reportSearching = () =>
+      updateIntentProgress(this.db, intent.id, 'searching', {
+        ...(from ? { from } : { list_id: listId }),
+        accounts: targetIds,
+        searched: [...searched],
+        mailbox,
+        ...(batch ? { batch } : {}),
+      });
+    reportSearching();
 
     const searchResult = await fanOut({
       pool: this.pool,
       accountIds: targetIds,
       label: 'hold_by_sender:search',
       fn: async (accountId, imap) => {
-        const rows = await imap.search(mailbox, criteria, limit);
-        const uids = rows.map((r) => r.uid);
+        // Some servers refuse HEADER List-Id outright, so a List-Id sweep can
+        // still be answered from the cache. A sender search has no such excuse.
+        let uids: number[] = [];
+        let searchError: unknown;
+        try {
+          uids = (await imap.search(mailbox, criteria, limit)).map((r) => r.uid);
+        } catch (error) {
+          if (!listId) throw error;
+          searchError = error;
+        }
         const recovered = await this.recoverMissedBySender({
           accountId,
           mailbox,
           from,
+          listId,
           before: criteria.before,
           limit,
           alreadyFound: uids,
           imap,
         });
+        if (searchError !== undefined) {
+          // Without the cache there is no answer at all, and that has to read
+          // as an error rather than as the list having no mail.
+          if (!recovered.checked) throw searchError;
+          cacheOnlyAccounts.push(accountId);
+        }
+        searched.push(accountId);
+        reportSearching();
         return { uids, recovered };
       },
     });
@@ -2333,6 +2475,10 @@ export class Executor {
     // (or any caller) can relay a specific next-step hint. We also run this
     // check on dry_run to surface the warning in previews.
     if (expandedTargets.length > 0) {
+      updateIntentProgress(this.db, intent.id, 'checking_replies', {
+        matched: expandedTargets.length,
+        ...(batch ? { batch } : {}),
+      });
       // Group by (account_id, mailbox). hold_by_sender only searches a single
       // mailbox per call today, but grouping matches threadHasReplies's
       // expected per-mailbox shape and future-proofs multi-mailbox cases.
@@ -2377,6 +2523,15 @@ export class Executor {
       }
     }
 
+    // Every account erroring is not a zero. Nothing was searched, and reporting
+    // no_match would tell the caller the mail isn't there.
+    const failedAccounts = Object.keys(searchResult.errors);
+    if (expandedTargets.length === 0 && failedAccounts.length === targetIds.length) {
+      throw new Error(
+        `Could not search any account: ${Object.values(searchResult.errors).join('; ')}`
+      );
+    }
+
     if (expandedTargets.length === 0) {
       // Matching nothing must not look like sweeping clean.
       //
@@ -2393,7 +2548,7 @@ export class Executor {
       //
       // The second is only worth a round trip when a cursor was actually given.
       let unfilteredCount: number | null = null;
-      if (before) {
+      if (before && from) {
         try {
           const probe = await fanOut({
             pool: this.pool,
@@ -2432,8 +2587,10 @@ export class Executor {
               'server-side search miss has not been ruled out. Enabling the cache would ' +
               'settle it.';
 
-      const diagnosis =
-        (unfilteredCount && unfilteredCount > 0
+      const diagnosis = listId
+        ? `No message in ${mailbox} matched List-Id "${listId}". Read one message from the ` +
+          `list with read_thread and copy its list_id exactly.${cacheOnlyNote()}`
+        : (unfilteredCount && unfilteredCount > 0
           ? `The server matched ${unfilteredCount} message(s) from this sender, but all of ` +
             `them are at or after before=${before}, so none were eligible. Widen or drop ` +
             '`before`.'
@@ -2446,6 +2603,8 @@ export class Executor {
             'COMPLETE address, or a prefix of it (a prefix matches at any length). A bare ' +
             'domain is the least reliable form here, not the most.') +
         cacheNote;
+      const notSearched =
+        failedAccounts.length > 0 ? ` Not searched: ${failedAccounts.join(', ')}.` : '';
 
       // Queued sweeps never return this payload to anyone: the caller gets an
       // id and polls get_intent, which shows status and targets. Recording the
@@ -2456,7 +2615,7 @@ export class Executor {
       // are three different findings, and this record is the only place a
       // queued sweep can distinguish them after the fact.
       updateIntentProgress(this.db, intent.id, 'no_match', {
-        from,
+        ...(from ? { from } : { list_id: listId }),
         mailbox,
         before,
         matched: 0,
@@ -2467,7 +2626,7 @@ export class Executor {
       const payload: {
         status: 'no_match';
         matched: 0;
-        searched: { from: string; mailbox: string; before?: string };
+        searched: { from?: string; list_id?: string; mailbox: string; before?: string };
         diagnosis: string;
         cache_cross_check?: {
           checked: boolean;
@@ -2485,8 +2644,12 @@ export class Executor {
       } = {
         status: 'no_match',
         matched: 0,
-        searched: { from, mailbox, ...(before ? { before } : {}) },
-        diagnosis,
+        searched: {
+          ...(from ? { from } : { list_id: listId }),
+          mailbox,
+          ...(before ? { before } : {}),
+        },
+        diagnosis: `${diagnosis}${notSearched}`,
         ...(crossCheck ? { cache_cross_check: crossCheck } : {}),
         accounts_searched: searchResult.accounts_searched,
         accounts_available: allIds,
@@ -2508,6 +2671,7 @@ export class Executor {
 
     const hasSearchErrors = Object.keys(searchResult.errors).length > 0;
     if (!hasSearchErrors && !crossCheck) return result;
+    const searchName = from ? 'FROM search' : 'List-Id search';
 
     const parsed = JSON.parse(result[0].text);
     // Merge search-time per_account_errors so the caller sees both search
@@ -2525,14 +2689,17 @@ export class Executor {
         // papered over, every dry_run preview still under-reports and nobody
         // learns the server's FROM search cannot be trusted for this sender.
         parsed.warning = crossCheck.applied
-          ? `The IMAP server's FROM search missed ${crossCheck.recovered} message(s) that the ` +
-            'local cache found; they were included in this hold. Treat server-side FROM ' +
-            'counts for this sender as a floor, not a total.'
-          : `The IMAP server's FROM search missed ${crossCheck.recovered} message(s) that the ` +
+          ? `The IMAP server's ${searchName} missed ${crossCheck.recovered} message(s) that the ` +
+            'local cache found; they were included in this hold. Treat server-side ' +
+            `counts for this ${from ? 'sender' : 'list'} as a floor, not a total.`
+          : `The IMAP server's ${searchName} missed ${crossCheck.recovered} message(s) that the ` +
             'local cache found. They were NOT held: cache.mode is shadow, which measures ' +
             "without changing behaviour. Run 'agent-mail cache on' to have sweeps include " +
             'them.';
       }
+    }
+    if (cacheOnlyAccounts.length > 0) {
+      parsed.warning = `${parsed.warning ?? ''}${cacheOnlyNote()}`.trim();
     }
     return [{ type: 'text', text: JSON.stringify(parsed, null, 2) }];
   }
