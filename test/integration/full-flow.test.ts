@@ -30,6 +30,8 @@ vi.mock('../../src/provider/imap.js', () => ({
         from: { address: 'a@b.com', name: null },
       }))
     ),
+    existingUids: async (_m: string, uids: number[]) => uids,
+    uidsByMessageId: async () => new Map<string, number[]>(),
     moveMessages: vi.fn(async (uids: number[]) => ({
       uidMap: new Map(uids.map((uid) => [uid, uid + 1000])),
     })),

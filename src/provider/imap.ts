@@ -443,8 +443,13 @@ export class ImapProvider {
 
   /** Which of these Message-Ids belong to a message in this mailbox. */
   async messageIdsIn(mailbox: string, messageIds: string[]): Promise<Set<string>> {
+    return new Set((await this.uidsByMessageId(mailbox, messageIds)).keys());
+  }
+
+  /** The UIDs in this mailbox of each Message-Id that has a message here. */
+  async uidsByMessageId(mailbox: string, messageIds: string[]): Promise<Map<string, number[]>> {
     const wanted = new Set(messageIds);
-    const found = new Set<string>();
+    const found = new Map<string, number[]>();
 
     for (let start = 0; start < messageIds.length; start += REPLY_SEARCH_CHUNK) {
       const chunk = messageIds.slice(start, start + REPLY_SEARCH_CHUNK);
@@ -454,10 +459,28 @@ export class ImapProvider {
       );
       if (hits.length === 0) continue;
       for (const message of await this.readAncestry(mailbox, hits)) {
-        if (wanted.has(message.messageId)) found.add(message.messageId);
+        if (!wanted.has(message.messageId)) continue;
+        const uids = found.get(message.messageId) ?? [];
+        if (!uids.includes(message.uid)) uids.push(message.uid);
+        found.set(message.messageId, uids);
       }
     }
     return found;
+  }
+
+  /** Which of these UIDs still exist in this mailbox. */
+  async existingUids(mailbox: string, uids: number[]): Promise<number[]> {
+    if (uids.length === 0) return [];
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      const result = await this.client.search({ uid: uids.join(',') }, { uid: true });
+      if (!Array.isArray(result)) {
+        throw new Error(`Search failed in ${mailbox}`);
+      }
+      return result;
+    } finally {
+      lock.release();
+    }
   }
 
   private async searchReferencing(mailbox: string, messageIds: string[]): Promise<number[]> {
@@ -477,7 +500,7 @@ export class ImapProvider {
       // imapflow reports a failed search as `false`. Reading that as "no hits"
       // would let a sweep through the replies gate unchecked.
       if (!Array.isArray(result)) {
-        throw new Error(`Reply search failed in ${mailbox}`);
+        throw new Error(`Search failed in ${mailbox}`);
       }
       return result;
     } finally {
@@ -489,7 +512,7 @@ export class ImapProvider {
   private async readAncestry(
     mailbox: string,
     uids: number[]
-  ): Promise<Array<{ messageId: string; ancestry: string[] }>> {
+  ): Promise<Array<{ uid: number; messageId: string; ancestry: string[] }>> {
     const lock = await this.client.getMailboxLock(mailbox);
     try {
       const messages = [];
@@ -502,6 +525,7 @@ export class ImapProvider {
         const inReplyTo = parseMessageIds(extractHeader(headers, 'In-Reply-To'))[0];
         const references = parseMessageIds(extractHeader(headers, 'References'));
         messages.push({
+          uid: msg.uid,
           messageId: msg.envelope?.messageId ?? '',
           ancestry: [inReplyTo, ...references].filter((id): id is string => Boolean(id)),
         });

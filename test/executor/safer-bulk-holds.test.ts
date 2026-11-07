@@ -62,6 +62,8 @@ function fakeImap(opts: {
           references: opts.references?.[uid] ?? [],
         }))
     ),
+    existingUids: async (_m: string, uids: number[]) => uids,
+    uidsByMessageId: async () => new Map<string, number[]>(),
     moveMessages: vi.fn(async (uids: number[]) => ({
       uidMap: new Map(uids.map((u) => [u, u + 9000])),
     })),
@@ -438,7 +440,7 @@ describe('a move that fails', () => {
       });
   }
 
-  it('undo leaves an unconfirmed target alone and says so', async () => {
+  it('undo says so when a target is nowhere in holding', async () => {
     const imap = fakeImap({ matches: () => [2] });
     secondMoveFails(imap);
     const executor = makeExecutor(imap);
@@ -490,7 +492,7 @@ describe('a move that fails', () => {
     imap.moveMessages.mockRejectedValue(new Error('connection dropped'));
     await expect(
       run(imap, 'hold_by_sender', { from: 'a@example.com', account_ids: ['one'] })
-    ).rejects.toThrow('Nothing was held: connection dropped');
+    ).rejects.toThrow('No message was confirmed as held: connection dropped');
   });
 
   it('reports one sender of a batch as failed while the other holds', async () => {

@@ -54,6 +54,8 @@ describe('undo restore_messages (rehold_messages)', () => {
       withConnection: vi.fn(async (_: string, fn: any) =>
         fn({
           getMailboxPath: async () => 'agent-mail-holding',
+          existingUids: async (_m: string, uids: number[]) => uids,
+          uidsByMessageId: async () => new Map<string, number[]>(),
           moveMessages: async (uids: number[], from: string, to: string) => {
             moves.push({ uids, from, to });
             return { uidMap: new Map(uids.map((u) => [u, u])) };
@@ -83,6 +85,8 @@ describe('undo restore_messages (rehold_messages)', () => {
       withConnection: vi.fn(async (_: string, fn: any) =>
         fn({
           getMailboxPath: async () => 'agent-mail-holding',
+          existingUids: async (_m: string, uids: number[]) => uids,
+          uidsByMessageId: async () => new Map<string, number[]>(),
           moveMessages: async (uids: number[]) => {
             moves.push(uids);
             return { uidMap: new Map() };
