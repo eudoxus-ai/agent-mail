@@ -10,7 +10,7 @@ export const unsubscribeSenderTool: ToolDefinition = {
       'A message from this sender. Its List-Unsubscribe header is read from the server, so no read_thread is needed first. Pass this or unsubscribe_url, not both.'
     ),
     unsubscribe_url: z.string().url().optional().describe('The List-Unsubscribe HTTP URL, if you already have it'),
-    account_id: z.string().min(1).optional().describe('Account ID (with unsubscribe_url)'),
+    account_id: z.string().min(1).optional().describe('Account ID, with unsubscribe_url only. A target carries its own.'),
   }),
   annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
   async execute() {

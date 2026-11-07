@@ -63,6 +63,25 @@ describe('fetchMessage body', () => {
     expect(m.bodyText.trim()).toBe('Html body.');
   });
 
+  it('does not read the body of an attached message as this one', async () => {
+    const { imap } = provider(
+      {
+        type: 'multipart/mixed',
+        childNodes: [
+          { type: 'text/html', part: '1' },
+          {
+            type: 'message/rfc822',
+            part: '2',
+            childNodes: [{ type: 'text/plain', part: '2.1' }],
+          },
+        ],
+      },
+      { '1': '<p>Outer body.</p>', '2.1': 'Attached message text.' }
+    );
+    const m = await imap.fetchMessage('INBOX', 7);
+    expect(m.bodyText.trim()).toBe('Outer body.');
+  });
+
   it('does not cut a long body short', async () => {
     const long = 'x'.repeat(20_000);
     const { imap } = provider({ type: 'text/plain', part: '1' }, { '1': long });

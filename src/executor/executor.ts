@@ -2045,6 +2045,13 @@ export class Executor {
       throw new Error('unsubscribe_sender needs exactly one of target or unsubscribe_url');
     }
     if (!target) return { url: givenUrl as string };
+    // The UID only means something in its own account, and this can't be undone.
+    if (target.account_id !== intent.account_id) {
+      throw new Error(
+        `target belongs to ${target.account_id}, but this call is using ${intent.account_id}. ` +
+          'Leave out account_id when passing a target.'
+      );
+    }
 
     const message = await imap.fetchMessage(target.mailbox ?? 'INBOX', target.uid);
     const header = message.listUnsubscribe;

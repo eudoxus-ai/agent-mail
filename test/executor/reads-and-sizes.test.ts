@@ -231,3 +231,27 @@ describe('search_threads query on the IMAP path', () => {
     );
   });
 });
+
+describe('unsubscribe_sender account checks', () => {
+  it('refuses a target from a different account than the one being used', async () => {
+    const fetchMock = vi.fn(async () => ({ status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const fetchMessage = vi.fn(async () => ({
+      listUnsubscribe: { http_url: 'https://other.example/u', mailto: null, one_click: true },
+    }));
+    const { executor } = setup({ fetchMessage });
+
+    await expect(
+      executor.executeImmediate({
+        tool: 'unsubscribe_sender',
+        toolParams: { target: { account_id: 'b', uid: 9 }, account_id: 'a' },
+        accountId: 'a',
+        agentId: 't',
+        risk: 'low',
+      })
+    ).rejects.toThrow('target belongs to b');
+
+    expect(fetchMessage).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});

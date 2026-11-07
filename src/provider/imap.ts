@@ -1177,6 +1177,9 @@ export function collectTextParts(structure: unknown): {
     const type = (node.type ?? '').toLowerCase();
     const disposition = (node.disposition ?? '').toLowerCase();
 
+    // An attached message has a body of its own, which is not this message's.
+    if (type === 'message/rfc822') return;
+
     // A text part dispositioned as an attachment (a .txt someone sent) is not
     // the message body and must not be indexed as one.
     if (disposition !== 'attachment') {
