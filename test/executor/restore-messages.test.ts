@@ -21,7 +21,7 @@ function seedHoldIntent(db: any, intentId: string, targets: Array<{uid: number; 
     uid: t.uid,
     mailbox: 'agent-mail-holding',
     envelope_snapshot: { subject: 's', from: 'f@x.com', original_mailbox: t.original_mailbox },
-    destination_uid: t.destination_uid,
+    destination_uid: t.destination_uid ?? t.uid,
   })));
 }
 

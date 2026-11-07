@@ -15,7 +15,7 @@ const accounts: AccountConfig[] = [
 function seedRestoreIntent(
   db: ReturnType<typeof openDatabase>,
   intentId: string,
-  targets: Array<{ uid: number; destinationMailbox: string }>
+  targets: Array<{ uid: number; destinationMailbox: string; unconfirmed?: boolean }>
 ) {
   db.prepare(
     `INSERT INTO intents (id, account_id, tool, params, risk, status, undo_token, undo_expires_at)
@@ -26,6 +26,7 @@ function seedRestoreIntent(
     uid: t.uid,
     mailbox: t.destinationMailbox,
     envelope_snapshot: { subject: 's', from: 'f@x.com', original_mailbox: t.destinationMailbox },
+    destination_uid: t.unconfirmed ? undefined : t.uid,
   })));
 }
 
@@ -74,6 +75,32 @@ describe('undo restore_messages (rehold_messages)', () => {
       { uids: [21], from: 'Archive', to: 'agent-mail-holding' },
     ]);
     expect(getIntent(db, 'restore-1')!.status).toBe('undone');
+  });
+
+  it('leaves alone a restored message it cannot locate', async () => {
+    const moves: number[][] = [];
+    const pool = {
+      withConnection: vi.fn(async (_: string, fn: any) =>
+        fn({
+          getMailboxPath: async () => 'agent-mail-holding',
+          moveMessages: async (uids: number[]) => {
+            moves.push(uids);
+            return { uidMap: new Map() };
+          },
+        })
+      ),
+    };
+    const db = openDatabase(':memory:');
+    seedRestoreIntent(db, 'restore-1', [
+      { uid: 20, destinationMailbox: 'INBOX' },
+      { uid: 21, destinationMailbox: 'INBOX', unconfirmed: true },
+    ]);
+    const executor = new Executor({ db, accounts, pool: pool as any, logger });
+
+    const result = await executor.undoIntent('restore-1');
+
+    expect(moves).toEqual([[20]]);
+    expect(result.message).toContain('1 target(s) could not be located');
   });
 });
 

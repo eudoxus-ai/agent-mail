@@ -116,6 +116,7 @@ function fakeImap(imapUids: number[], generation = GENERATION) {
       uidMap: new Map(uids.map((u) => [u, u + 9000])),
     })),
     hasRepliesTo: vi.fn(async () => false),
+    sentMailboxes: vi.fn(async () => []),
   };
 }
 

@@ -362,7 +362,7 @@ Edit `~/.agent-mail/policy.yaml` to customize which actions need approval. The d
 
 - **Ungated:** search, read, overview, draft, label, unsubscribe, pending-actions, audit-log, get-intent, restore, undo
 - **Always gated:** send (every outbound email needs your approval)
-- **Configurable:** hold (ungated by default, gated when the thread has replies)
+- **Configurable:** hold (ungated by default, gated when the thread has replies, including your own replies in any Sent folder)
 
 Example: to require approval for all hold actions:
 

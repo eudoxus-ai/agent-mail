@@ -168,6 +168,13 @@ export class GenerationMismatchError extends Error {
 }
 
 /** The subset of the IMAP surface the generation guard needs. */
+function describeCacheOnly(accounts: string[]): string {
+  return accounts.length === 0
+    ? ''
+    : ` ${accounts.join(', ')} refused the List-Id search, so this sweep used ` +
+        'the local cache there. That covers only the mail the cache has backfilled.';
+}
+
 interface GenerationReader {
   mailboxSnapshot(mailbox: string): Promise<{ uidValidity: number }>;
 }
@@ -859,7 +866,7 @@ export class Executor {
         return { success: false, message: 'Undo window has expired' };
       }
 
-      await this.performUndo(intent, undoOp);
+      const undoResult = await this.performUndo(intent, undoOp);
 
       const undone = updateIntentStatusIfCurrent(
         this.db,
@@ -884,7 +891,15 @@ export class Executor {
         detail: buildAuditSummary(intent.tool, 'undone', intent.params),
       });
 
-      return { success: true, message: `Undone: ${intent.tool}` };
+      const unconfirmed = undoResult?.unconfirmed ?? 0;
+      return {
+        success: true,
+        message:
+          `Undone: ${intent.tool}` +
+          (unconfirmed > 0
+            ? `. ${unconfirmed} target(s) could not be located, so they were left alone.`
+            : ''),
+      };
     } catch (error) {
       return {
         success: false,
@@ -906,7 +921,15 @@ export class Executor {
       // either, so it has no thread to protect and must not fail the rest.
       const selected = await imap.fetchEnvelopes(mailbox, uids);
       const selectedIds = selected.map((message) => message.messageId).filter(Boolean);
-      return imap.hasRepliesTo(mailbox, selectedIds, uids);
+      if (await imap.hasRepliesTo(mailbox, selectedIds, uids)) return true;
+
+      // The user's own replies live in Sent, not beside the message they
+      // answer, and a thread they replied to is the one most worth protecting.
+      for (const sent of await imap.sentMailboxes()) {
+        if (sent === mailbox) continue;
+        if (await imap.hasRepliesTo(sent, selectedIds, [])) return true;
+      }
+      return false;
     });
   }
 
@@ -1752,10 +1775,29 @@ export class Executor {
               });
               continue;
             }
-            // Use destination_uid (actual UID in holding) if available; fall back to uid for back-compat
-            const holdingUid = entry.destination_uid ?? t.uid;
+            // Only a confirmed destination identifies the message in holding.
+            // The source UID there, if any, is a different message.
+            const holdingUid = entry.destination_uid;
+            if (holdingUid === null) {
+              errors.push({
+                uid: t.uid,
+                account_id: accountId,
+                reason: 'never confirmed in holding, so it cannot be located there',
+              });
+              continue;
+            }
             if (!dryRun) {
-              const { uidMap } = await imap.moveMessages([holdingUid], holding, entry.original_mailbox);
+              let uidMap: Map<number, number>;
+              try {
+                ({ uidMap } = await imap.moveMessages([holdingUid], holding, entry.original_mailbox));
+              } catch (error) {
+                errors.push({
+                  uid: t.uid,
+                  account_id: accountId,
+                  reason: error instanceof Error ? error.message : String(error),
+                });
+                continue;
+              }
               this.echoToCache({
                 accountId,
                 mailbox: holding,
@@ -1764,8 +1806,8 @@ export class Executor {
                 detail: { toMailbox: entry.original_mailbox },
               });
               // Map the restored-to UID back under the source uid key for persistence
-              const restoredUid = uidMap.get(holdingUid) ?? holdingUid;
-              acctUidMap.set(t.uid, restoredUid);
+              const restoredUid = uidMap.get(holdingUid);
+              if (restoredUid !== undefined) acctUidMap.set(t.uid, restoredUid);
 
               // The restored UID lives in original_mailbox now, so that is the
               // generation the rehold undo will have to match.
@@ -1892,6 +1934,7 @@ export class Executor {
         const crossCheck = detail.cache_cross_check as
           | { checked: boolean; recovered: number; applied: boolean; reason?: string }
           | undefined;
+        const listId = detail.list_id as string | undefined;
         // The note carries the verdict in prose because a skimming reader
         // never opens the structured field. Three zeros, three meanings:
         // cache-verified, cache-contradicted (shadow saw messages it was not
@@ -1899,7 +1942,7 @@ export class Executor {
         const cacheNote = !crossCheck
           ? ''
           : crossCheck.recovered > 0
-            ? ` The local cache found ${crossCheck.recovered} message(s) from this sender ` +
+            ? ` The local cache found ${crossCheck.recovered} message(s) ${listId ? 'on this list' : 'from this sender'} ` +
               "that the server's search missed, and they were NOT held (cache.mode was " +
               "not 'on' in the process that ran this sweep). Run 'agent-mail cache on', " +
               'restart the daemon, and re-run the sweep.'
@@ -1912,17 +1955,22 @@ export class Executor {
           status: 'no_match',
           matched: 0,
           searched: {
-            from: detail.from,
+            ...(listId ? { list_id: listId } : { from: detail.from }),
             mailbox: detail.mailbox,
             ...(detail.before ? { before: detail.before } : {}),
           },
           ...(crossCheck ? { cache_cross_check: crossCheck } : {}),
+          ...(detail.per_account_errors ? { per_account_errors: detail.per_account_errors } : {}),
           note:
-            'The sweep matched no messages — this is NOT the same as the sender being ' +
-            'cleared. The server-side FROM match can miss; verify with search_threads, ' +
-            'or retry with a different substring (a full address has been observed to ' +
-            'match where a domain substring did not, and vice versa).' +
-            cacheNote,
+            (listId
+              ? 'The sweep matched no messages — this is NOT the same as the list being ' +
+                'cleared. Read one message from the list with read_thread and copy its ' +
+                'list_id exactly.' +
+                describeCacheOnly((detail.cache_only_accounts as string[] | undefined) ?? [])
+              : 'The sweep matched no messages — this is NOT the same as the sender being ' +
+                'cleared. The server-side FROM match can miss; verify with search_threads, ' +
+                'or retry with a different substring (a full address has been observed to ' +
+                'match where a domain substring did not, and vice versa).') + cacheNote,
         };
       }
 
@@ -2213,6 +2261,9 @@ export class Executor {
       (n: number, a: any) => n + a.message_count,
       0
     );
+    if (totalMessages === 0 && Object.keys(fanResult.errors).length > 0) {
+      throw new Error(`Nothing was held: ${Object.values(fanResult.errors).join('; ')}`);
+    }
 
     const payload: {
       accounts_searched: string[];
@@ -2247,6 +2298,7 @@ export class Executor {
     updateIntentProgress(this.db, intent.id, dryRun ? 'previewed' : 'held', {
       total_messages: totalMessages,
       ...(targetErrors.length > 0 ? { errors: targetErrors } : {}),
+      ...(payload.per_account_errors ? { per_account_errors: payload.per_account_errors } : {}),
     });
     if (includeSummary) {
       payload.moved = allEnvelopes.map((e: any) => ({
@@ -2296,6 +2348,8 @@ export class Executor {
       detail?: string;
       errors?: unknown[];
       per_account_errors?: Record<string, string>;
+      warning?: string;
+      cache_cross_check?: unknown;
     }> = [];
 
     for (const [done, from] of senders.entries()) {
@@ -2309,6 +2363,8 @@ export class Executor {
           ...(result.status === 'no_match' ? { detail: result.diagnosis } : {}),
           ...(result.errors ? { errors: result.errors } : {}),
           ...(result.per_account_errors ? { per_account_errors: result.per_account_errors } : {}),
+          ...(result.warning ? { warning: result.warning } : {}),
+          ...(result.cache_cross_check ? { cache_cross_check: result.cache_cross_check } : {}),
         });
       } catch (error) {
         if (error instanceof HoldBySenderBlockedError) {
@@ -2373,11 +2429,7 @@ export class Executor {
 
     const searched: string[] = [];
     const cacheOnlyAccounts: string[] = [];
-    const cacheOnlyNote = () =>
-      cacheOnlyAccounts.length === 0
-        ? ''
-        : ` ${cacheOnlyAccounts.join(', ')} refused the List-Id search, so this sweep used ` +
-          'the local cache there. That covers only the mail the cache has backfilled.';
+    const cacheOnlyNote = () => describeCacheOnly(cacheOnlyAccounts);
     const reportSearching = () =>
       updateIntentProgress(this.db, intent.id, 'searching', {
         ...(from ? { from } : { list_id: listId }),
@@ -2577,7 +2629,7 @@ export class Executor {
             // server is wrong, and that is the one thing the caller must not
             // miss. Reading this as "the inbox is clean" is the exact failure
             // the whole no_match change exists to prevent.
-            ` The local cache found ${crossCheck.recovered} message(s) from this sender ` +
+            ` The local cache found ${crossCheck.recovered} message(s) ${from ? 'from this sender' : 'on this list'} ` +
             'that the server\'s search missed, and they were NOT held because cache.mode ' +
             "is shadow. Run 'agent-mail cache on' to have sweeps include them."
           : crossCheck.checked
@@ -2621,6 +2673,8 @@ export class Executor {
         matched: 0,
         server_matched_ignoring_before: unfilteredCount,
         ...(crossCheck ? { cache_cross_check: crossCheck } : {}),
+        ...(cacheOnlyAccounts.length > 0 ? { cache_only_accounts: cacheOnlyAccounts } : {}),
+        ...(failedAccounts.length > 0 ? { per_account_errors: searchResult.errors } : {}),
       });
 
       const payload: {
@@ -2701,13 +2755,20 @@ export class Executor {
     if (cacheOnlyAccounts.length > 0) {
       parsed.warning = `${parsed.warning ?? ''}${cacheOnlyNote()}`.trim();
     }
+    updateIntentProgress(this.db, intent.id, dryRun ? 'previewed' : 'held', {
+      total_messages: parsed.total_messages,
+      ...(parsed.errors ? { errors: parsed.errors } : {}),
+      ...(parsed.per_account_errors ? { per_account_errors: parsed.per_account_errors } : {}),
+      ...(parsed.warning ? { warning: parsed.warning } : {}),
+      ...(crossCheck ? { cache_cross_check: crossCheck } : {}),
+    });
     return [{ type: 'text', text: JSON.stringify(parsed, null, 2) }];
   }
 
   private async performUndo(
     intent: Intent,
     undoOp: { reverseAction: string; params: Record<string, unknown> }
-  ): Promise<void> {
+  ): Promise<{ unconfirmed: number } | void> {
     // Multi-account undo: group targets by account and apply per-account
     if (undoOp.reverseAction === 'reverse_label') {
       const targets = intent.params.targets as Target[];
@@ -2765,17 +2826,22 @@ export class Executor {
             uid: lt.uid,
             mailbox: lt.envelope_snapshot?.original_mailbox ?? lt.mailbox,
           }));
-      const grouped = parseTargets(effectiveTargets);
+      // A target with no confirmed destination never reached holding, or can't
+      // be found there: its move failed, or its UID was gone before the move.
+      // Its source UID must not stand in, because in holding that number is
+      // some other message.
+      const confirmed = effectiveTargets.filter(
+        (t) => ledgerByKey.get(`${t.account_id}:${t.uid}`)?.destination_uid != null
+      );
+      const grouped = parseTargets(confirmed);
 
       for (const [accountId, list] of Object.entries(grouped)) {
         await this.pool.withConnection(accountId, async (imap) => {
           const holding = await imap.getMailboxPath('holding');
           const inbox = await imap.getMailboxPath('inbox');
-          // Build list of actual UIDs in holding (using destination_uid if available)
-          const holdingUids = list.map((t) => {
-            const entry = ledgerByKey.get(`${accountId}:${t.uid}`);
-            return entry?.destination_uid ?? t.uid;
-          });
+          const holdingUids = list.map(
+            (t) => ledgerByKey.get(`${accountId}:${t.uid}`)?.destination_uid as number
+          );
           // Undo is all-or-nothing, so every target is checked before anything
           // moves: a partial undo is worse than a refused one.
           const generations = new Map<string, number>();
@@ -2797,7 +2863,7 @@ export class Executor {
           });
         });
       }
-      return;
+      return { unconfirmed: effectiveTargets.length - confirmed.length };
     }
 
     // restore_messages undo: re-hold each UID back to the holding folder.
@@ -2812,12 +2878,17 @@ export class Executor {
         string,
         Array<{ uid: number; currentMailbox: string; generation: number | null }>
       >();
+      let unconfirmed = 0;
       for (const t of targets) {
+        // Without a confirmed destination the message can't be told apart from
+        // whatever else has that UID in the mailbox it was restored to.
+        if (t.destination_uid === null) {
+          unconfirmed += 1;
+          continue;
+        }
         const list = byAccount.get(t.account_id) ?? [];
-        // Use destination_uid (actual UID in original_mailbox) if available; fall back to uid
-        const actualUid = t.destination_uid ?? t.uid;
         list.push({
-          uid: actualUid,
+          uid: t.destination_uid,
           currentMailbox: t.envelope_snapshot?.original_mailbox ?? t.mailbox,
           generation: t.destination_uidvalidity,
         });
@@ -2848,7 +2919,7 @@ export class Executor {
           }
         });
       }
-      return;
+      return { unconfirmed };
     }
 
     // draft_reply undo: delete the draft from the Drafts folder

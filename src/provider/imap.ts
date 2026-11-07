@@ -1,6 +1,7 @@
 import { ImapFlow } from 'imapflow';
 import type { ResolvedAccount, EmailMessage, SearchCriteria, Participant } from '../types.js';
 import { parseListUnsubscribe } from '../lib/list-unsubscribe.js';
+import { isSentMailbox } from '../lib/sent-mailboxes.js';
 import { pickNewestUids } from './search-ordering.js';
 import { extractSnippet, extractSnippetFromPart, getHeader, splitHeadersBody } from './mime.js';
 import type { SnippetSource } from './mime.js';
@@ -557,6 +558,11 @@ export class ImapProvider {
     }));
   }
 
+  async sentMailboxes(): Promise<string[]> {
+    const mailboxes = await this.listMailboxes();
+    return mailboxes.filter(isSentMailbox).map((m) => m.path);
+  }
+
   async fetchMessage(mailbox: string, uid: number): Promise<EmailMessage> {
     const lock = await this.client.getMailboxLock(mailbox);
     try {
@@ -635,10 +641,13 @@ export class ImapProvider {
     const lock = await this.client.getMailboxLock(fromMailbox);
     try {
       const result = await this.client.messageMove(uids.join(','), toMailbox, { uid: true });
-      const uidMap: Map<number, number> = (result as any)?.uidMap instanceof Map
-        ? (result as any).uidMap
-        : new Map(uids.map((u) => [u, u]));
-      return { uidMap };
+      // imapflow reports a failed move as `false`, not by throwing.
+      if (!result) {
+        throw new Error(`Could not move ${uids.length} message(s) from ${fromMailbox} to ${toMailbox}`);
+      }
+      // A server may not say where the messages landed. Leave the map empty
+      // rather than guess: the source UID means nothing in the destination.
+      return { uidMap: result.uidMap instanceof Map ? result.uidMap : new Map() };
     } finally {
       lock.release();
     }

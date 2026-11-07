@@ -76,6 +76,7 @@ function fakeImap(onMove?: () => void) {
     // The middleware checks thread context before applying policy to a
     // hold_messages call, which happens before the queue is ever reached.
     hasRepliesTo: vi.fn(async () => false),
+    sentMailboxes: vi.fn(async () => []),
   };
 }
 

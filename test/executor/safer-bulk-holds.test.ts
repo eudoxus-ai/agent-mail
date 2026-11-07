@@ -30,6 +30,8 @@ function fakeImap(opts: {
   matches?: (criteria: any) => number[];
   missing?: number[];
   hasReplies?: (ids: string[]) => boolean;
+  repliesIn?: (mailbox: string, ids: string[]) => boolean;
+  sent?: string[];
 } = {}) {
   const missing = new Set(opts.missing ?? []);
   return {
@@ -57,7 +59,11 @@ function fakeImap(opts: {
     moveMessages: vi.fn(async (uids: number[]) => ({
       uidMap: new Map(uids.map((u) => [u, u + 9000])),
     })),
-    hasRepliesTo: vi.fn(async (_m: string, ids: string[]) => opts.hasReplies?.(ids) ?? false),
+    hasRepliesTo: vi.fn(
+      async (mailbox: string, ids: string[]) =>
+        opts.repliesIn?.(mailbox, ids) ?? opts.hasReplies?.(ids) ?? false
+    ),
+    sentMailboxes: vi.fn(async () => opts.sent ?? ['Sent']),
   };
 }
 
@@ -359,5 +365,208 @@ describe('sweep progress', () => {
     const searching = seen.filter((p: any) => p.phase === 'searching') as any[];
     expect(searching.at(-1).detail.searched).toEqual(expect.arrayContaining(['one', 'two']));
     expect(searching[0].detail.searched).toEqual([]);
+  });
+});
+
+describe('replies gate and Sent', () => {
+  const inSentOnly = (mailbox: string) => mailbox === 'Sent';
+
+  it('counts a reply that exists only in Sent', async () => {
+    const executor = makeExecutor(fakeImap({ repliesIn: inSentOnly }));
+    await expect(executor.threadHasReplies('a', 'INBOX', [1])).resolves.toBe(true);
+  });
+
+  it('checks every sent folder', async () => {
+    const imap = fakeImap({
+      sent: ['Sent', 'Sent Messages'],
+      repliesIn: (mailbox) => mailbox === 'Sent Messages',
+    });
+    await expect(makeExecutor(imap).threadHasReplies('a', 'INBOX', [1])).resolves.toBe(true);
+  });
+
+  it('does not search the sweep mailbox twice when sweeping Sent', async () => {
+    const imap = fakeImap({ sent: ['Sent'] });
+    await makeExecutor(imap).threadHasReplies('a', 'Sent', [1]);
+    expect(imap.hasRepliesTo).toHaveBeenCalledTimes(1);
+  });
+
+  it('excludes the selected UIDs only in their own mailbox', async () => {
+    const imap = fakeImap({});
+    await makeExecutor(imap).threadHasReplies('a', 'INBOX', [1]);
+    expect(imap.hasRepliesTo).toHaveBeenCalledWith('INBOX', ['<1@x>'], [1]);
+    expect(imap.hasRepliesTo).toHaveBeenCalledWith('Sent', ['<1@x>'], []);
+  });
+
+  it('fails closed when Sent cannot be searched', async () => {
+    const imap = fakeImap({
+      repliesIn: (mailbox) => {
+        if (mailbox === 'Sent') throw new Error('Reply search failed in Sent');
+        return false;
+      },
+    });
+    await expect(makeExecutor(imap).threadHasReplies('a', 'INBOX', [1])).rejects.toThrow(
+      'Reply search failed in Sent'
+    );
+  });
+});
+
+describe('a move that fails', () => {
+  const fromHolding = (imap: ReturnType<typeof fakeImap>) =>
+    (imap.moveMessages.mock.calls as unknown as Array<[number[], string, string]>)
+      .filter(([, from]) => from === 'agent-mail-holding')
+      .flatMap(([uids]) => uids);
+
+  /** The first account's move works; the second account's fails. */
+  function secondMoveFails(imap: ReturnType<typeof fakeImap>) {
+    imap.moveMessages
+      .mockImplementationOnce(async (uids: number[]) => ({
+        uidMap: new Map(uids.map((u) => [u, u + 9000])),
+      }))
+      .mockImplementationOnce(async () => {
+        throw new Error('connection dropped');
+      });
+  }
+
+  it('undo leaves an unconfirmed target alone and says so', async () => {
+    const imap = fakeImap({ matches: () => [2] });
+    secondMoveFails(imap);
+    const executor = makeExecutor(imap);
+    const { intent } = await executor.executeImmediate({
+      tool: 'hold_by_sender',
+      toolParams: { from: 'a@example.com', account_ids: ['one', 'two'] },
+      accountId: 'one',
+      agentId: 't',
+      risk: 'medium',
+    });
+
+    const undo = await executor.undoIntent(intent.id);
+
+    expect(undo.success).toBe(true);
+    expect(undo.message).toContain('1 target(s) could not be located');
+    expect(fromHolding(imap)).toEqual([9002]);
+  });
+
+  it('reports a partly failed sweep to a polling caller', async () => {
+    const imap = fakeImap({ matches: () => [2] });
+    secondMoveFails(imap);
+    const { intent } = await run(imap, 'hold_by_sender', {
+      from: 'a@example.com',
+      account_ids: ['one', 'two'],
+    });
+    expect(getIntentProgress(db, intent.id)?.detail?.per_account_errors).toEqual({
+      two: 'connection dropped',
+    });
+  });
+
+  it('undo of hold_messages skips a UID that was gone before the move', async () => {
+    const imap = fakeImap({ missing: [2] });
+    const executor = makeExecutor(imap);
+    const { intent } = await executor.executeImmediate({
+      tool: 'hold_messages',
+      toolParams: { targets: [target(1), target(2), target(3)] },
+      accountId: 'one',
+      agentId: 't',
+      risk: 'medium',
+    });
+
+    await executor.undoIntent(intent.id);
+
+    expect(fromHolding(imap)).toEqual([9001, 9003]);
+  });
+
+  it('fails the sweep when nothing could be moved', async () => {
+    const imap = fakeImap({ matches: () => [2] });
+    imap.moveMessages.mockRejectedValue(new Error('connection dropped'));
+    await expect(
+      run(imap, 'hold_by_sender', { from: 'a@example.com', account_ids: ['one'] })
+    ).rejects.toThrow('Nothing was held: connection dropped');
+  });
+
+  it('reports one sender of a batch as failed while the other holds', async () => {
+    const imap = fakeImap({ matches: () => [2] });
+    secondMoveFails(imap);
+    const { payload } = await run(imap, 'hold_by_sender', {
+      from: ['ok@example.com', 'bad@example.com'],
+      account_ids: ['one'],
+    });
+    expect(payload.senders.map((s: { status: string }) => s.status)).toEqual(['held', 'failed']);
+    expect(payload.senders[1].detail).toContain('connection dropped');
+  });
+});
+
+describe('what a queued sweep leaves behind', () => {
+  const recovering = (executor: InstanceType<typeof Executor>, uids: number[]) => {
+    (executor as any).cacheConfig = { ...(executor as any).cacheConfig, mode: 'on' };
+    (executor as any).recoverMissedBySender = vi.fn(async () => ({ uids, checked: true }));
+    return executor;
+  };
+  const refusing = () => {
+    const imap = fakeImap();
+    imap.search.mockRejectedValue(new Error('IMAP search failed in INBOX'));
+    return imap;
+  };
+  const sweep = (executor: InstanceType<typeof Executor>, toolParams: Record<string, unknown>) =>
+    executor.executeImmediate({
+      tool: 'hold_by_sender',
+      toolParams: { account_ids: ['one'], ...toolParams },
+      accountId: 'one',
+      agentId: 't',
+      risk: 'medium',
+    });
+
+  it('a batch keeps each sender\'s warning and cross-check', async () => {
+    const executor = makeExecutor(fakeImap());
+    const crossCheck = { checked: true, recovered: 2, applied: false };
+    (executor as any).holdSweep = vi.fn(async () => [
+      {
+        type: 'text',
+        text: JSON.stringify({ total_messages: 1, warning: 'not held', cache_cross_check: crossCheck }),
+      },
+    ]);
+    const { intent } = await sweep(executor, { from: ['a@x.com', 'b@x.com'] });
+
+    const detail = getIntentProgress(db, intent.id)?.detail as any;
+    expect(detail.senders[0]).toMatchObject({ warning: 'not held', cache_cross_check: crossCheck });
+  });
+
+  it('a cache-only List-Id sweep records its warning', async () => {
+    const executor = recovering(makeExecutor(refusing()), [1]);
+    const { intent } = await sweep(executor, { list_id: 'cto.groups.io' });
+
+    const progress = getIntentProgress(db, intent.id);
+    expect(progress?.phase).toBe('held');
+    expect(progress?.detail?.warning).toContain('refused the List-Id search');
+  });
+
+  it('get_intent describes a List-Id no-match as one', async () => {
+    const executor = makeExecutor(fakeImap());
+    const { intent } = await sweep(executor, { list_id: 'cto.groups.io' });
+
+    const { result } = await executor.executeImmediate({
+      tool: 'get_intent',
+      toolParams: { intent_id: intent.id },
+      accountId: 'one',
+      agentId: 't',
+      risk: 'none',
+    });
+    const { outcome } = JSON.parse(result[0].text);
+
+    expect(outcome.searched).toEqual({ list_id: 'cto.groups.io', mailbox: 'INBOX' });
+    expect(outcome.note).toContain('copy its list_id exactly');
+    expect(outcome.note).not.toContain('FROM');
+  });
+
+  it('get_intent carries the cache-only caveat on a List-Id no-match', async () => {
+    const executor = recovering(makeExecutor(refusing()), []);
+    const { intent } = await sweep(executor, { list_id: 'cto.groups.io' });
+
+    const { result } = await executor.executeImmediate({
+      tool: 'get_intent',
+      toolParams: { intent_id: intent.id },
+      accountId: 'one',
+      agentId: 't',
+      risk: 'none',
+    });
+    expect(JSON.parse(result[0].text).outcome.note).toContain('refused the List-Id search');
   });
 });

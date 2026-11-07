@@ -180,3 +180,31 @@ describe('ImapProvider.fetchEnvelopes (slim fields)', () => {
     expect(lock.release).toHaveBeenCalled();
   });
 });
+
+describe('ImapProvider.moveMessages', () => {
+  function withMove(result: unknown) {
+    const provider = makeProvider();
+    (provider as any).client = {
+      getMailboxLock: async () => ({ release: vi.fn() }),
+      messageMove: async () => result,
+    };
+    return provider;
+  }
+
+  it('throws when the server refuses the move', async () => {
+    await expect(withMove(false).moveMessages([1], 'INBOX', 'Held')).rejects.toThrow(
+      'Could not move 1 message(s) from INBOX to Held'
+    );
+  });
+
+  it('returns the mapping the server gave', async () => {
+    const uidMap = new Map([[1, 77]]);
+    await expect(withMove({ uidMap }).moveMessages([1], 'INBOX', 'Held')).resolves.toEqual({ uidMap });
+  });
+
+  it('leaves the mapping empty when the server gave none', async () => {
+    const { uidMap } = await withMove({ path: 'INBOX' }).moveMessages([1], 'INBOX', 'Held');
+    expect(uidMap.size).toBe(0);
+  });
+});
+
