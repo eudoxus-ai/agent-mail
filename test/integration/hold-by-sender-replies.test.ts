@@ -11,8 +11,8 @@ const logger = createLogger('cli', { minLevel: 'error' });
 // Regression: `hold_by_sender` declares `when_thread_has_replies:
 // approval_required` in default policy, but the middleware can't inspect
 // replies without first expanding the IMAP search. The executor must run the
-// replies check itself after expanding UIDs and fail-closed with a structured
-// error when any matched thread has replies.
+// replies check itself after expanding UIDs, leave replied threads where they
+// are, and fail-closed with a structured error when that leaves nothing to hold.
 // ---------------------------------------------------------------------------
 
 interface FakeMessage {
@@ -131,8 +131,8 @@ describe('hold_by_sender replies gate (regression)', () => {
       pool: pool as any,
       logger,
     });
-    // Simulate: the expanded UIDs include a replied-to thread.
-    vi.spyOn(executor, 'threadHasReplies').mockResolvedValue(true);
+    // Simulate: every expanded UID is in a replied-to thread.
+    vi.spyOn(executor, 'repliedUids').mockImplementation(async (_a, _m, uids) => new Set(uids));
   });
 
   it('aborts with structured replies_present error and moves no messages', async () => {

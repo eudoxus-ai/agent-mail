@@ -40,6 +40,38 @@ describe('get_intent', () => {
     expect(payload.reversed_by_intent_id).toBe('restore-1');
   });
 
+  it('says why a queued action failed', async () => {
+    const db = openDatabase(':memory:');
+    db.prepare(`INSERT INTO intents (id, account_id, tool, params, risk, status, error_detail)
+                VALUES ('hold-1', 'a@x.com', 'hold_by_sender', '{}', 'medium', 'failed', ?)`)
+      .run(JSON.stringify({ error: 'replies_present', matched_count: 3 }));
+    const pool = { withConnection: vi.fn() };
+    const executor = new Executor({ db, accounts, pool: pool as any, logger });
+    const { result } = await executor.executeImmediate({
+      tool: 'get_intent',
+      toolParams: { intent_id: 'hold-1' },
+      accountId: 'a@x.com', agentId: 'test', risk: 'none',
+    });
+    expect(JSON.parse(result[0].text).error_detail).toEqual({
+      error: 'replies_present',
+      matched_count: 3,
+    });
+  });
+
+  it('leaves error_detail out when nothing went wrong', async () => {
+    const db = openDatabase(':memory:');
+    db.prepare(`INSERT INTO intents (id, account_id, tool, params, risk, status)
+                VALUES ('hold-1', 'a@x.com', 'hold_messages', '{}', 'medium', 'executed')`).run();
+    const pool = { withConnection: vi.fn() };
+    const executor = new Executor({ db, accounts, pool: pool as any, logger });
+    const { result } = await executor.executeImmediate({
+      tool: 'get_intent',
+      toolParams: { intent_id: 'hold-1' },
+      accountId: 'a@x.com', agentId: 'test', risk: 'none',
+    });
+    expect(JSON.parse(result[0].text)).not.toHaveProperty('error_detail');
+  });
+
   it('reports unknown intent_id', async () => {
     const db = openDatabase(':memory:');
     const pool = { withConnection: vi.fn() };

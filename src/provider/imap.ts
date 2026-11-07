@@ -2,6 +2,7 @@ import { ImapFlow } from 'imapflow';
 import type { ResolvedAccount, EmailMessage, SearchCriteria, Participant } from '../types.js';
 import { parseListUnsubscribe } from '../lib/list-unsubscribe.js';
 import { isSentMailbox } from '../lib/sent-mailboxes.js';
+import { parseMessageIds } from '../lib/message-ids.js';
 import { pickNewestUids } from './search-ordering.js';
 import { extractSnippet, extractSnippetFromPart, getHeader, htmlToText, splitHeadersBody } from './mime.js';
 import type { SnippetSource } from './mime.js';
@@ -372,9 +373,8 @@ export class ImapProvider {
         { uid: true }
       )) {
         const { headers, snippet } = readPreview(msg);
-        const inReplyTo = extractHeader(headers, 'In-Reply-To');
-        const references =
-          extractHeader(headers, 'References')?.split(/\s+/).filter(Boolean) ?? [];
+        const inReplyTo = parseMessageIds(extractHeader(headers, 'In-Reply-To'))[0];
+        const references = parseMessageIds(extractHeader(headers, 'References'));
         const rawListUnsubscribe = extractHeader(headers, 'List-Unsubscribe');
         const listUnsubscribePost = extractHeader(headers, 'List-Unsubscribe-Post');
 
@@ -387,7 +387,7 @@ export class ImapProvider {
           date: msg.envelope?.date?.toISOString() ?? new Date().toISOString(),
           subject: msg.envelope?.subject ?? '(no subject)',
           bodyText: '',
-          inReplyTo: inReplyTo ?? undefined,
+          inReplyTo,
           references,
           flags: Array.from(msg.flags ?? []),
           listUnsubscribe: rawListUnsubscribe != null
@@ -411,13 +411,19 @@ export class ImapProvider {
    * sweep time. A server hit is confirmed against the parsed headers because
    * HEADER search matches substrings.
    */
-  async hasRepliesTo(
+  /**
+   * The Message-Ids of every thread where another message in this mailbox
+   * replies to one of the given messages, including that reply's own ancestry.
+   * A message in the result is part of a conversation someone answered.
+   */
+  async replyThreadIds(
     mailbox: string,
     messageIds: string[],
     excludeUids: number[]
-  ): Promise<boolean> {
+  ): Promise<Set<string>> {
     const wanted = new Set(messageIds);
     const excluded = new Set(excludeUids);
+    const thread = new Set<string>();
 
     for (let start = 0; start < messageIds.length; start += REPLY_SEARCH_CHUNK) {
       const chunk = messageIds.slice(start, start + REPLY_SEARCH_CHUNK);
@@ -425,35 +431,82 @@ export class ImapProvider {
       const candidates = hits.filter((uid) => !excluded.has(uid));
       if (candidates.length === 0) continue;
 
-      const messages = await this.fetchEnvelopes(mailbox, candidates);
-      const replied = messages.some(
-        (m) =>
-          (m.inReplyTo !== undefined && wanted.has(m.inReplyTo)) ||
-          m.references.some((reference) => wanted.has(reference))
-      );
-      if (replied) return true;
+      for (const message of await this.readAncestry(mailbox, candidates)) {
+        // The server matches substrings, so a hit is only a candidate.
+        if (!message.ancestry.some((id) => wanted.has(id))) continue;
+        thread.add(message.messageId);
+        for (const id of message.ancestry) thread.add(id);
+      }
     }
-    return false;
+    return thread;
+  }
+
+  /** Which of these Message-Ids belong to a message in this mailbox. */
+  async messageIdsIn(mailbox: string, messageIds: string[]): Promise<Set<string>> {
+    const wanted = new Set(messageIds);
+    const found = new Set<string>();
+
+    for (let start = 0; start < messageIds.length; start += REPLY_SEARCH_CHUNK) {
+      const chunk = messageIds.slice(start, start + REPLY_SEARCH_CHUNK);
+      const hits = await this.searchAny(
+        mailbox,
+        chunk.map((id) => ({ header: { 'Message-ID': id } }))
+      );
+      if (hits.length === 0) continue;
+      for (const message of await this.readAncestry(mailbox, hits)) {
+        if (wanted.has(message.messageId)) found.add(message.messageId);
+      }
+    }
+    return found;
   }
 
   private async searchReferencing(mailbox: string, messageIds: string[]): Promise<number[]> {
+    return this.searchAny(
+      mailbox,
+      messageIds.flatMap((id) => [
+        { header: { References: id } },
+        { header: { 'In-Reply-To': id } },
+      ])
+    );
+  }
+
+  private async searchAny(mailbox: string, terms: object[]): Promise<number[]> {
     const lock = await this.client.getMailboxLock(mailbox);
     try {
-      const result = await this.client.search(
-        {
-          or: messageIds.flatMap((id) => [
-            { header: { References: id } },
-            { header: { 'In-Reply-To': id } },
-          ]),
-        } as any,
-        { uid: true }
-      );
+      const result = await this.client.search({ or: terms } as any, { uid: true });
       // imapflow reports a failed search as `false`. Reading that as "no hits"
       // would let a sweep through the replies gate unchecked.
       if (!Array.isArray(result)) {
         throw new Error(`Reply search failed in ${mailbox}`);
       }
       return result;
+    } finally {
+      lock.release();
+    }
+  }
+
+  /** Headers only: the replies gate has no use for a preview of the body. */
+  private async readAncestry(
+    mailbox: string,
+    uids: number[]
+  ): Promise<Array<{ messageId: string; ancestry: string[] }>> {
+    const lock = await this.client.getMailboxLock(mailbox);
+    try {
+      const messages = [];
+      for await (const msg of this.client.fetch(
+        uids.join(','),
+        { uid: true, envelope: true, headers: ['in-reply-to', 'references'] },
+        { uid: true }
+      )) {
+        const headers = msg.headers?.toString('utf-8') ?? '';
+        const inReplyTo = parseMessageIds(extractHeader(headers, 'In-Reply-To'))[0];
+        const references = parseMessageIds(extractHeader(headers, 'References'));
+        messages.push({
+          messageId: msg.envelope?.messageId ?? '',
+          ancestry: [inReplyTo, ...references].filter((id): id is string => Boolean(id)),
+        });
+      }
+      return messages;
     } finally {
       lock.release();
     }
@@ -507,9 +560,8 @@ export class ImapProvider {
           { uid: true }
         )) {
           const { headers, snippet } = readPreview(msg);
-          const inReplyTo = extractHeader(headers, 'In-Reply-To');
-          const references =
-            extractHeader(headers, 'References')?.split(/\s+/).filter(Boolean) ?? [];
+          const inReplyTo = parseMessageIds(extractHeader(headers, 'In-Reply-To'))[0];
+          const references = parseMessageIds(extractHeader(headers, 'References'));
 
           results.push({
             uid: msg.uid,
@@ -520,7 +572,7 @@ export class ImapProvider {
             date: msg.envelope?.date?.toISOString() ?? new Date().toISOString(),
             subject: msg.envelope?.subject ?? '(no subject)',
             bodyText: '',
-            inReplyTo: inReplyTo ?? undefined,
+            inReplyTo,
             references,
             flags: Array.from(msg.flags ?? []),
             mailbox,
@@ -560,7 +612,11 @@ export class ImapProvider {
 
   async sentMailboxes(): Promise<string[]> {
     const mailboxes = await this.listMailboxes();
-    return mailboxes.filter(isSentMailbox).map((m) => m.path);
+    // A \\Noselect folder cannot be opened, so searching one would fail the
+    // replies check for every hold on the account.
+    return mailboxes
+      .filter((m) => isSentMailbox(m) && !m.flags.some((f) => f.toLowerCase() === '\\noselect'))
+      .map((m) => m.path);
   }
 
   async fetchMessage(mailbox: string, uid: number): Promise<EmailMessage> {
@@ -589,10 +645,8 @@ export class ImapProvider {
       const ccAddrs = toParticipants(msg.envelope?.cc);
 
       const headers = msg.headers?.toString('utf-8') ?? '';
-      const inReplyTo = extractHeader(headers, 'In-Reply-To');
-      const references = extractHeader(headers, 'References')
-        ?.split(/\s+/)
-        .filter(Boolean) ?? [];
+      const inReplyTo = parseMessageIds(extractHeader(headers, 'In-Reply-To'))[0];
+      const references = parseMessageIds(extractHeader(headers, 'References'));
       const rawListUnsubscribe = extractHeader(headers, 'List-Unsubscribe');
       const listUnsubscribePost = extractHeader(headers, 'List-Unsubscribe-Post');
 
@@ -607,7 +661,7 @@ export class ImapProvider {
         date: msg.envelope?.date?.toISOString() ?? new Date().toISOString(),
         subject: msg.envelope?.subject ?? '(no subject)',
         bodyText,
-        inReplyTo: inReplyTo ?? undefined,
+        inReplyTo,
         references,
         flags: Array.from(msg.flags ?? []),
         listUnsubscribe: rawListUnsubscribe != null
@@ -895,8 +949,7 @@ export class ImapProvider {
         const { headers, snippet } = readPreview(msg);
         const { listId, listUnsubscribe } = extractListHeadersFromSource(headers);
         const listUnsubscribePost = extractHeader(headers, 'List-Unsubscribe-Post');
-        const references =
-          extractHeader(headers, 'References')?.split(/\s+/).filter(Boolean) ?? [];
+        const references = parseMessageIds(extractHeader(headers, 'References'));
 
         const message: EmailMessage = {
           uid: msg.uid,
@@ -910,7 +963,7 @@ export class ImapProvider {
           date: msg.envelope?.date?.toISOString() ?? '',
           subject: msg.envelope?.subject ?? '',
           bodyText: '',
-          inReplyTo: extractHeader(headers, 'In-Reply-To') ?? undefined,
+          inReplyTo: parseMessageIds(extractHeader(headers, 'In-Reply-To'))[0],
           references,
           flags: Array.from(msg.flags ?? []),
           listUnsubscribe:
