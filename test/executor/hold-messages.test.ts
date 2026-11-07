@@ -21,7 +21,8 @@ describe('hold_messages', () => {
         fn({
           getMailboxPath: async () => 'agent-mail-holding',
           moveMessages: async (uids: number[]) => { moveCalls.push(accountId); return { uidMap: new Map(uids.map((u) => [u, u])) }; },
-          fetchEnvelopes: async () => [],
+          fetchEnvelopes: async (_mailbox: string, uids: number[]) =>
+            uids.map((uid) => ({ uid, subject: 's', from: { address: 'x@y.com' } })),
         })
       ),
     };
@@ -47,7 +48,8 @@ describe('hold_messages', () => {
         fn({
           getMailboxPath: async () => 'agent-mail-holding',
           moveMessages: async (uids: number[]) => { moveCalls.push({ accountId, uids }); return { uidMap: new Map(uids.map((u) => [u, u])) }; },
-          fetchEnvelopes: async () => [],
+          fetchEnvelopes: async (_mailbox: string, uids: number[]) =>
+            uids.map((uid) => ({ uid, subject: 's', from: { address: 'x@y.com' } })),
         })
       ),
     };
@@ -69,7 +71,8 @@ describe('hold_messages', () => {
         fn({
           getMailboxPath: async () => 'agent-mail-holding',
           moveMessages: async (uids: number[]) => ({ uidMap: new Map(uids.map((u) => [u, u])) }),
-          fetchEnvelopes: async () => [],
+          fetchEnvelopes: async (_mailbox: string, uids: number[]) =>
+            uids.map((uid) => ({ uid, subject: 's', from: { address: 'x@y.com' } })),
         })
       ),
     };
@@ -95,7 +98,8 @@ describe('hold_messages', () => {
         fn({
           getMailboxPath: async () => 'agent-mail-holding',
           moveMessages: async (uids: number[]) => ({ uidMap: new Map(uids.map((u) => [u, u])) }),
-          fetchEnvelopes: async () => [],
+          fetchEnvelopes: async (_mailbox: string, uids: number[]) =>
+            uids.map((uid) => ({ uid, subject: 's', from: { address: 'x@y.com' } })),
         })
       ),
     };

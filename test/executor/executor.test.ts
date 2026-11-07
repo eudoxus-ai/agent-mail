@@ -40,7 +40,17 @@ vi.mock('../../src/provider/imap.js', () => ({
       mailbox: 'INBOX',
     }),
     createDraft: vi.fn().mockResolvedValue({ uid: 99 }),
-    moveMessages: vi.fn().mockResolvedValue({ uidMap: new Map() }),
+    fetchEnvelopes: vi.fn(async (_mailbox: string, uids: number[]) =>
+      uids.map((uid) => ({
+        uid,
+        messageId: `<${uid}@test>`,
+        subject: 'Test',
+        from: { address: 'a@b.com', name: null },
+      }))
+    ),
+    moveMessages: vi.fn(async (uids: number[]) => ({
+      uidMap: new Map(uids.map((uid) => [uid, uid + 1000])),
+    })),
     setFlags: vi.fn().mockResolvedValue(undefined),
     removeFlags: vi.fn().mockResolvedValue(undefined),
     getMailboxPath: vi.fn().mockResolvedValue('agent-mail-quarantine'),

@@ -128,6 +128,8 @@ cache:
   # Mailboxes to sync. Entries starting with a backslash are IMAP special-use
   # flags, resolved per provider (Gmail's "[Gmail]/Sent Mail" and iCloud's
   # "Sent Messages" both match "\\\\Sent").
+  # "\\\\Sent" also covers unflagged folders named Sent, Sent Messages, Sent Mail
+  # or Sent Items, so every one of them on an account is synced.
   #
   # Gmail's All Mail ("\\\\All") is excluded on purpose: it holds a near-copy of
   # every message, roughly doubling cache size for very little extra reach.

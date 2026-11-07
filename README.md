@@ -189,7 +189,7 @@ Or if you prefer npx (after `npm link`):
 }
 ```
 
-Restart Claude Desktop. You should see agent-mail's 13 tools in the tool list.
+Restart Claude Desktop. You should see agent-mail's tools in the tool list.
 
 ### Launch the reviewer UI once
 
@@ -331,6 +331,12 @@ There is no batch-size limit. Filing fifty holds at once is fine: they queue dur
 
 ### Long bulk sweeps
 
+`hold_by_sender` takes one address or a list of up to 100, and `list_id` holds a mailing list whose posts come from per-member addresses. A list is one intent that reports `held`, `no_match`, `blocked` or `failed` per sender, and can be undone as a whole. Both need explicit `account_ids`, because each extra account adds a search per sender. A sender with replied threads is reported as `blocked` and doesn't stop the others.
+
+iCloud refuses `List-Id` searches, so a `list_id` sweep there uses the local cache and says so in its `warning`. It covers only mail the cache has backfilled.
+
+`cancel_intent` withdraws queued work that hasn't started. Finished work is reversed with `undo_intent`.
+
 `hold_messages` and `hold_by_sender` take `background: true` (the default for `hold_by_sender`). The call queues the work and returns an `intent_id` right away:
 
 ```json
@@ -356,7 +362,7 @@ Edit `~/.agent-mail/policy.yaml` to customize which actions need approval. The d
 
 - **Ungated:** search, read, overview, draft, label, unsubscribe, pending-actions, audit-log, get-intent, restore, undo
 - **Always gated:** send (every outbound email needs your approval)
-- **Configurable:** hold (ungated by default, gated when the thread has replies)
+- **Configurable:** hold (ungated by default, gated when the thread has replies, including your own replies in any Sent folder)
 
 Example: to require approval for all hold actions:
 

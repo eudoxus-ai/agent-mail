@@ -23,6 +23,7 @@ tools:
   get_scan_result:     { risk: none, gate: ungated, reversible: false }
   get_diagnostics:     { risk: none, gate: ungated, reversible: false }
   undo_intent:         { risk: low, gate: ungated, reversible: false }
+  cancel_intent:       { risk: low, gate: ungated, reversible: false }
 
   unsubscribe_sender:
     risk: low

@@ -16,6 +16,7 @@ export interface CachedSearchParams {
   mailbox: string;
   query?: string;
   from?: string;
+  listId?: string;
   to?: string;
   subject?: string;
   since?: Date;
@@ -118,6 +119,10 @@ export function searchCache(
     where.push(`(LOWER(m.from_address) LIKE ? OR LOWER(COALESCE(m.from_name, '')) LIKE ?)`);
     const needle = `%${params.from.toLowerCase()}%`;
     args.push(needle, needle);
+  }
+  if (params.listId) {
+    where.push(`LOWER(m.list_id) LIKE ?`);
+    args.push(`%${params.listId.toLowerCase()}%`);
   }
   if (params.to) {
     where.push(`LOWER(m.to_json) LIKE ?`);

@@ -9,6 +9,7 @@ import { getAccount, getDefaultAccount } from '../provider/accounts.js';
 import { describeIntent } from '../ledger/audit-summary.js';
 import { DEFAULT_REVIEWER_PORT } from '../config.js';
 import { buildApprovalUrl } from '../reviewer/urls.js';
+import { parseSweep } from '../tools/hold-by-sender.js';
 
 /**
  * Tools that accept `background: true`.
@@ -37,6 +38,7 @@ export function wrapToolHandler(
   return async (params: Record<string, unknown>) => {
     try {
       const canonicalToolName = toolDef.name;
+      if (canonicalToolName === 'hold_by_sender') parseSweep(params);
 
       // Resolve principal account for the intent record. Migrated tools no
       // longer take `account_id` directly — derive a principal from targets[0]

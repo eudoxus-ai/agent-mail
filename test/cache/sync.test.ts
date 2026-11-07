@@ -5,6 +5,7 @@ import {
   syncMailbox,
   drainMailboxBodies,
   resolveMailboxes,
+  unresolvedSelectors,
   DEFAULT_MAILBOX_SELECTORS,
   type SyncOptions,
 } from '../../src/cache/sync.js';
@@ -541,5 +542,20 @@ describe('cross-mailbox threading during sync', () => {
       .prepare(`SELECT DISTINCT thread_id FROM messages`)
       .all() as Array<{ thread_id: string }>;
     expect(threads).toHaveLength(1);
+  });
+});
+
+describe('resolveMailboxes and Sent folders', () => {
+  it('syncs an unflagged sent folder alongside the flagged one', () => {
+    const descriptors = [
+      { path: 'INBOX', specialUse: '\\Inbox', delimiter: '.' },
+      { path: 'INBOX.Sent', specialUse: '\\Sent', delimiter: '.' },
+      { path: 'INBOX.Sent Messages', specialUse: null, delimiter: '.' },
+    ];
+    expect(resolveMailboxes(descriptors, ['\\Sent'])).toEqual([
+      { path: 'INBOX.Sent', storeAs: 'INBOX.Sent' },
+      { path: 'INBOX.Sent Messages', storeAs: 'INBOX.Sent Messages' },
+    ]);
+    expect(unresolvedSelectors(descriptors, ['\\Sent'])).toEqual([]);
   });
 });

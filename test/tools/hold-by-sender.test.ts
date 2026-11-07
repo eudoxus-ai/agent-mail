@@ -1,10 +1,16 @@
 import { describe, it, expect } from 'vitest';
-import { holdBySenderTool } from '../../src/tools/hold-by-sender.js';
+import { holdBySenderTool, parseSweep } from '../../src/tools/hold-by-sender.js';
 
 describe('hold_by_sender tool definition', () => {
-  it('requires from', () => {
-    expect(() => holdBySenderTool.inputSchema.parse({})).toThrow();
-    expect(() => holdBySenderTool.inputSchema.parse({ from: 'x@y' })).not.toThrow();
+  it('requires from or list_id', () => {
+    expect(() => parseSweep(holdBySenderTool.inputSchema.parse({}))).toThrow(/exactly one/);
+    expect(() => parseSweep(holdBySenderTool.inputSchema.parse({ from: 'x@y' }))).not.toThrow();
+  });
+
+  it('accepts a list of senders and validates each one', () => {
+    expect(() => holdBySenderTool.inputSchema.parse({ from: ['x@y', 'a@b'] })).not.toThrow();
+    expect(() => holdBySenderTool.inputSchema.parse({ from: ['x@y', 'a'] })).toThrow();
+    expect(() => holdBySenderTool.inputSchema.parse({ from: [] })).toThrow();
   });
 
   it('accepts before + account_ids', () => {

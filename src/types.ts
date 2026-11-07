@@ -188,6 +188,8 @@ export interface ThreadSnippet {
 
 export interface SearchCriteria {
   from?: string;
+  /** Matched against the List-Id header by the server. */
+  listId?: string;
   to?: string;
   subject?: string;
   body?: string;

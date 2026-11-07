@@ -1,3 +1,4 @@
+import { isSentMailbox } from '../lib/sent-mailboxes.js';
 import type { Database } from '../ledger/sqlite.js';
 import type { Logger } from '../logger.js';
 import type { SyncProvider, MailboxDescriptor, SyncEnvelope } from './ports.js';
@@ -114,20 +115,21 @@ export interface ResolvedMailbox {
 function matchSelector(
   descriptors: MailboxDescriptor[],
   selector: string
-): ResolvedMailbox | null {
+): ResolvedMailbox[] {
   if (selector.startsWith('\\')) {
-    const match = descriptors.find(
-      (d) => d.specialUse?.toLowerCase() === selector.toLowerCase()
-    );
+    const isMatch =
+      selector.toLowerCase() === '\\sent'
+        ? isSentMailbox
+        : (d: MailboxDescriptor) => d.specialUse?.toLowerCase() === selector.toLowerCase();
     // Special-use folders keep their server path as the store name — nothing
     // queries them by an alias, and renaming them would orphan every row
     // already cached for existing accounts.
-    return match ? { path: match.path, storeAs: match.path } : null;
+    return descriptors.filter(isMatch).map((d) => ({ path: d.path, storeAs: d.path }));
   }
 
   const wanted = selector.toLowerCase();
   const exact = descriptors.find((d) => d.path.toLowerCase() === wanted);
-  if (exact) return { path: exact.path, storeAs: selector };
+  if (exact) return [{ path: exact.path, storeAs: selector }];
 
   // Namespaced servers hide the folder behind a prefix; the last path
   // segment is what the selector actually names. Whole-segment match only —
@@ -137,7 +139,7 @@ function matchSelector(
     const parts = d.path.split(d.delimiter ?? '/');
     return parts[parts.length - 1]?.toLowerCase() === wanted;
   });
-  return suffix ? { path: suffix.path, storeAs: selector } : null;
+  return suffix ? [{ path: suffix.path, storeAs: selector }] : [];
 }
 
 export function resolveMailboxes(
@@ -148,8 +150,8 @@ export function resolveMailboxes(
   const seen = new Set<string>();
 
   for (const selector of selectors) {
-    const match = matchSelector(descriptors, selector);
-    if (match && !seen.has(match.path)) {
+    for (const match of matchSelector(descriptors, selector)) {
+      if (seen.has(match.path)) continue;
       seen.add(match.path);
       resolved.push(match);
     }
@@ -170,7 +172,7 @@ export function unresolvedSelectors(
   descriptors: MailboxDescriptor[],
   selectors: string[] = DEFAULT_MAILBOX_SELECTORS
 ): string[] {
-  return selectors.filter((selector) => matchSelector(descriptors, selector) === null);
+  return selectors.filter((selector) => matchSelector(descriptors, selector).length === 0);
 }
 
 function backfillSince(

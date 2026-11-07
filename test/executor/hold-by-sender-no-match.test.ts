@@ -60,8 +60,8 @@ function fakeImap(opts: { search?: unknown[]; searchUids?: number[] } = {}) {
     moveMessages: vi.fn(async (uids: number[]) => ({
       uidMap: new Map(uids.map((u) => [u, u + 9000])),
     })),
-    fetchMessages: vi.fn(async () => []),
-    fetchThreadContext: vi.fn(async () => []),
+    hasRepliesTo: vi.fn(async () => false),
+    sentMailboxes: vi.fn(async () => []),
   };
 }
 
