@@ -2,7 +2,7 @@ import { ImapFlow } from 'imapflow';
 import type { ResolvedAccount, EmailMessage, SearchCriteria, Participant } from '../types.js';
 import { parseListUnsubscribe } from '../lib/list-unsubscribe.js';
 import { pickNewestUids } from './search-ordering.js';
-import { extractSnippet, extractSnippetFromPart } from './mime.js';
+import { extractSnippet, extractSnippetFromPart, getHeader, splitHeadersBody } from './mime.js';
 import type { SnippetSource } from './mime.js';
 
 function toParticipant(addr: { name?: string | null; address?: string | null } | undefined): Participant {
@@ -14,6 +14,37 @@ function toParticipant(addr: { name?: string | null; address?: string | null } |
 
 function toParticipants(addrs: Array<{ name?: string | null; address?: string | null }> | undefined): Participant[] {
   return (addrs ?? []).map(toParticipant);
+}
+
+/**
+ * What a listing needs from each message, asked for by name.
+ *
+ * Reading a fixed prefix of the source does not work: real mail carries 4-9 KB
+ * of Received/ARC/DKIM headers first, so a 2 KB prefix holds none of the
+ * threading or list headers and never reaches the body. Everything downstream
+ * of a missing header fails quietly rather than loudly: list mail is filed as
+ * personal, and replies go undetected by the `when_thread_has_replies` gate.
+ */
+const PREVIEW_QUERY = {
+  headers: [
+    'content-type',
+    'content-transfer-encoding',
+    'in-reply-to',
+    'references',
+    'list-id',
+    'list-unsubscribe',
+    'list-unsubscribe-post',
+  ],
+  bodyParts: [{ key: 'TEXT', start: 0, maxLength: 2048 }],
+};
+
+function readPreview(msg: {
+  headers?: Buffer;
+  bodyParts?: Map<string, Buffer>;
+}): { headers: string; snippet: string } {
+  const headers = msg.headers?.toString('utf-8') ?? '';
+  const body = msg.bodyParts?.get('text')?.toString('utf-8') ?? '';
+  return { headers, snippet: extractSnippet(`${headers.trimEnd()}\r\n\r\n${body}`) };
 }
 
 export interface ImapProviderOptions {
@@ -217,7 +248,7 @@ export class ImapProvider {
       const uidsToFetch = pickNewestUids(allUids, limit);
       if (uidsToFetch.length === 0) return [];
 
-      // Phase 2: hydrate envelopes + partial source for the selected UIDs.
+      // Phase 2: hydrate envelopes + preview headers for the selected UIDs.
       const results: Array<{
         uid: number;
         envelope: { message_id: string; subject: string; from: Participant; date: string };
@@ -233,13 +264,12 @@ export class ImapProvider {
           uid: true,
           envelope: true,
           flags: true,
-          source: { start: 0, maxLength: 2048 },
-          headers: ['list-id', 'list-unsubscribe'],
+          ...PREVIEW_QUERY,
         },
         { uid: true }
       )) {
-        const headersStr = msg.headers?.toString('utf-8') ?? '';
-        const { listId, listUnsubscribe } = extractListHeadersFromSource(headersStr);
+        const { headers, snippet } = readPreview(msg);
+        const { listId, listUnsubscribe } = extractListHeadersFromSource(headers);
         results.push({
           uid: msg.uid,
           envelope: {
@@ -248,7 +278,7 @@ export class ImapProvider {
             from: toParticipant(msg.envelope?.from?.[0]),
             date: msg.envelope?.date?.toISOString() ?? new Date().toISOString(),
           },
-          snippet: extractSnippet(msg.source ?? Buffer.alloc(0)),
+          snippet,
           flags: Array.from(msg.flags ?? []),
           list_id: listId,
           list_unsubscribe: listUnsubscribe,
@@ -311,7 +341,7 @@ export class ImapProvider {
     }
   }
 
-  /** Fetch envelopes + partial source for a specific list of UIDs. Returns EmailMessage objects with a `snippet` field. */
+  /** Fetch envelopes + preview headers for a specific list of UIDs. Returns EmailMessage objects with a `snippet` field. */
   async fetchEnvelopes(
     mailbox: string,
     uids: number[]
@@ -326,16 +356,16 @@ export class ImapProvider {
           uid: true,
           envelope: true,
           flags: true,
-          source: { start: 0, maxLength: 2048 },
+          ...PREVIEW_QUERY,
         },
         { uid: true }
       )) {
-        const source = msg.source?.toString('utf-8') ?? '';
-        const inReplyTo = extractHeader(source, 'In-Reply-To');
+        const { headers, snippet } = readPreview(msg);
+        const inReplyTo = extractHeader(headers, 'In-Reply-To');
         const references =
-          extractHeader(source, 'References')?.split(/\s+/).filter(Boolean) ?? [];
-        const rawListUnsubscribe = extractHeader(source, 'List-Unsubscribe');
-        const listUnsubscribePost = extractHeader(source, 'List-Unsubscribe-Post');
+          extractHeader(headers, 'References')?.split(/\s+/).filter(Boolean) ?? [];
+        const rawListUnsubscribe = extractHeader(headers, 'List-Unsubscribe');
+        const listUnsubscribePost = extractHeader(headers, 'List-Unsubscribe-Post');
 
         results.push({
           uid: msg.uid,
@@ -353,7 +383,7 @@ export class ImapProvider {
             ? parseListUnsubscribe(rawListUnsubscribe, listUnsubscribePost ?? undefined)
             : undefined,
           mailbox,
-          snippet: extractSnippet(msg.source ?? Buffer.alloc(0)),
+          snippet,
         });
       }
       return results;
@@ -405,14 +435,14 @@ export class ImapProvider {
             uid: true,
             envelope: true,
             flags: true,
-            source: { start: 0, maxLength: 2048 },
+            ...PREVIEW_QUERY,
           },
           { uid: true }
         )) {
-          const source = msg.source?.toString('utf-8') ?? '';
-          const inReplyTo = extractHeader(source, 'In-Reply-To');
+          const { headers, snippet } = readPreview(msg);
+          const inReplyTo = extractHeader(headers, 'In-Reply-To');
           const references =
-            extractHeader(source, 'References')?.split(/\s+/).filter(Boolean) ?? [];
+            extractHeader(headers, 'References')?.split(/\s+/).filter(Boolean) ?? [];
 
           results.push({
             uid: msg.uid,
@@ -427,7 +457,7 @@ export class ImapProvider {
             references,
             flags: Array.from(msg.flags ?? []),
             mailbox,
-            snippet: extractSnippet(msg.source ?? Buffer.alloc(0)),
+            snippet,
           });
           if (results.length >= maxMessages) break;
         }
@@ -772,15 +802,15 @@ export class ImapProvider {
           internalDate: true,
           size: true,
           bodyStructure: true,
-          source: { start: 0, maxLength: 2048 },
+          ...PREVIEW_QUERY,
         },
         { uid: true }
       )) {
-        const source = msg.source?.toString('utf-8') ?? '';
-        const { listId, listUnsubscribe } = extractListHeadersFromSource(source);
-        const listUnsubscribePost = extractHeader(source, 'List-Unsubscribe-Post');
+        const { headers, snippet } = readPreview(msg);
+        const { listId, listUnsubscribe } = extractListHeadersFromSource(headers);
+        const listUnsubscribePost = extractHeader(headers, 'List-Unsubscribe-Post');
         const references =
-          extractHeader(source, 'References')?.split(/\s+/).filter(Boolean) ?? [];
+          extractHeader(headers, 'References')?.split(/\s+/).filter(Boolean) ?? [];
 
         const message: EmailMessage = {
           uid: msg.uid,
@@ -794,7 +824,7 @@ export class ImapProvider {
           date: msg.envelope?.date?.toISOString() ?? '',
           subject: msg.envelope?.subject ?? '',
           bodyText: '',
-          inReplyTo: extractHeader(source, 'In-Reply-To') ?? undefined,
+          inReplyTo: extractHeader(headers, 'In-Reply-To') ?? undefined,
           references,
           flags: Array.from(msg.flags ?? []),
           listUnsubscribe:
@@ -811,7 +841,7 @@ export class ImapProvider {
           internalDate: toDate(msg.internalDate),
           size: msg.size ?? null,
           listId,
-          snippet: extractSnippet(msg.source ?? Buffer.alloc(0)),
+          snippet,
           attachments: collectAttachments(msg.bodyStructure),
           message,
         });
@@ -1157,10 +1187,9 @@ export function collectTextParts(structure: unknown): {
   return { plain, html, charset };
 }
 
+/** Only the header block is searched: a body line can look like a header. */
 function extractHeader(source: string, name: string): string | null {
-  const regex = new RegExp(`^${name}:\\s*(.+?)(?:\\r?\\n(?!\\s)|$)`, 'im');
-  const match = source.match(regex);
-  return match ? match[1].trim() : null;
+  return getHeader(splitHeadersBody(source).headers, name);
 }
 
 export function extractListHeadersFromSource(source: string): {
