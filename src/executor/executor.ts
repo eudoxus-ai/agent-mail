@@ -1920,7 +1920,7 @@ export class Executor {
               imap,
               holding,
               pending.map(({ entry }) => ({ uid: entry.destination_uid, messageId: entry.message_id })),
-              this.heldUids(accountId)
+              await this.heldUids(imap, accountId, holding)
             );
             errors.push(...refused);
             reachedMoves = true;
@@ -3022,7 +3022,10 @@ export class Executor {
     return finished.size;
   }
 
-  /** Which of these targets have a message in this mailbox, by Message-Id. */
+  /**
+   * Which of these targets have a message in this mailbox, by Message-Id.
+   * Targets can share a Message-Id, so each copy answers for one target only.
+   */
   private async foundIn(
     imap: ImapProvider,
     mailbox: string,
@@ -3031,11 +3034,23 @@ export class Executor {
     const ids = rows.flatMap((r) => r.envelope_snapshot?.message_id ?? []);
     if (ids.length === 0) return [];
     const found = await imap.uidsByMessageId(mailbox, ids);
-    return rows.filter((r) => found.has(r.envelope_snapshot?.message_id ?? ''));
+    return rows.filter(
+      (r) => found.get(r.envelope_snapshot?.message_id ?? '')?.shift() !== undefined
+    );
   }
 
-  /** UIDs in holding that a hold has on record, so no lookup can take them. */
-  private heldUids(accountId: string): Set<number> {
+  /**
+   * UIDs in holding that a hold has on record, so no lookup can take them.
+   * A folder only reuses a UID in a new generation, so a row from an older one
+   * says nothing about holding today. A row with no generation might still
+   * apply, so it stays reserved.
+   */
+  private async heldUids(
+    imap: ImapProvider,
+    accountId: string,
+    holding: string
+  ): Promise<Set<number>> {
+    const { uidValidity } = await imap.mailboxSnapshot(holding);
     const rows = this.db
       .prepare(
         `SELECT it.destination_uid AS uid
@@ -3043,9 +3058,10 @@ export class Executor {
            JOIN intents i ON i.id = it.intent_id
           WHERE it.account_id = ?
             AND it.destination_uid IS NOT NULL
+            AND (it.destination_uidvalidity IS NULL OR it.destination_uidvalidity = ?)
             AND i.tool IN ('hold_messages', 'hold_by_sender')`
       )
-      .all(accountId) as Array<{ uid: number }>;
+      .all(accountId, uidValidity) as Array<{ uid: number }>;
     return new Set(rows.map((r) => Number(r.uid)));
   }
 
@@ -3105,7 +3121,7 @@ export class Executor {
             uid: t.destination_uid,
             messageId: t.envelope_snapshot?.message_id,
           })),
-          this.heldUids(accountId)
+          await this.heldUids(imap, accountId, holding)
         );
         // Already in the inbox counts: an earlier undo's move may have landed
         // with its reply lost, or the message never left.
@@ -3159,44 +3175,51 @@ export class Executor {
           holdingGeneration = undefined;
         }
 
+        const located = new Map<IntentTargetRow, number>();
+        const missing: IntentTargetRow[] = [];
         for (const mailbox of new Set(list.map((t) => t.mailbox))) {
           const here = list.filter((t) => t.mailbox === mailbox);
           // By UID only. Nothing reserves mail outside holding, so a lookup
           // here could take a copy the user put in this folder.
-          const located = await locateMessages(
+          const uids = await locateMessages(
             imap,
             mailbox,
             here.map((t) => ({ uid: t.destination_uid }))
           );
-          // Already in holding counts, for the same reason as the hold undo.
-          done(await this.foundIn(imap, holding, here.filter((_, i) => located[i] === null)));
-
           for (const [index, t] of here.entries()) {
-            const uid = located[index];
-            if (uid === null) continue;
-            const { uidMap } = await imap.moveMessages([uid], mailbox, holding);
-            this.echoToCache({
+            const uid = uids[index];
+            if (uid === null) missing.push(t);
+            else located.set(t, uid);
+          }
+        }
+        // Already in holding counts, for the same reason as the hold undo.
+        // Asked once and before any move, so no copy is counted twice and
+        // nothing this undo moves is mistaken for mail that was already there.
+        done(await this.foundIn(imap, holding, missing));
+
+        for (const [t, uid] of located) {
+          const { uidMap } = await imap.moveMessages([uid], t.mailbox, holding);
+          this.echoToCache({
+            accountId,
+            mailbox: t.mailbox,
+            uids: [uid],
+            effect: 'moved',
+            detail: { toMailbox: holding },
+          });
+          done([t]);
+          // Restoring again reads the hold's row, so it has to learn the
+          // message's new UID in holding.
+          const newUid = uidMap.get(uid);
+          if (newUid === undefined) continue;
+          for (const hold of holds) {
+            updateIntentTargetDestinations(
+              this.db,
+              hold,
               accountId,
-              mailbox,
-              uids: [uid],
-              effect: 'moved',
-              detail: { toMailbox: holding },
-            });
-            done([t]);
-            // Restoring again reads the hold's row, so it has to learn the
-            // message's new UID in holding.
-            const newUid = uidMap.get(uid);
-            if (newUid === undefined) continue;
-            for (const hold of holds) {
-              updateIntentTargetDestinations(
-                this.db,
-                hold,
-                accountId,
-                new Map([[t.uid, newUid]]),
-                mailbox,
-                holdingGeneration
-              );
-            }
+              new Map([[t.uid, newUid]]),
+              t.mailbox,
+              holdingGeneration
+            );
           }
         }
       });

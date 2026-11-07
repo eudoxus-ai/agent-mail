@@ -33,6 +33,7 @@ describe('restore_messages', () => {
         fn({
           getMailboxPath: async () => 'agent-mail-holding',
           existingUids: async (_m: string, uids: number[]) => uids,
+          mailboxSnapshot: async () => ({ uidValidity: 1, uidNext: 1000, highestModseq: 1, exists: 0 }),
           uidsByMessageId: async () => new Map<string, number[]>(),
           moveMessages: async (uids: number[], from: string, to: string) => {
             moves.push({ uids, from, to });
@@ -81,6 +82,7 @@ describe('restore_messages', () => {
         fn({
           getMailboxPath: async () => 'agent-mail-holding',
           existingUids: async (_m: string, uids: number[]) => uids,
+          mailboxSnapshot: async () => ({ uidValidity: 1, uidNext: 1000, highestModseq: 1, exists: 0 }),
           uidsByMessageId: async () => new Map<string, number[]>(),
           moveMessages: async (uids: number[], from: string, to: string) => {
             moves.push({ uids, from, to });
@@ -118,6 +120,7 @@ describe('restore_messages', () => {
         fn({
           getMailboxPath: async () => 'agent-mail-holding',
           existingUids: async (_m: string, uids: number[]) => uids,
+          mailboxSnapshot: async () => ({ uidValidity: 1, uidNext: 1000, highestModseq: 1, exists: 0 }),
           uidsByMessageId: async () => new Map<string, number[]>(),
           moveMessages: async (uids: number[]) => { moves.push(1); return { uidMap: new Map(uids.map((u) => [u, u])) }; },
         })
@@ -149,6 +152,7 @@ describe('restore_messages', () => {
         fn({
           getMailboxPath: async () => 'agent-mail-holding',
           existingUids: async (_m: string, uids: number[]) => uids,
+          mailboxSnapshot: async () => ({ uidValidity: 1, uidNext: 1000, highestModseq: 1, exists: 0 }),
           uidsByMessageId: async () => new Map<string, number[]>(),
           moveMessages: async (uids: number[], from: string, to: string) => {
             moves.push({ uids, from, to });

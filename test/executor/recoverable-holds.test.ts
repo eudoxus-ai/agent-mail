@@ -37,6 +37,7 @@ const socketDrop = () => Object.assign(new Error('read ECONNRESET'), { code: 'EC
 class FakeServer {
   folders = new Map<string, Map<number, string>>();
   nextUid = 9000;
+  uidValidity = 42;
   /** What happens to each move, in order. Anything past the end succeeds. */
   moves: Step[] = [];
   fetchFails = new Set<string>();
@@ -59,7 +60,7 @@ class FakeServer {
   }
 
   async mailboxSnapshot() {
-    return { uidValidity: 42, uidNext: 1000, highestModseq: 10, exists: 5 };
+    return { uidValidity: this.uidValidity, uidNext: 1000, highestModseq: 10, exists: 5 };
   }
 
   async fetchEnvelopes(mailbox: string, uids: number[]) {
@@ -591,6 +592,95 @@ describe('mail another hold owns', () => {
     const { payload } = await restore(executor, [t(1, 'INBOX')]);
 
     expect(payload.moved).toEqual([]);
+    expect(server.ids(HOLDING)).toEqual(['<dup>']);
+  });
+});
+
+describe('a holding folder that was recreated', () => {
+  /** <a> held and restored, then holding restarts and <b> lands on <a>'s old UID. */
+  async function reusedUid() {
+    const server = new FakeServer({ INBOX: { 1: '<a>', 2: '<b>' } });
+    const executor = makeExecutor({ one: server });
+    const first = await hold(executor, [t(1, 'INBOX')]);
+    const staleUid = getIntentTargets(db, first.intent.id)[0].destination_uid!;
+    await restore(executor, [t(1)]);
+
+    server.uidValidity = 43;
+    server.nextUid = staleUid - 1;
+    server.moves = ['lose-response'];
+    await expect(hold(executor, [t(2, 'INBOX')])).rejects.toThrow();
+    expect([...server.folders.get(HOLDING)!.keys()]).toEqual([staleUid]);
+    return { server, executor };
+  }
+
+  it('restores mail sitting on a UID an older hold recorded', async () => {
+    const { server, executor } = await reusedUid();
+
+    const { payload } = await restore(executor, [t(2, 'INBOX')]);
+
+    expect(payload.moved).toHaveLength(1);
+    expect(server.ids(HOLDING)).toEqual([]);
+  });
+
+  it('undoes a hold whose mail sits on such a UID', async () => {
+    const server = new FakeServer({ INBOX: { 1: '<a>', 2: '<b>' }, Archive: { 3: '<c>' } });
+    const executor = makeExecutor({ one: server });
+    const first = await hold(executor, [t(1, 'INBOX')]);
+    const staleUid = getIntentTargets(db, first.intent.id)[0].destination_uid!;
+    await restore(executor, [t(1)]);
+
+    // Only the second move's reply is lost, so this hold can still be undone.
+    server.uidValidity = 43;
+    server.nextUid = staleUid - 2;
+    server.moves = ['ok', 'lose-response'];
+    const second = await hold(executor, [t(2, 'INBOX'), t(3, 'Archive')]);
+    expect([...server.folders.get(HOLDING)!.keys()]).toContain(staleUid);
+
+    const undo = await executor.undoIntent(second.intent.id);
+
+    expect(undo.success).toBe(true);
+    expect(undo.message).not.toContain('could not be located');
+    expect(server.ids(HOLDING)).toEqual([]);
+  });
+});
+
+describe('targets that share a Message-Id', () => {
+  it('counts one copy in the inbox as one message undone, not two', async () => {
+    const server = new FakeServer({ INBOX: { 1: '<dup>', 2: '<dup>' } });
+    const executor = makeExecutor({ one: server });
+    const { intent } = await hold(executor, [t(1, 'INBOX'), t(2, 'INBOX')]);
+    server.folders.get(HOLDING)!.clear();
+    server.folders.get('INBOX')!.set(5, '<dup>');
+
+    const undo = await executor.undoIntent(intent.id);
+
+    expect(undo.message).toContain('1 target(s) could not be located');
+  });
+
+  it('counts one copy in holding once across mailboxes', async () => {
+    const server = new FakeServer({ INBOX: { 1: '<dup>' }, Archive: { 2: '<dup>' } });
+    const executor = makeExecutor({ one: server });
+    await hold(executor, [t(1, 'INBOX'), t(2, 'Archive')]);
+    const { intent } = await restore(executor, [t(1), t(2)]);
+    server.folders.get('INBOX')!.clear();
+    server.folders.get('Archive')!.clear();
+    server.folders.get(HOLDING)!.set(5, '<dup>');
+
+    const undo = await executor.undoIntent(intent.id);
+
+    expect(undo.message).toContain('1 target(s) could not be located');
+  });
+
+  it('does not count a copy the same undo just moved into holding', async () => {
+    const server = new FakeServer({ INBOX: { 1: '<dup>' }, Archive: { 2: '<dup>' } });
+    const executor = makeExecutor({ one: server });
+    await hold(executor, [t(1, 'INBOX'), t(2, 'Archive')]);
+    const { intent } = await restore(executor, [t(1), t(2)]);
+    server.folders.get('Archive')!.clear();
+
+    const undo = await executor.undoIntent(intent.id);
+
+    expect(undo.message).toContain('1 target(s) could not be located');
     expect(server.ids(HOLDING)).toEqual(['<dup>']);
   });
 });
