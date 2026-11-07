@@ -51,7 +51,7 @@ export function extractSnippet(source: Buffer | string, maxLength = 200): string
   }
 }
 
-function splitHeadersBody(source: string): { headers: string; body: string } {
+export function splitHeadersBody(source: string): { headers: string; body: string } {
   const idx = source.search(/\r?\n\r?\n/);
   if (idx === -1) return { headers: source, body: '' };
   const sep = source[idx] === '\r' ? 4 : 2;
@@ -61,10 +61,17 @@ function splitHeadersBody(source: string): { headers: string; body: string } {
   };
 }
 
-function getHeader(headers: string, name: string): string | null {
-  const regex = new RegExp(`^${name}:\\s*(.+?)(?:\\r?\\n(?!\\s)|$)`, 'im');
+/**
+ * Read one header from a header block, joining folded continuation lines.
+ * Long values (List-Unsubscribe, References, a multipart Content-Type) are
+ * routinely folded, and the part after the fold is the part that matters: the
+ * HTTPS unsubscribe URL, the parent Message-Id, the boundary.
+ */
+export function getHeader(headers: string, name: string): string | null {
+  const regex = new RegExp(`^${name}:[ \\t]*(.*(?:\\r?\\n[ \\t].*)*)`, 'im');
   const match = headers.match(regex);
-  return match ? match[1].trim() : null;
+  if (!match) return null;
+  return match[1].replace(/\r?\n[ \t]+/g, ' ').trim() || null;
 }
 
 function extractBoundary(contentType: string): string | null {
