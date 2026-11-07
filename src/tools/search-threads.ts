@@ -7,7 +7,13 @@ export const searchThreadsTool: ToolDefinition = {
   description:
     'Search email threads across all accounts (or a scoped subset). Returns snippets (account_id, uid, mailbox, from_address, from_name, envelope, snippet, flags, list_id, list_unsubscribe, is_list_mail, category, target) newest-first. Each result includes a `category` triage hint set to one of `newsletter`, `promotional`, `transactional`, `notification`, or `personal` — a fast heuristic classification so you do not need to reimplement one. The full-shape result includes flat top-level `from_address` and `from_name` for one-hop sender access, alongside the back-compat nested `envelope.from.{address,name}`. Envelope includes accounts_searched, accounts_available, per_account_errors, and `next_cursor` when more results are available. To paginate, pass `next_cursor` back verbatim as `cursor` on the next call (preferred). `before` (ISO8601, exclusive) is still supported for manual pagination. Each result carries a preassembled `target` object suitable for hold_messages. Set `include_snippets: true` to populate the `snippet` field (adds one IMAP fetch per result; off by default). Use `fields` to project only the keys you need per result (recommended for bulk triage to shrink payloads; `from_address` and `from_name` are available as flat projections). For full attention signals, use get_overview.',
   inputSchema: z.object({
-    query: z.string().min(1).optional().describe('Search query text'),
+    query: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        'Full-text search. From the local cache, every word must appear somewhere in the subject, body, participants or attachment names, in any order, so `paid for by` also matches a receipt containing those three words apart. Use double quotes for an exact phrase ("paid for by") and a trailing * for a prefix. When the cache cannot answer, the mail server searches subjects and bodies for the text as one phrase.'
+      ),
     from: z.string().min(1).optional().describe('Filter by sender email/name'),
     to: z.string().min(1).optional().describe('Filter by recipient'),
     subject: z.string().min(1).optional().describe('Filter by subject'),

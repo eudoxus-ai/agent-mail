@@ -12,7 +12,8 @@ export const listSendersTool: ToolDefinition = {
     mailbox: z.string().min(1).optional().describe('Mailbox (default: INBOX)'),
     min_count: z.number().int().positive().optional().describe('Omit senders with fewer than this many messages (default 1)'),
     sample_size: z.number().int().positive().max(20).optional().describe('UIDs to include per sender (default 5)'),
-    scan_limit: z.number().int().positive().max(1000).optional().describe('Max messages per account to scan (default 500)'),
+    scan_limit: z.number().int().positive().max(1000).optional().describe('Max messages per account to scan (default 500). `coverage` reports, per account, how many were scanned, whether the cap was hit, and the oldest date reached.'),
+    limit: z.number().int().positive().optional().describe('Max senders to return, busiest first (default 200). `senders_total` gives the full count.'),
     async: z
       .boolean()
       .optional()

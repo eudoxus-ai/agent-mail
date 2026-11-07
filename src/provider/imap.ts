@@ -3,7 +3,7 @@ import type { ResolvedAccount, EmailMessage, SearchCriteria, Participant } from 
 import { parseListUnsubscribe } from '../lib/list-unsubscribe.js';
 import { isSentMailbox } from '../lib/sent-mailboxes.js';
 import { pickNewestUids } from './search-ordering.js';
-import { extractSnippet, extractSnippetFromPart, getHeader, splitHeadersBody } from './mime.js';
+import { extractSnippet, extractSnippetFromPart, getHeader, htmlToText, splitHeadersBody } from './mime.js';
 import type { SnippetSource } from './mime.js';
 
 function toParticipant(addr: { name?: string | null; address?: string | null } | undefined): Participant {
@@ -573,7 +573,7 @@ export class ImapProvider {
           envelope: true,
           flags: true,
           bodyStructure: true,
-          source: true,
+          headers: PREVIEW_QUERY.headers,
         },
         { uid: true }
       );
@@ -588,17 +588,15 @@ export class ImapProvider {
       const toAddrs = toParticipants(msg.envelope?.to);
       const ccAddrs = toParticipants(msg.envelope?.cc);
 
-      // Parse headers from source for threading
-      const source = msg.source?.toString('utf-8') ?? '';
-      const inReplyTo = extractHeader(source, 'In-Reply-To');
-      const references = extractHeader(source, 'References')
+      const headers = msg.headers?.toString('utf-8') ?? '';
+      const inReplyTo = extractHeader(headers, 'In-Reply-To');
+      const references = extractHeader(headers, 'References')
         ?.split(/\s+/)
         .filter(Boolean) ?? [];
-      const rawListUnsubscribe = extractHeader(source, 'List-Unsubscribe');
-      const listUnsubscribePost = extractHeader(source, 'List-Unsubscribe-Post');
+      const rawListUnsubscribe = extractHeader(headers, 'List-Unsubscribe');
+      const listUnsubscribePost = extractHeader(headers, 'List-Unsubscribe-Post');
 
-      // Extract body text (simplified - real implementation would parse MIME)
-      const bodyText = extractBodyText(source);
+      const bodyText = await this.readBodyText(msg.uid, msg.bodyStructure);
 
       return {
         uid: msg.uid,
@@ -620,6 +618,19 @@ export class ImapProvider {
     } finally {
       lock.release();
     }
+  }
+
+  /**
+   * The readable body: the text part, or the HTML part as text when there is no
+   * usable text part. Parts are decoded by the download, so this is what a
+   * person would read. The caller holds the mailbox lock.
+   */
+  private async readBodyText(uid: number, structure: unknown): Promise<string> {
+    const parts = collectTextParts(structure);
+    const text = parts.plain ? await this.downloadPart(uid, parts.plain) : null;
+    if (text?.trim()) return text;
+    const html = parts.html ? await this.downloadPart(uid, parts.html) : null;
+    return html ? htmlToText(html) : '';
   }
 
   async fetchMessages(
@@ -1241,6 +1252,9 @@ export function collectTextParts(structure: unknown): {
     const type = (node.type ?? '').toLowerCase();
     const disposition = (node.disposition ?? '').toLowerCase();
 
+    // An attached message has a body of its own, which is not this message's.
+    if (type === 'message/rfc822') return;
+
     // A text part dispositioned as an attachment (a .txt someone sent) is not
     // the message body and must not be indexed as one.
     if (disposition !== 'attachment') {
@@ -1346,11 +1360,3 @@ async function streamToString(stream: NodeJS.ReadableStream | ReadableStream): P
   return new TextDecoder().decode(merged);
 }
 
-function extractBodyText(source: string): string {
-  // Simple extraction: everything after the first blank line
-  const parts = source.split(/\r?\n\r?\n/);
-  if (parts.length > 1) {
-    return parts.slice(1).join('\n\n').substring(0, 5000);
-  }
-  return '';
-}

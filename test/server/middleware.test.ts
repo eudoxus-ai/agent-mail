@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { wrapToolHandler } from '../../src/server/middleware.js';
 import { queueSendTool } from '../../src/tools/queue-send.js';
+import { unsubscribeSenderTool } from '../../src/tools/unsubscribe-sender.js';
 import { Executor } from '../../src/executor/executor.js';
 import { openDatabase } from '../../src/ledger/db.js';
 import type { AccountConfig, PolicyConfig } from '../../src/types.js';
@@ -95,5 +96,31 @@ describe('wrapToolHandler pending response payload', () => {
     expect(payload.approval_url).toBe(
       `http://127.0.0.1:5555/intents/${payload.intent_id}`
     );
+  });
+});
+
+describe('wrapToolHandler account routing', () => {
+  it('runs a tool with a single target on that target\'s account', async () => {
+    const two: AccountConfig[] = [
+      ...accounts,
+      { id: 'b@y.com', email: 'b@y.com', imap: accounts[0].imap, smtp: accounts[0].smtp },
+    ];
+    const db = openDatabase(':memory:');
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as any;
+    const executor = new Executor({ db, accounts: two, pool: {} as any, logger });
+    const executeImmediate = vi
+      .spyOn(executor, 'executeImmediate')
+      .mockResolvedValue({ result: [{ type: 'text', text: '{}' }] } as any);
+    const handler = wrapToolHandler(unsubscribeSenderTool, {
+      db,
+      executor,
+      policy: { tools: { unsubscribe_sender: { risk: 'low', gate: 'ungated' } as any } },
+      accounts: two,
+      logger,
+    });
+
+    await handler({ target: { account_id: 'b@y.com', uid: 9 } });
+
+    expect(executeImmediate.mock.calls[0][0].accountId).toBe('b@y.com');
   });
 });

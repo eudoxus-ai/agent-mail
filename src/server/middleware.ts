@@ -43,7 +43,8 @@ export function wrapToolHandler(
       // Resolve principal account for the intent record. Migrated tools no
       // longer take `account_id` directly — derive a principal from targets[0]
       // or account_ids[0] when present, otherwise fall back to the default.
-      const targets = params.targets as
+      const singleTarget = params.target as { account_id: string } | undefined;
+      const targets = (params.targets ?? (singleTarget ? [singleTarget] : undefined)) as
         | Array<{ account_id: string }>
         | undefined;
       const accountIds = params.account_ids as string[] | undefined;
