@@ -241,7 +241,7 @@ Notifications are posted with `osascript` instead of `node-notifier`/`terminal-n
 | `get_overview` | Cross-account summary of recent mail that needs attention | None | Immediate |
 | `draft_reply` | Create a draft (saved to Drafts, not sent) | Low | Immediate |
 | `label_thread` | Add/remove IMAP flags on `targets: [{account_id, uid}]` | Low | Immediate |
-| `unsubscribe_sender` | HTTP List-Unsubscribe (RFC 2369) | Low | Immediate |
+| `unsubscribe_sender` | HTTP List-Unsubscribe, from a message or a URL | Low | Immediate |
 | `get_pending_actions` | Check the approval queue (cross-account) | None | Immediate |
 | `get_audit_log` | View action history (cross-account) | None | Immediate |
 | `queue_send` | Queue an email for sending | High | **Always requires approval** |

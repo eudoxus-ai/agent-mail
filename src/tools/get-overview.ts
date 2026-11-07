@@ -46,6 +46,10 @@ export const getOverviewTool: ToolDefinition = {
       .number()
       .optional()
       .describe('Max threads per category per account. Default 25.'),
+    include_participants: z
+      .boolean()
+      .optional()
+      .describe('Include `signals.thread_participants` on each thread. Off by default because it dominates the response.'),
     async: z
       .boolean()
       .optional()
@@ -65,6 +69,7 @@ export interface OverviewInput {
   mailboxes?: string[];
   include?: Category[];
   limit_per_category?: number;
+  include_participants?: boolean;
   async?: boolean;
 }
 
@@ -90,8 +95,11 @@ export interface OverviewThread {
     latest_date: string;
     truncated: boolean;
   };
-  signals: MessageSignals;
+  signals: OverviewSignals;
 }
+
+type OverviewSignals = Omit<MessageSignals, 'thread_participants'> &
+  Partial<Pick<MessageSignals, 'thread_participants'>>;
 
 export interface OverviewAccountBundle {
   account_id: string;
@@ -165,6 +173,7 @@ export async function runGetOverview(deps: RunDeps): Promise<OverviewResult> {
         categories,
         since,
         limitPerCategory,
+        includeParticipants: deps.input.include_participants ?? false,
       })
     )
   );
@@ -235,6 +244,12 @@ interface CollectDeps {
   categories: Category[];
   since: Date;
   limitPerCategory: number;
+  includeParticipants: boolean;
+}
+
+function withoutParticipants(signals: MessageSignals): OverviewSignals {
+  const { thread_participants: _omitted, ...rest } = signals;
+  return rest;
 }
 
 async function collectAccountBundle(deps: CollectDeps): Promise<OverviewAccountBundle> {
@@ -393,7 +408,7 @@ async function collectAccountBundle(deps: CollectDeps): Promise<OverviewAccountB
           latest_date: threadMessages[threadMessages.length - 1].date,
           truncated,
         },
-        signals,
+        signals: deps.includeParticipants ? signals : withoutParticipants(signals),
       });
     }
     // Sort newest-first by latest message date

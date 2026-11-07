@@ -4,6 +4,7 @@ import { isListMail } from '../attention/signals.js';
 import { classifyCategory, type Category } from '../attention/category.js';
 import type { Logger } from '../logger.js';
 import type { ImapConnectionPool } from '../provider/imap-pool.js';
+import type { ImapProvider } from '../provider/imap.js';
 import {
   createIntent,
   getIntent,
@@ -225,6 +226,26 @@ export async function assertGenerationMatches(
  * anything a healthy job produces, with slack for a slow provider.
  */
 const PROGRESS_STALE_AFTER_MS = 10 * 60_000;
+
+/** The most of a message body `read_thread` hands to the agent. */
+const READ_THREAD_MAX_BODY_CHARS = 20_000;
+const LIST_SENDERS_DEFAULT_LIMIT = 200;
+const GET_INTENT_DEFAULT_TARGETS = 50;
+
+/** How much of an account a capped scan actually reached. */
+interface ScanCoverage {
+  scanned: number;
+  truncated: boolean;
+  oldest_scanned: string | null;
+}
+
+function scanCoverage(dates: string[], scanLimit: number): ScanCoverage {
+  const oldest = dates.reduce<string | null>(
+    (min, date) => (!min || new Date(date) < new Date(min) ? date : min),
+    null
+  );
+  return { scanned: dates.length, truncated: dates.length >= scanLimit, oldest_scanned: oldest };
+}
 
 /**
  * Tools that change mail. Only these can be meaningfully orphaned by a restart
@@ -922,6 +943,10 @@ export class Executor {
         }
       );
 
+      if (!draft.bodyText.trim()) {
+        throw new Error(`Could not read the body of draft ${draftId}, so it was not sent`);
+      }
+
       return {
         from: account.email,
         to: draft.to.map((participant) => participant.address).filter(Boolean),
@@ -1011,10 +1036,12 @@ export class Executor {
       accountIds: targetIds,
       label: 'search_threads',
       fn: async (accountId, imap) => {
-        const resultSets = query
+        // Quotes mark a phrase for the cache; to a server they are literal text.
+        const serverQuery = query?.replaceAll('"', '');
+        const resultSets = serverQuery
           ? await Promise.all([
-              imap.search(mailbox, { ...baseCriteria, subject: query }, imapFetchLimit),
-              imap.search(mailbox, { ...baseCriteria, body: query }, imapFetchLimit),
+              imap.search(mailbox, { ...baseCriteria, subject: serverQuery }, imapFetchLimit),
+              imap.search(mailbox, { ...baseCriteria, body: serverQuery }, imapFetchLimit),
             ])
           : [await imap.search(mailbox, baseCriteria, imapFetchLimit)];
 
@@ -1434,6 +1461,8 @@ export class Executor {
     accounts_searched: string[];
     accounts_available: string[];
     per_account_errors?: Record<string, string>;
+    coverage: Record<string, ScanCoverage>;
+    senders_total: number;
     senders: Array<{
       account_id: string;
       from: string;
@@ -1454,6 +1483,8 @@ export class Executor {
     const minCount = (intent.params.min_count as number) ?? 1;
     const sampleSize = (intent.params.sample_size as number) ?? 5;
     const scanLimit = (intent.params.scan_limit as number) ?? 500;
+    const sendersLimit = (intent.params.limit as number) ?? LIST_SENDERS_DEFAULT_LIMIT;
+    const coverage: Record<string, ScanCoverage> = {};
     const criteria = {
       since: intent.params.since ? new Date(intent.params.since as string) : undefined,
       before: intent.params.before ? new Date(intent.params.before as string) : undefined,
@@ -1464,6 +1495,7 @@ export class Executor {
       accountIds: targetIds,
       fn: async (accountId, imap) => {
         const raw = await imap.search(mailbox, criteria, scanLimit);
+        coverage[accountId] = scanCoverage(raw.map((r) => r.envelope.date), scanLimit);
         const groups = new Map<string, {
           from: string;
           uids: number[];
@@ -1477,7 +1509,7 @@ export class Executor {
           const g = groups.get(addr) ?? { from: addr, uids: [], withUnsub: 0, listMail: 0, latest: '' };
           g.uids.push(r.uid);
           if (r.list_unsubscribe) g.withUnsub += 1;
-          if (r.list_unsubscribe) g.listMail += 1;
+          if (isListMail(r.list_unsubscribe, r.list_id)) g.listMail += 1;
           if (!g.latest || new Date(r.envelope.date).getTime() > new Date(g.latest).getTime()) {
             g.latest = r.envelope.date;
           }
@@ -1497,18 +1529,23 @@ export class Executor {
       },
     });
 
-    const senders = Object.values(fanResult.per_account)
+    const allSenders = Object.values(fanResult.per_account)
       .flat()
       .sort((a, b) => b.count - a.count);
+    const senders = allSenders.slice(0, sendersLimit);
 
     const payload: {
       accounts_searched: string[];
       accounts_available: string[];
       per_account_errors?: Record<string, string>;
+      coverage: Record<string, ScanCoverage>;
+      senders_total: number;
       senders: typeof senders;
     } = {
       accounts_searched: fanResult.accounts_searched,
       accounts_available: allIds,
+      coverage,
+      senders_total: allSenders.length,
       senders,
     };
     if (Object.keys(fanResult.errors).length > 0) {
@@ -1829,7 +1866,10 @@ export class Executor {
       if (!row) {
         return [{ type: 'text', text: JSON.stringify({ error: 'intent not found', intent_id: id }) }];
       }
-      const targets = getIntentTargets(this.db, id).map((t) => ({
+      const allTargets = getIntentTargets(this.db, id);
+      const targetsLimit =
+        (intent.params.targets_limit as number | undefined) ?? GET_INTENT_DEFAULT_TARGETS;
+      const targets = allTargets.slice(0, targetsLimit).map((t) => ({
         uid: t.uid,
         account_id: t.account_id,
         mailbox: t.mailbox,
@@ -1848,6 +1888,7 @@ export class Executor {
         // is indistinguishable from one that was never picked up.
         progress: getIntentProgress(this.db, id),
         targets,
+        targets_total: allTargets.length,
       };
       if (links.reverses.length > 0) payload.reverses_intent_id = links.reverses;
       if (links.reversed_by) payload.reversed_by_intent_id = links.reversed_by;
@@ -1928,7 +1969,12 @@ export class Executor {
         // Attach a snippet derived from the already-fetched body — no extra IMAP call.
         const bodyContent = msg.bodyText ?? '';
         const snippet = extractSnippetFromPart({ type: 'text/plain', content: bodyContent });
-        const payload = { ...msg, snippet };
+        const payload: Record<string, unknown> = { ...msg, snippet };
+        if (bodyContent.length > READ_THREAD_MAX_BODY_CHARS) {
+          payload.bodyText = bodyContent.slice(0, READ_THREAD_MAX_BODY_CHARS);
+          payload.body_truncated = true;
+          payload.body_chars = bodyContent.length;
+        }
         return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
       });
     }
@@ -1955,16 +2001,25 @@ export class Executor {
         }
 
         case 'unsubscribe_sender': {
-          const { url, headers } = await assertSafeRemoteUrl(
-            intent.params.unsubscribe_url as string
-          );
+          const resolved = await this.resolveUnsubscribe(intent, imap);
+          const { url, headers } = await assertSafeRemoteUrl(resolved.url);
+          // RFC 8058 defines this exact body; senders that support one-click
+          // ignore or reject a POST without it.
           const response = await fetch(url, {
             method: 'POST',
             redirect: 'manual',
             signal: createTimedAbortSignal(),
-            headers,
+            headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: 'List-Unsubscribe=One-Click',
           });
-          const unsubPayload: Record<string, unknown> = { message: `Unsubscribe request sent (HTTP ${response.status})` };
+          const unsubPayload: Record<string, unknown> = {
+            message: `Unsubscribe request sent (HTTP ${response.status})`,
+            unsubscribe_url: resolved.url,
+          };
+          if (resolved.oneClick === false) {
+            unsubPayload.warning =
+              'This sender does not advertise one-click unsubscribe, so the link may need a person to confirm it in a browser.';
+          }
           const unsubHint = buildUndoHint({ intent_id: intent.id, tool: intent.tool, created_at: intent.created_at });
           if (unsubHint) Object.assign(unsubPayload, unsubHint);
           return [{ type: 'text', text: JSON.stringify(unsubPayload) }];
@@ -1974,6 +2029,34 @@ export class Executor {
           return [{ type: 'text', text: `Unknown tool: ${intent.tool}` }];
       }
     });
+  }
+
+  /**
+   * The URL to POST for `unsubscribe_sender`: the one passed in, or the HTTP
+   * List-Unsubscribe link of the target message, read from the server.
+   */
+  private async resolveUnsubscribe(
+    intent: Intent,
+    imap: ImapProvider
+  ): Promise<{ url: string; oneClick?: boolean }> {
+    const target = intent.params.target as Target | undefined;
+    const givenUrl = intent.params.unsubscribe_url as string | undefined;
+    if (Boolean(target) === Boolean(givenUrl)) {
+      throw new Error('unsubscribe_sender needs exactly one of target or unsubscribe_url');
+    }
+    if (!target) return { url: givenUrl as string };
+
+    const message = await imap.fetchMessage(target.mailbox ?? 'INBOX', target.uid);
+    const header = message.listUnsubscribe;
+    if (!header) {
+      throw new Error(`UID ${target.uid} has no List-Unsubscribe header`);
+    }
+    if (!header.http_url) {
+      throw new Error(
+        `UID ${target.uid} only offers a mailto unsubscribe (${header.mailto}); use queue_send for it`
+      );
+    }
+    return { url: header.http_url, oneClick: header.one_click };
   }
 
   /**

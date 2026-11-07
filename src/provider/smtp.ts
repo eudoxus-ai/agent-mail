@@ -47,7 +47,7 @@ function normalizeAddressList(value: string | string[]): string {
 }
 
 export function buildDraftMessage(options: DraftMessageOptions): Buffer {
-  const lines = [
+  const headers = [
     `From: ${sanitizeHeaderValue(options.from)}`,
     `To: ${normalizeAddressList(options.to)}`,
     `Subject: ${sanitizeHeaderValue(options.subject)}`,
@@ -62,11 +62,10 @@ export function buildDraftMessage(options: DraftMessageOptions): Buffer {
     `Date: ${new Date().toUTCString()}`,
     'Content-Type: text/plain; charset=utf-8',
     'Content-Transfer-Encoding: 8bit',
-    '',
-    options.text.replace(/\r?\n/g, '\r\n'),
   ].filter(Boolean);
+  const body = options.text.replace(/\r?\n/g, '\r\n');
 
-  return Buffer.from(lines.join('\r\n'), 'utf-8');
+  return Buffer.from(`${headers.join('\r\n')}\r\n\r\n${body}`, 'utf-8');
 }
 
 export async function sendMail(
