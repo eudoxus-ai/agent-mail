@@ -8,6 +8,8 @@ function makeImap(opts: {
   hasQuarantine?: boolean;
   renameOk?: boolean;
   uids?: number[];
+  listFails?: boolean;
+  moveFails?: boolean;
 }) {
   const calls: Call[] = [];
   return {
@@ -26,10 +28,12 @@ function makeImap(opts: {
     },
     async listMessageUids(mailbox: string) {
       calls.push({ op: 'listUids', args: [mailbox] });
+      if (opts.listFails) throw new Error('search failed');
       return opts.uids ?? [];
     },
     async moveMessages(uids: number[], from: string, to: string) {
       calls.push({ op: 'move', args: [uids, from, to] });
+      if (opts.moveFails) throw new Error('move failed');
     },
     async deleteMailbox(name: string) {
       calls.push({ op: 'delete', args: [name] });
@@ -72,6 +76,18 @@ describe('migrateHoldingFolder', () => {
       { op: 'move', args: [[1, 2, 3], 'agent-mail-quarantine', 'agent-mail-holding'] },
       { op: 'delete', args: ['agent-mail-quarantine'] },
     ]);
+  });
+
+  it('keeps the old folder when its messages cannot be listed', async () => {
+    const imap = makeImap({ hasQuarantine: true, listFails: true });
+    await expect(migrateHoldingFolder(imap)).rejects.toThrow('search failed');
+    expect(imap.calls.map((c) => c.op)).not.toContain('delete');
+  });
+
+  it('keeps the old folder when its messages cannot be moved', async () => {
+    const imap = makeImap({ hasQuarantine: true, uids: [1], moveFails: true });
+    await expect(migrateHoldingFolder(imap)).rejects.toThrow('move failed');
+    expect(imap.calls.map((c) => c.op)).not.toContain('delete');
   });
 
   it('fallback with empty source does not call move but still deletes', async () => {
