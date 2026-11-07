@@ -48,6 +48,13 @@ describe('locateMessages', () => {
     ).resolves.toEqual([1, 2, null]);
   });
 
+  it('never takes a reserved UID', async () => {
+    const imap = mailbox([], { '<a>': [1, 2] });
+    await expect(
+      locateMessages(imap, 'M', [{ uid: null, messageId: '<a>' }], new Set([1]))
+    ).resolves.toEqual([2]);
+  });
+
   it('does not take a copy another target owns by UID', async () => {
     const imap = mailbox([1], { '<a>': [1] });
     await expect(

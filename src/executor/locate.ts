@@ -15,11 +15,15 @@ export interface Locatable {
  * A recorded UID is only a claim: the message may have moved on since, and a
  * move can land without the server's reply reaching us. So a recorded UID counts
  * only if it still exists, and anything else is looked up by Message-Id.
+ *
+ * Copies can share a Message-Id, so the lookup never takes a UID in `reserved`:
+ * those belong to some other record, and this message is not that one.
  */
 export async function locateMessages(
   imap: LocatableMailbox,
   mailbox: string,
-  messages: Locatable[]
+  messages: Locatable[],
+  reserved: Set<number> = new Set()
 ): Promise<Array<number | null>> {
   const recorded = messages.flatMap((m) => (m.uid === null ? [] : [m.uid]));
   const present = new Set(recorded.length > 0 ? await imap.existingUids(mailbox, recorded) : []);
@@ -31,11 +35,10 @@ export async function locateMessages(
   return messages.map((m) => {
     if (isHere(m)) return m.uid;
     if (!m.messageId) return null;
-    // Two copies can share a Message-Id, so each copy is handed out once, and
-    // never one that another target already owns by UID.
+    // Each copy is handed out once, and never one a target here owns by UID.
     const hits: number[] = byId.get(m.messageId) ?? [];
     let hit = hits.shift();
-    while (hit !== undefined && present.has(hit)) hit = hits.shift();
+    while (hit !== undefined && (present.has(hit) || reserved.has(hit))) hit = hits.shift();
     return hit ?? null;
   });
 }

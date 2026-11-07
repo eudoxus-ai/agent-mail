@@ -2,9 +2,15 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { openDatabase } from '../../src/ledger/db.js';
 import type { Database } from '../../src/ledger/sqlite.js';
 import { createLogger } from '../../src/logger.js';
-import { getIntent } from '../../src/ledger/intents.js';
-import { getIntentTargets } from '../../src/ledger/intent-targets.js';
+import {
+  createIntent,
+  getIntent,
+  updateIntentProgress,
+  updateIntentStatus,
+} from '../../src/ledger/intents.js';
+import { getIntentTargets, insertIntentTargets } from '../../src/ledger/intent-targets.js';
 import { Executor } from '../../src/executor/executor.js';
+import { ImapConnectionPool } from '../../src/provider/imap-pool.js';
 import type { AccountConfig } from '../../src/types.js';
 
 /**
@@ -23,7 +29,10 @@ const account = (id: string): AccountConfig => ({
 });
 const accounts = [account('one'), account('two')];
 
-type Step = 'ok' | 'refuse' | 'lose-response';
+type Step = 'ok' | 'refuse' | 'lose-response' | 'drop-after-landing';
+
+/** What a real dropped socket looks like, so the pool treats it as one. */
+const socketDrop = () => Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });
 
 class FakeServer {
   folders = new Map<string, Map<number, string>>();
@@ -31,6 +40,8 @@ class FakeServer {
   /** What happens to each move, in order. Anything past the end succeeds. */
   moves: Step[] = [];
   fetchFails = new Set<string>();
+  /** Mailboxes whose next read drops the connection, once each. */
+  fetchDropsOnce = new Set<string>();
 
   constructor(mail: Record<string, Record<number, string>>) {
     for (const [name, messages] of Object.entries(mail)) {
@@ -53,6 +64,7 @@ class FakeServer {
 
   async fetchEnvelopes(mailbox: string, uids: number[]) {
     if (this.fetchFails.has(mailbox)) throw new Error('connection dropped');
+    if (this.fetchDropsOnce.delete(mailbox)) throw socketDrop();
     const folder = this.folders.get(mailbox)!;
     return uids
       .filter((uid) => folder.has(uid))
@@ -94,12 +106,24 @@ class FakeServer {
       uidMap.set(uid, next);
     }
     if (step === 'lose-response') throw new Error('connection dropped');
+    if (step === 'drop-after-landing') throw socketDrop();
     return { uidMap };
   }
 
   async replyThreadIds() {
     return new Set<string>();
   }
+
+  // Enough of a provider for the real pool to borrow it.
+  isDead() {
+    return false;
+  }
+  getLastError() {
+    return undefined;
+  }
+  async noop() {}
+  async disconnect() {}
+  destroy() {}
 }
 
 let db: Database;
@@ -119,6 +143,15 @@ function makeExecutor(servers: Record<string, FakeServer>) {
     } as never,
     logger: createLogger('cli', { minLevel: 'error' }),
   });
+}
+
+/** The real pool, so a dropped connection reconnects and re-runs the work. */
+function makeExecutorWithRealPool(server: FakeServer) {
+  const logger = createLogger('cli', { minLevel: 'error' });
+  const pool = new ImapConnectionPool({ accounts, logger, keepaliveIntervalMs: 0 }) as any;
+  pool.ensureConnected = async () => server;
+  pool.teardown = async () => {};
+  return new Executor({ db, accounts, pool, logger });
 }
 
 const t = (uid: number, mailbox?: string, account_id = 'one') => ({
@@ -459,5 +492,262 @@ describe('the same UID in two mailboxes', () => {
 
     expect(undo.success).toBe(true);
     expect(server.ids(HOLDING)).toEqual([]);
+  });
+});
+
+describe('a dropped connection', () => {
+  it('still lets the pool reconnect and finish a hold', async () => {
+    const server = new FakeServer({ INBOX: { 1: '<a>' } });
+    server.fetchDropsOnce.add('INBOX');
+    const executor = makeExecutorWithRealPool(server);
+
+    const { payload } = await hold(executor, [t(1, 'INBOX')]);
+
+    expect(payload.total_messages).toBe(1);
+    expect(server.ids(HOLDING)).toEqual(['<a>']);
+  });
+
+  it('does not forget a mailbox that finished before the drop', async () => {
+    const server = new FakeServer({ INBOX: { 1: '<a>' }, Archive: { 2: '<b>' } });
+    server.fetchDropsOnce.add('Archive');
+    const executor = makeExecutorWithRealPool(server);
+
+    const { payload } = await hold(executor, [t(1, 'INBOX'), t(2, 'Archive')]);
+
+    expect(payload.total_messages).toBe(2);
+    expect(payload.errors).toBeUndefined();
+    expect(server.ids(HOLDING)).toEqual(['<a>', '<b>']);
+  });
+
+  it('keeps what moved when the account then fails outright', async () => {
+    const server = new FakeServer({ INBOX: { 1: '<a>' }, Archive: { 2: '<b>' } });
+    server.fetchDropsOnce.add('Archive');
+    const executor = makeExecutor({ one: server });
+
+    const { payload } = await hold(executor, [t(1, 'INBOX'), t(2, 'Archive')]);
+
+    expect(payload.total_messages).toBe(1);
+    expect(payload.per_account_errors).toEqual({ one: 'read ECONNRESET' });
+  });
+
+  it('does not repeat a refusal when a restore is re-run', async () => {
+    const server = new FakeServer({ INBOX: { 1: '<a>' } });
+    const executor = makeExecutorWithRealPool(server);
+    await hold(executor, [t(1, 'INBOX')]);
+    const existing = server.existingUids.bind(server);
+    let dropped = false;
+    server.existingUids = async (mailbox, uids) => {
+      if (!dropped) {
+        dropped = true;
+        throw socketDrop();
+      }
+      return existing(mailbox, uids);
+    };
+
+    const { payload } = await restore(executor, [t(1), t(99)]);
+
+    expect(payload.moved).toHaveLength(1);
+    expect(payload.errors).toHaveLength(1);
+  });
+
+  it('reports an undo whose move landed as done', async () => {
+    const server = new FakeServer({ INBOX: { 1: '<a>' } });
+    const executor = makeExecutorWithRealPool(server);
+    const { intent } = await hold(executor, [t(1, 'INBOX')]);
+    server.moves = ['drop-after-landing'];
+
+    const undo = await executor.undoIntent(intent.id);
+
+    expect(undo.success).toBe(true);
+    expect(undo.message).not.toContain('could not be located');
+    expect(getIntent(db, intent.id)?.status).toBe('undone');
+  });
+});
+
+describe('mail another hold owns', () => {
+  it('leaves a later hold of the same message alone when undoing an old hold', async () => {
+    const server = new FakeServer({ INBOX: { 1: '<a>', 2: '<b>' } });
+    const executor = makeExecutor({ one: server });
+    const first = await hold(executor, [t(1, 'INBOX'), t(2, 'INBOX')]);
+    await restore(executor, [t(1)]);
+    const newUid = [...server.folders.get('INBOX')!.keys()][0];
+    const second = await hold(executor, [t(newUid, 'INBOX')]);
+
+    const undoFirst = await executor.undoIntent(first.intent.id);
+
+    expect(undoFirst.message).toContain('1 target(s) could not be located');
+    expect(server.ids(HOLDING)).toEqual(['<a>']);
+    expect((await executor.undoIntent(second.intent.id)).success).toBe(true);
+    expect(server.ids('INBOX')).toEqual(['<a>', '<b>']);
+  });
+
+  it('does not restore another copy for a hold that never moved', async () => {
+    const server = new FakeServer({ INBOX: { 1: '<dup>' }, Archive: { 7: '<dup>' } });
+    const executor = makeExecutor({ one: server });
+    await hold(executor, [t(7, 'Archive')]);
+    server.moves = ['refuse'];
+    await expect(hold(executor, [t(1, 'INBOX')])).rejects.toThrow();
+
+    const { payload } = await restore(executor, [t(1, 'INBOX')]);
+
+    expect(payload.moved).toEqual([]);
+    expect(server.ids(HOLDING)).toEqual(['<dup>']);
+  });
+});
+
+describe('an undo that gets interrupted', () => {
+  it('succeeds on the retry after a lost reply', async () => {
+    const server = new FakeServer({ INBOX: { 1: '<a>' } });
+    const executor = makeExecutor({ one: server });
+    const { intent } = await hold(executor, [t(1, 'INBOX')]);
+    server.moves = ['lose-response'];
+
+    const first = await executor.undoIntent(intent.id);
+    const second = await executor.undoIntent(intent.id);
+
+    expect(first.success).toBe(false);
+    expect(second.success).toBe(true);
+    expect(getIntent(db, intent.id)?.status).toBe('undone');
+  });
+
+  it('does not call mail the first attempt moved lost', async () => {
+    const one = new FakeServer({ INBOX: { 1: '<a>' } });
+    const two = new FakeServer({ INBOX: { 2: '<b>' } });
+    const executor = makeExecutor({ one, two });
+    const { intent } = await hold(executor, [t(1, 'INBOX', 'one'), t(2, 'INBOX', 'two')]);
+    two.moves = ['refuse'];
+    await executor.undoIntent(intent.id);
+
+    const second = await executor.undoIntent(intent.id);
+
+    expect(second.success).toBe(true);
+    expect(second.message).not.toContain('could not be located');
+  });
+
+  it('counts what an undone restore moved before it failed', async () => {
+    const server = new FakeServer({ INBOX: { 1: '<a>', 2: '<b>' } });
+    const executor = makeExecutor({ one: server });
+    await hold(executor, [t(1, 'INBOX'), t(2, 'INBOX')]);
+    const { intent } = await restore(executor, [t(1), t(2)]);
+    server.moves = ['ok', 'refuse'];
+
+    const first = await executor.undoIntent(intent.id);
+
+    expect(first.message).toContain('Undid 1 of 2');
+    const second = await executor.undoIntent(intent.id);
+    expect(second.success).toBe(true);
+    expect(second.message).not.toContain('could not be located');
+    expect(server.ids(HOLDING)).toEqual(['<a>', '<b>']);
+  });
+
+  it('counts mail that is already in the inbox as undone', async () => {
+    const server = new FakeServer({ INBOX: { 1: '<a>' } });
+    const executor = makeExecutor({ one: server });
+    const { intent } = await hold(executor, [t(1, 'INBOX')]);
+    const held = server.folders.get(HOLDING)!;
+    const [[uid, id]] = [...held];
+    held.delete(uid);
+    server.folders.get('INBOX')!.set(5, id);
+
+    expect((await executor.undoIntent(intent.id)).success).toBe(true);
+  });
+
+  it('fails when a hold moved nothing at all', async () => {
+    const server = new FakeServer({ INBOX: {} });
+    const executor = makeExecutor({ one: server });
+    const { intent } = await hold(executor, [t(1, 'INBOX')]);
+
+    const undo = await executor.undoIntent(intent.id);
+
+    expect(undo.success).toBe(false);
+    expect(getIntent(db, intent.id)?.status).toBe('executed');
+  });
+});
+
+describe('restoring in less tidy situations', () => {
+  it('can restore mail that undoing a restore put back under an undone hold', async () => {
+    const server = new FakeServer({ INBOX: { 1: '<a>', 2: '<b>' } });
+    const executor = makeExecutor({ one: server });
+    const { intent: held } = await hold(executor, [t(1, 'INBOX'), t(2, 'INBOX')]);
+    const { intent: restored } = await restore(executor, [t(1)]);
+    await executor.undoIntent(held.id);
+    await executor.undoIntent(restored.id);
+    expect(server.ids(HOLDING)).toEqual(['<a>']);
+
+    const { payload } = await restore(executor, [t(1)]);
+
+    expect(payload.moved).toHaveLength(1);
+    expect(server.ids(HOLDING)).toEqual([]);
+  });
+
+  function holdLeftExecuting() {
+    const intent = createIntent(db, {
+      account_id: 'one',
+      tool: 'hold_messages',
+      params: { targets: [t(1, 'INBOX')] },
+      risk: 'medium',
+      agent_id: 'a',
+    });
+    updateIntentStatus(db, intent.id, 'executing');
+    insertIntentTargets(db, intent.id, [
+      {
+        account_id: 'one',
+        uid: 1,
+        mailbox: 'INBOX',
+        envelope_snapshot: {
+          subject: '',
+          from: '',
+          original_mailbox: 'INBOX',
+          message_id: '<a>',
+        },
+      },
+    ]);
+    return intent;
+  }
+
+  it('restores from a hold whose process died', async () => {
+    const server = new FakeServer({ INBOX: {}, [HOLDING]: { 9001: '<a>' } });
+    holdLeftExecuting();
+
+    const { payload } = await restore(makeExecutor({ one: server }), [t(1)]);
+
+    expect(payload.moved).toHaveLength(1);
+    expect(server.ids('INBOX')).toEqual(['<a>']);
+  });
+
+  it('keeps away from a hold that is still running', async () => {
+    const server = new FakeServer({ INBOX: {}, [HOLDING]: { 9001: '<a>' } });
+    const intent = holdLeftExecuting();
+    updateIntentProgress(db, intent.id, 'moving', {});
+
+    const { payload } = await restore(makeExecutor({ one: server }), [t(1)]);
+
+    expect(payload.moved).toEqual([]);
+    expect(server.ids(HOLDING)).toEqual(['<a>']);
+  });
+
+  it('records one account when the other is down', async () => {
+    const one = new FakeServer({ INBOX: { 1: '<a>' } });
+    const two = new FakeServer({ INBOX: { 2: '<b>' } });
+    const down = new Set<string>();
+    const executor = new Executor({
+      db,
+      accounts,
+      pool: {
+        withConnection: async (id: string, fn: (i: unknown) => Promise<unknown>) => {
+          if (down.has(id)) throw new Error(`cannot connect to ${id}`);
+          return fn({ one, two }[id]);
+        },
+      } as never,
+      logger: createLogger('cli', { minLevel: 'error' }),
+    });
+    await hold(executor, [t(1, 'INBOX', 'one'), t(2, 'INBOX', 'two')]);
+    down.add('two');
+
+    const { intent, payload } = await restore(executor, [t(1, undefined, 'one'), t(2, undefined, 'two')]);
+
+    expect(payload.moved).toEqual([expect.objectContaining({ uid: 1 })]);
+    expect(payload.errors[0].reason).toBe('cannot connect to two');
+    expect(getIntentTargets(db, intent.id)).toHaveLength(1);
   });
 });

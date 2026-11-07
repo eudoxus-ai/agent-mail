@@ -31,6 +31,7 @@ import {
 } from '../provider/url-safety.js';
 import { generateUndoToken, getUndoExpiry, parseUndoToken } from './undo.js';
 import { buildUndoHint } from '../lib/undo-hint.js';
+import { isConnectionDropError } from '../provider/imap-pool.js';
 import { fanOut } from './fan-out.js';
 import { locateMessages } from './locate.js';
 import { parseTargets, type Target } from '../tools/target.js';
@@ -57,6 +58,26 @@ import { invalidate } from '../cache/invalidate.js';
 import { stageAttachment, AttachmentTooLargeError } from '../cache/attachment-store.js';
 import { INLINE_MAX_BYTES } from '../tools/get-attachment.js';
 import { DEFAULT_CACHE_CONFIG, type CacheConfig } from '../cache/config.js';
+
+/** One account's share of a hold. See `holdTargets`. */
+interface AccountHoldResult {
+  account_id: string;
+  per_mailbox: Array<{ mailbox: string; message_count: number; uids: number[] }>;
+  envelopes: Array<{
+    account_id: string;
+    uid: number;
+    mailbox: string;
+    subject: string;
+    from: string;
+    message_id?: string;
+    /** Undefined on a dry run, or if the snapshot call failed. */
+    uidvalidity?: number;
+  }>;
+  errors: Array<{ uid: number; account_id: string; mailbox: string; reason: string }>;
+  failures: string[];
+  /** Mailboxes done with, so a re-run after a dropped connection skips them. */
+  finished: Set<string>;
+}
 
 /**
  * Thrown from `holdBySender` when the replies-present policy gate blocks the
@@ -177,6 +198,25 @@ function describeCacheOnly(accounts: string[]): string {
     ? ''
     : ` ${accounts.join(', ')} refused the List-Id search, so this sweep used ` +
         'the local cache there. That covers only the mail the cache has backfilled.';
+}
+
+/**
+ * Whether something is still working on an executing intent. Decided from the
+ * ledger, because queued jobs run in the daemon, whose pool this process can't
+ * see. Two signals mean alive: a live worker lease, or fresh progress.
+ */
+function intentLiveness(db: Database, intent: Intent, now = Date.now()) {
+  const updatedAt = getIntentProgress(db, intent.id)?.updated_at;
+  const progressAgeMs = updatedAt != null ? now - new Date(updatedAt).getTime() : null;
+  const liveLease =
+    intent.claimed_by != null &&
+    intent.lease_expires_at != null &&
+    new Date(intent.lease_expires_at).getTime() > now;
+  // Progress lands at least once per mailbox per pass, well inside the
+  // operation timeout; anything fresher than this window is being written by a
+  // live job.
+  const freshProgress = progressAgeMs != null && progressAgeMs < PROGRESS_STALE_AFTER_MS;
+  return { liveLease, progressAgeMs, alive: liveLease || freshProgress };
 }
 
 interface GenerationReader {
@@ -1352,18 +1392,7 @@ export class Executor {
 
       const progress = getIntentProgress(this.db, intent.id);
       const targets = getIntentTargets(this.db, intent.id);
-      const progressAgeMs =
-        progress?.updated_at != null ? now - new Date(progress.updated_at).getTime() : null;
-
-      const liveLease =
-        intent.claimed_by != null &&
-        intent.lease_expires_at != null &&
-        new Date(intent.lease_expires_at).getTime() > now;
-      // Progress lands at least once per mailbox per pass, well inside the
-      // operation timeout; anything fresher than this window is being written
-      // by a live job.
-      const freshProgress =
-        progressAgeMs != null && progressAgeMs < PROGRESS_STALE_AFTER_MS;
+      const { liveLease, progressAgeMs, alive } = intentLiveness(this.db, intent, now);
 
       const entry: Record<string, unknown> = {
         intent_id: intent.id,
@@ -1376,7 +1405,7 @@ export class Executor {
         targets_unconfirmed: targets.filter((t) => t.destination_uid === null).length,
       };
 
-      if (liveLease || freshProgress) {
+      if (alive) {
         entry.alive_because = liveLease
           ? `worker ${intent.claimed_by} holds a live lease`
           : `progress updated ${Math.round((progressAgeMs ?? 0) / 1000)}s ago`;
@@ -1778,9 +1807,13 @@ export class Executor {
       if (unknown.length > 0) throw new Error(`Unknown account_ids in targets: ${unknown.join(', ')}`);
 
       // What the ledger knows about each held UID, by account and UID, then by
-      // the mailbox it came from: UIDs are unique only within a mailbox. Failed
-      // holds count, because a move can land even when the hold reports failure.
-      // Oldest first, so the latest hold of a message wins.
+      // the mailbox it came from: UIDs are unique only within a mailbox. Oldest
+      // first, so the latest hold of a message wins.
+      //
+      // Any finished hold counts, and one whose process died: a failed hold's
+      // move can still have landed, and undoing a restore can put mail back in
+      // holding under a hold that was itself undone. Only a hold still running
+      // is off limits.
       const rows = this.db
         .prepare(
           `SELECT it.intent_id, it.account_id, it.uid, it.envelope_snapshot, it.destination_uid,
@@ -1788,7 +1821,7 @@ export class Executor {
            FROM intent_targets it
            JOIN intents i ON i.id = it.intent_id
            WHERE i.tool IN ('hold_messages', 'hold_by_sender')
-             AND i.status IN ('executed', 'failed')
+             AND i.status IN ('executed', 'failed', 'undone', 'executing')
            ORDER BY i.created_at, i.rowid`
         )
         .all() as Array<{ intent_id: string; account_id: string; uid: number; envelope_snapshot: string | null; destination_uid: number | null; destination_uidvalidity: number | null }>;
@@ -1799,8 +1832,14 @@ export class Executor {
         destination_uid: number | null;
         destination_uidvalidity: number | null;
       }
+      const running = new Set(
+        checkStuckExecuting(this.db)
+          .filter((i) => intentLiveness(this.db, i).alive)
+          .map((i) => i.id)
+      );
       const held = new Map<string, Map<string, HeldEntry>>();
       for (const r of rows) {
+        if (running.has(r.intent_id)) continue;
         const snap = r.envelope_snapshot ? JSON.parse(r.envelope_snapshot) : null;
         if (!snap?.original_mailbox) continue;
         const key = `${r.account_id}:${r.uid}`;
@@ -1837,112 +1876,123 @@ export class Executor {
       const restored: IntentTargetInsert[] = [];
 
       for (const accountId of accountIds) {
-        await this.pool.withConnection(accountId, async (imap) => {
-          const holding = await imap.getMailboxPath('holding');
-          // One snapshot per mailbox for the whole batch, shared by the
-          // generation guard and by the destination stamp written below.
-          const generations = new Map<string, number>();
-          const pending: Array<{ uid: number; entry: HeldEntry }> = [];
-          for (const t of targets) {
-            if (t.account_id !== accountId) continue;
-            const entry = resolveHeld(t, holding);
-            if (typeof entry === 'string') {
-              errors.push({ uid: t.uid, account_id: accountId, reason: entry });
-              continue;
-            }
-            // The UID we are about to move lives in holding, so holding's
-            // generation is the one that has to still match. Checked per
-            // target, before the move, so a mismatch costs nothing.
-            try {
-              await assertGenerationMatches(
-                imap,
-                holding,
-                entry.destination_uidvalidity,
-                { logger: this.logger, cache: generations, context: 'restore_messages' }
-              );
-            } catch (error) {
-              errors.push({
-                uid: t.uid,
-                account_id: accountId,
-                reason: error instanceof Error ? error.message : String(error),
-              });
-              continue;
-            }
-            pending.push({ uid: t.uid, entry });
-          }
-
-          let located: Array<number | null>;
-          try {
-            located = await locateMessages(
-              imap,
-              holding,
-              pending.map(({ entry }) => ({ uid: entry.destination_uid, messageId: entry.message_id }))
-            );
-          } catch (error) {
-            const reason = error instanceof Error ? error.message : String(error);
-            for (const { uid } of pending) errors.push({ uid, account_id: accountId, reason });
-            return;
-          }
-
-          for (const [index, { uid, entry }] of pending.entries()) {
-            const holdingUid = located[index];
-            if (holdingUid === null) {
-              errors.push({
-                uid,
-                account_id: accountId,
-                reason: 'not in holding, so there is nothing to restore',
-              });
-              continue;
-            }
-            if (!dryRun) {
-              let uidMap: Map<number, number>;
+        const accountTargets = targets.filter((t) => t.account_id === accountId);
+        // Everything up to the first move can throw, and the pool may run it
+        // again, so refusals are only published once it has got that far.
+        let reachedMoves = false;
+        try {
+          await this.pool.withConnection(accountId, async (imap) => {
+            const holding = await imap.getMailboxPath('holding');
+            // One snapshot per mailbox for the whole batch, shared by the
+            // generation guard and by the destination stamp written below.
+            const generations = new Map<string, number>();
+            const refused: typeof errors = [];
+            const pending: Array<{ uid: number; entry: HeldEntry }> = [];
+            for (const t of accountTargets) {
+              const entry = resolveHeld(t, holding);
+              if (typeof entry === 'string') {
+                refused.push({ uid: t.uid, account_id: accountId, reason: entry });
+                continue;
+              }
+              // The UID we are about to move lives in holding, so holding's
+              // generation is the one that has to still match. Checked per
+              // target, before the move, so a mismatch costs nothing.
               try {
-                ({ uidMap } = await imap.moveMessages([holdingUid], holding, entry.original_mailbox));
+                await assertGenerationMatches(
+                  imap,
+                  holding,
+                  entry.destination_uidvalidity,
+                  { logger: this.logger, cache: generations, context: 'restore_messages' }
+                );
               } catch (error) {
-                errors.push({
-                  uid,
+                if (isConnectionDropError(error)) throw error;
+                refused.push({
+                  uid: t.uid,
                   account_id: accountId,
                   reason: error instanceof Error ? error.message : String(error),
                 });
                 continue;
               }
-              this.echoToCache({
-                accountId,
-                mailbox: holding,
-                uids: [holdingUid],
-                effect: 'moved',
-                detail: { toMailbox: entry.original_mailbox },
-              });
-
-              // The restored UID lives in original_mailbox now, so that is the
-              // generation the rehold undo will have to match.
-              let landed = generations.get(entry.original_mailbox);
-              if (landed === undefined) {
-                try {
-                  landed = (await imap.mailboxSnapshot(entry.original_mailbox)).uidValidity;
-                  generations.set(entry.original_mailbox, landed);
-                } catch {
-                  landed = undefined;
-                }
-              }
-              restored.push({
-                account_id: accountId,
-                uid,
-                mailbox: entry.original_mailbox,
-                envelope_snapshot: {
-                  subject: '',
-                  from: '',
-                  original_mailbox: entry.original_mailbox,
-                  message_id: entry.message_id,
-                },
-                destination_uid: uidMap.get(holdingUid),
-                destination_uidvalidity: landed,
-              });
+              pending.push({ uid: t.uid, entry });
             }
-            moved.push({ uid, account_id: accountId, destination_mailbox: entry.original_mailbox });
-            reverses.add(entry.intent_id);
+
+            const located = await locateMessages(
+              imap,
+              holding,
+              pending.map(({ entry }) => ({ uid: entry.destination_uid, messageId: entry.message_id })),
+              this.heldUids(accountId)
+            );
+            errors.push(...refused);
+            reachedMoves = true;
+
+            for (const [index, { uid, entry }] of pending.entries()) {
+              const holdingUid = located[index];
+              if (holdingUid === null) {
+                errors.push({
+                  uid,
+                  account_id: accountId,
+                  reason: 'not in holding, so there is nothing to restore',
+                });
+                continue;
+              }
+              if (!dryRun) {
+                let uidMap: Map<number, number>;
+                try {
+                  ({ uidMap } = await imap.moveMessages([holdingUid], holding, entry.original_mailbox));
+                } catch (error) {
+                  errors.push({
+                    uid,
+                    account_id: accountId,
+                    reason: error instanceof Error ? error.message : String(error),
+                  });
+                  continue;
+                }
+                this.echoToCache({
+                  accountId,
+                  mailbox: holding,
+                  uids: [holdingUid],
+                  effect: 'moved',
+                  detail: { toMailbox: entry.original_mailbox },
+                });
+
+                // The restored UID lives in original_mailbox now, so that is the
+                // generation the rehold undo will have to match.
+                let landed = generations.get(entry.original_mailbox);
+                if (landed === undefined) {
+                  try {
+                    landed = (await imap.mailboxSnapshot(entry.original_mailbox)).uidValidity;
+                    generations.set(entry.original_mailbox, landed);
+                  } catch {
+                    landed = undefined;
+                  }
+                }
+                restored.push({
+                  account_id: accountId,
+                  uid,
+                  mailbox: entry.original_mailbox,
+                  envelope_snapshot: {
+                    subject: '',
+                    from: '',
+                    original_mailbox: entry.original_mailbox,
+                    message_id: entry.message_id,
+                  },
+                  destination_uid: uidMap.get(holdingUid),
+                  destination_uidvalidity: landed,
+                });
+              }
+              moved.push({ uid, account_id: accountId, destination_mailbox: entry.original_mailbox });
+              reverses.add(entry.intent_id);
+            }
+          });
+        } catch (error) {
+          // Nothing moved on this account, but others may have, and their
+          // results still have to be recorded.
+          if (reachedMoves) throw error;
+          const reason = error instanceof Error ? error.message : String(error);
+          for (const t of accountTargets) {
+            errors.push({ uid: t.uid, account_id: accountId, reason });
           }
-        });
+        }
       }
 
       if (!dryRun && reverses.size > 0) {
@@ -2215,6 +2265,11 @@ export class Executor {
       throw new Error(`Unknown account_ids in targets: ${unknown.join(', ')}`);
     }
 
+    // Outside the callback, because the pool runs it again after a dropped
+    // connection. A second run picks up at the next mailbox, and what the first
+    // run moved stays counted even if the account then fails outright.
+    const results = new Map<string, AccountHoldResult>();
+
     const fanResult = await fanOut({
       pool: this.pool,
       accountIds,
@@ -2226,21 +2281,16 @@ export class Executor {
           byMailbox.set(t.mailbox, list);
         }
 
-        const perMailbox: Array<{
-          mailbox: string;
-          message_count: number;
-          uids: number[];
-        }> = [];
-
-        const envelopeSnapshots: Array<{
-          account_id: string;
-          uid: number;
-          mailbox: string;
-          subject: string;
-          from: string;
-          /** Undefined on a dry run, or if the snapshot call failed. */
-          uidvalidity?: number;
-        }> = [];
+        const result: AccountHoldResult = results.get(accountId) ?? {
+          account_id: accountId,
+          per_mailbox: [],
+          envelopes: [],
+          errors: [],
+          failures: [],
+          finished: new Set(),
+        };
+        results.set(accountId, result);
+        const { errors, failures, finished } = result;
 
         const holding = await imap.getMailboxPath('holding');
 
@@ -2259,10 +2309,9 @@ export class Executor {
           }
         }
 
-        const errors: Array<{ uid: number; account_id: string; mailbox: string; reason: string }> = [];
-        const failures: string[] = [];
-
         for (const [mailbox, requested] of byMailbox) {
+          if (finished.has(mailbox)) continue;
+          let moveStarted = false;
           // One mailbox failing must not cost the others their result: what
           // they moved is real, and the caller has to hear about it.
           try {
@@ -2339,6 +2388,7 @@ export class Executor {
                 messages: uids.length,
               });
 
+              moveStarted = true;
               const { uidMap } = await imap.moveMessages(uids, mailbox, holding);
 
               // Confirm where they landed. A target still lacking a
@@ -2364,46 +2414,45 @@ export class Executor {
                 detail: { toMailbox: holding },
               });
             }
-            envelopeSnapshots.push(...snapshots);
-            perMailbox.push({ mailbox, message_count: uids.length, uids });
+            result.envelopes.push(...snapshots);
+            result.per_mailbox.push({ mailbox, message_count: uids.length, uids });
           } catch (error) {
+            // A drop before any mail moved is the pool's to handle: it
+            // reconnects and runs this again. Once a move has started, a
+            // second attempt can't tell what landed, so it stops here.
+            if (!moveStarted && isConnectionDropError(error)) throw error;
             const reason = error instanceof Error ? error.message : String(error);
             failures.push(reason);
             for (const uid of requested) {
               errors.push({ uid, account_id: accountId, mailbox, reason });
             }
           }
+          finished.add(mailbox);
         }
-
-        return {
-          account_id: accountId,
-          per_mailbox: perMailbox,
-          envelopes: envelopeSnapshots,
-          errors,
-          failures,
-          message_count: perMailbox.reduce((n, m) => n + m.message_count, 0),
-        };
       },
     });
 
-    const perAccountRaw = Object.values(fanResult.per_account);
+    const perAccountRaw = accountIds.flatMap((id) => results.get(id) ?? []);
 
     // Aggregate envelopes from all accounts (internal scaffolding — not exposed)
-    const allEnvelopes = perAccountRaw.flatMap((a: any) => a.envelopes ?? []);
-    const targetErrors = perAccountRaw.flatMap((a: any) => a.errors ?? []);
+    const allEnvelopes = perAccountRaw.flatMap((a) => a.envelopes);
+    const targetErrors = perAccountRaw.flatMap((a) => a.errors);
 
-    // Strip internal fields before building the public payload
-    const perAccount = perAccountRaw.map(
-      ({ envelopes: _envs, errors: _errs, failures: _fails, ...rest }: any) => rest
-    );
-    const totalMessages = perAccount.reduce(
-      (n: number, a: any) => n + a.message_count,
-      0
-    );
+    const perAccount = perAccountRaw
+      .filter((a) => a.per_mailbox.length > 0)
+      .map((a) => ({
+        account_id: a.account_id,
+        per_mailbox: a.per_mailbox,
+        message_count: a.per_mailbox.reduce((n, m) => n + m.message_count, 0),
+      }));
+    const totalMessages = perAccount.reduce((n, a) => n + a.message_count, 0);
 
     const accountErrors: Record<string, string> = { ...fanResult.errors };
-    for (const a of perAccountRaw as any[]) {
-      if (a.failures.length > 0) accountErrors[a.account_id] = a.failures.join('; ');
+    for (const a of perAccountRaw) {
+      if (a.failures.length === 0) continue;
+      accountErrors[a.account_id] = [...a.failures, accountErrors[a.account_id]]
+        .filter(Boolean)
+        .join('; ');
     }
 
     if (totalMessages === 0 && Object.keys(accountErrors).length > 0) {
@@ -2934,35 +2983,70 @@ export class Executor {
   }
 
   /**
-   * Run one undo step per account and return how many messages moved. Undo is
-   * checked per account, so one account can finish while another fails. When
-   * that happens the intent stays undoable: a second run skips what already
-   * moved, because those messages are no longer where the ledger left them.
+   * Run one undo step per account and return how many targets are back where
+   * they belong. Undo is checked per account, so one account can finish while
+   * another fails. When that happens the intent stays undoable, and a second
+   * run counts what the first one moved because it finds it at the destination.
    */
   private async undoPerAccount(
     targets: IntentTargetRow[],
-    step: (accountId: string, list: IntentTargetRow[], imap: ImapProvider) => Promise<number>
+    step: (
+      accountId: string,
+      list: IntentTargetRow[],
+      imap: ImapProvider,
+      done: (rows: IntentTargetRow[]) => void
+    ) => Promise<void>
   ): Promise<number> {
     const byAccount = new Map<string, IntentTargetRow[]>();
     for (const t of targets) {
       byAccount.set(t.account_id, [...(byAccount.get(t.account_id) ?? []), t]);
     }
 
-    let moved = 0;
+    // A set, not a count: the pool re-runs a step after a dropped connection,
+    // and a step that fails part way has still moved what it moved.
+    const finished = new Set<IntentTargetRow>();
+    const done = (rows: IntentTargetRow[]) => rows.forEach((row) => finished.add(row));
     const failures: string[] = [];
     for (const [accountId, list] of byAccount) {
       try {
-        moved += await this.pool.withConnection(accountId, (imap) => step(accountId, list, imap));
+        await this.pool.withConnection(accountId, (imap) => step(accountId, list, imap, done));
       } catch (error) {
         failures.push(`${accountId}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     if (failures.length > 0) {
       throw new Error(
-        `Undid ${moved} of ${targets.length} message(s). ${failures.join('; ')}. Run undo again to retry the rest.`
+        `Undid ${finished.size} of ${targets.length} message(s). ${failures.join('; ')}. Run undo again to retry the rest.`
       );
     }
-    return moved;
+    return finished.size;
+  }
+
+  /** Which of these targets have a message in this mailbox, by Message-Id. */
+  private async foundIn(
+    imap: ImapProvider,
+    mailbox: string,
+    rows: IntentTargetRow[]
+  ): Promise<IntentTargetRow[]> {
+    const ids = rows.flatMap((r) => r.envelope_snapshot?.message_id ?? []);
+    if (ids.length === 0) return [];
+    const found = await imap.uidsByMessageId(mailbox, ids);
+    return rows.filter((r) => found.has(r.envelope_snapshot?.message_id ?? ''));
+  }
+
+  /** UIDs in holding that a hold has on record, so no lookup can take them. */
+  private heldUids(accountId: string): Set<number> {
+    const rows = this.db
+      .prepare(
+        `SELECT it.destination_uid AS uid
+           FROM intent_targets it
+           JOIN intents i ON i.id = it.intent_id
+          WHERE it.account_id = ?
+            AND it.destination_uid IS NOT NULL
+            AND i.tool IN ('hold_messages', 'hold_by_sender')`
+      )
+      .all(accountId) as Array<{ uid: number }>;
+    return new Set(rows.map((r) => Number(r.uid)));
   }
 
   private async performUndo(
@@ -3001,7 +3085,7 @@ export class Executor {
     // and a target with no ledger row was gone before the move anyway.
     if (undoOp.reverseAction === 'move_back_to_inbox') {
       const targets = getIntentTargets(this.db, intent.id);
-      const moved = await this.undoPerAccount(targets, async (accountId, list, imap) => {
+      const finished = await this.undoPerAccount(targets, async (accountId, list, imap, done) => {
         const holding = await imap.getMailboxPath('holding');
         const inbox = await imap.getMailboxPath('inbox');
         // Every target is checked before this account moves anything.
@@ -3020,10 +3104,15 @@ export class Executor {
           list.map((t) => ({
             uid: t.destination_uid,
             messageId: t.envelope_snapshot?.message_id,
-          }))
+          })),
+          this.heldUids(accountId)
         );
+        // Already in the inbox counts: an earlier undo's move may have landed
+        // with its reply lost, or the message never left.
+        done(await this.foundIn(imap, inbox, list.filter((_, i) => located[i] === null)));
+
         const uids = located.filter((uid) => uid !== null);
-        if (uids.length === 0) return 0;
+        if (uids.length === 0) return;
         await imap.moveMessages(uids, holding, inbox);
         this.echoToCache({
           accountId,
@@ -3032,14 +3121,14 @@ export class Executor {
           effect: 'moved',
           detail: { toMailbox: inbox },
         });
-        return uids.length;
+        done(list.filter((_, i) => located[i] !== null));
       });
-      if (targets.length > 0 && moved === 0) {
+      if (finished === 0) {
         throw new Error(
-          `Nothing to undo: none of the ${targets.length} message(s) are in holding any more.`
+          `Nothing to undo: none of the ${targets.length} message(s) are in holding or the inbox.`
         );
       }
-      return { unconfirmed: targets.length - moved };
+      return { unconfirmed: targets.length - finished };
     }
 
     // restore_messages undo: re-hold each message.
@@ -3050,7 +3139,7 @@ export class Executor {
     if (undoOp.reverseAction === 'rehold_messages') {
       const targets = getIntentTargets(this.db, intent.id);
       const holds = getReversalLinks(this.db, intent.id).reverses;
-      const moved = await this.undoPerAccount(targets, async (accountId, list, imap) => {
+      const finished = await this.undoPerAccount(targets, async (accountId, list, imap, done) => {
         const holding = await imap.getMailboxPath('holding');
         // Checked up front for the same reason as the hold undo.
         const generations = new Map<string, number>();
@@ -3070,17 +3159,18 @@ export class Executor {
           holdingGeneration = undefined;
         }
 
-        let count = 0;
         for (const mailbox of new Set(list.map((t) => t.mailbox))) {
           const here = list.filter((t) => t.mailbox === mailbox);
+          // By UID only. Nothing reserves mail outside holding, so a lookup
+          // here could take a copy the user put in this folder.
           const located = await locateMessages(
             imap,
             mailbox,
-            here.map((t) => ({
-              uid: t.destination_uid,
-              messageId: t.envelope_snapshot?.message_id,
-            }))
+            here.map((t) => ({ uid: t.destination_uid }))
           );
+          // Already in holding counts, for the same reason as the hold undo.
+          done(await this.foundIn(imap, holding, here.filter((_, i) => located[i] === null)));
+
           for (const [index, t] of here.entries()) {
             const uid = located[index];
             if (uid === null) continue;
@@ -3092,7 +3182,7 @@ export class Executor {
               effect: 'moved',
               detail: { toMailbox: holding },
             });
-            count += 1;
+            done([t]);
             // Restoring again reads the hold's row, so it has to learn the
             // message's new UID in holding.
             const newUid = uidMap.get(uid);
@@ -3109,14 +3199,13 @@ export class Executor {
             }
           }
         }
-        return count;
       });
-      if (targets.length > 0 && moved === 0) {
+      if (finished === 0) {
         throw new Error(
-          `Nothing to undo: none of the ${targets.length} restored message(s) are where the restore put them.`
+          `Nothing to undo: none of the ${targets.length} restored message(s) are where the restore put them, or in holding.`
         );
       }
-      return { unconfirmed: targets.length - moved };
+      return { unconfirmed: targets.length - finished };
     }
 
     // draft_reply undo: delete the draft from the Drafts folder

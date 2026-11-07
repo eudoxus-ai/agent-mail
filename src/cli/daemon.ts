@@ -265,7 +265,7 @@ export async function daemonStatus(): Promise<void> {
             `  ${intent.id}  ${intent.tool}  started ${intent.created_at}\n` +
               `    ${targets.length} target(s) recorded, ${unconfirmed} unconfirmed` +
               (targets.length > 0
-                ? `\n    restore with: undo_intent ${intent.id}`
+                ? `\n    restore with: restore_messages, using the targets from get_intent ${intent.id}`
                 : '\n    no targets recorded — nothing to restore from')
           );
         }
