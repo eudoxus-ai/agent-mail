@@ -4,6 +4,8 @@ export interface EnvelopeSnapshot {
   subject: string;
   from: string;
   original_mailbox: string;
+  /** Finds the message when its UID was never confirmed or has gone stale. */
+  message_id?: string;
 }
 
 export interface IntentTargetInsert {
@@ -88,37 +90,26 @@ export function updateIntentTargetDestinations(
   intentId: string,
   accountId: string,
   uidMap: Map<number, number>,
-  mailbox?: string,
+  mailbox: string,
   /** UIDVALIDITY of the mailbox the messages landed in. */
   destinationUidvalidity?: number
 ): void {
   if (uidMap.size === 0) return;
 
-  // Scoped by mailbox when the caller knows it, for the same reason the
-  // conflict key includes it: the same UID in two mailboxes is two messages,
-  // and an unscoped update would stamp the wrong destination on one of them.
+  // Scoped by mailbox for the same reason the conflict key includes it: the
+  // same UID in two mailboxes is two messages.
   //
-  // COALESCE on the generation for the same reason the upsert uses it: the
-  // reconciliation pass that runs after every account finishes calls this
-  // without a generation, and must not erase the one recorded per mailbox.
-  const stmt = mailbox
-    ? db.prepare(
-        `UPDATE intent_targets
-            SET destination_uid = ?,
-                destination_uidvalidity = COALESCE(?, destination_uidvalidity)
-          WHERE intent_id = ? AND account_id = ? AND mailbox = ? AND uid = ?`
-      )
-    : db.prepare(
-        `UPDATE intent_targets
-            SET destination_uid = ?,
-                destination_uidvalidity = COALESCE(?, destination_uidvalidity)
-          WHERE intent_id = ? AND account_id = ? AND uid = ?`
-      );
+  // COALESCE on the generation so a caller without one can't erase it.
+  const stmt = db.prepare(
+    `UPDATE intent_targets
+        SET destination_uid = ?,
+            destination_uidvalidity = COALESCE(?, destination_uidvalidity)
+      WHERE intent_id = ? AND account_id = ? AND mailbox = ? AND uid = ?`
+  );
 
   const generation = destinationUidvalidity ?? null;
   for (const [sourceUid, destinationUid] of uidMap) {
-    if (mailbox) stmt.run(destinationUid, generation, intentId, accountId, mailbox, sourceUid);
-    else stmt.run(destinationUid, generation, intentId, accountId, sourceUid);
+    stmt.run(destinationUid, generation, intentId, accountId, mailbox, sourceUid);
   }
 }
 

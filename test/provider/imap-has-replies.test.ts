@@ -156,3 +156,28 @@ describe('a References header separated by commas', () => {
     expect([...ids]).toEqual(expect.arrayContaining(['<5@x>', '<root@x>', '<parent@x>']));
   });
 });
+
+describe('finding messages to undo or restore', () => {
+  it('reports which UIDs still exist', async () => {
+    const { imap, search } = provider({ search: () => [1, 3] });
+    await expect(imap.existingUids('Held', [1, 2, 3])).resolves.toEqual([1, 3]);
+    expect(search).toHaveBeenCalledWith({ uid: '1,2,3' }, { uid: true });
+  });
+
+  it('never reads a failed search as the UIDs being gone', async () => {
+    const { imap } = provider({ search: () => false });
+    await expect(imap.existingUids('Held', [1])).rejects.toThrow('Search failed in Held');
+  });
+
+  it('asks the server nothing when there is nothing to check', async () => {
+    const { imap, search } = provider({ search: () => [] });
+    await expect(imap.existingUids('Held', [])).resolves.toEqual([]);
+    expect(search).not.toHaveBeenCalled();
+  });
+
+  it('maps Message-Ids to UIDs, ignoring loose search hits', async () => {
+    const { imap } = provider({ search: () => [4, 5] });
+    const found = await imap.uidsByMessageId('Held', ['<4@x>']);
+    expect([...found]).toEqual([['<4@x>', [4]]]);
+  });
+});

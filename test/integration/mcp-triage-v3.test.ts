@@ -30,6 +30,9 @@ function makeFakePool(messages: Array<{
           if (role === 'inbox') return 'INBOX';
           return role;
         },
+        existingUids: async (_m: string, uids: number[]) => uids,
+        mailboxSnapshot: async () => ({ uidValidity: 1, uidNext: 1000, highestModseq: 1, exists: 0 }),
+        uidsByMessageId: async () => new Map<string, number[]>(),
         moveMessages: async (uids: number[], from: string, to: string) => {
           moveLog.push({ uids, from, to });
           // Remap: new UID = old UID + 1000

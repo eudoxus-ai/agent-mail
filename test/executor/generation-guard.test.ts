@@ -58,6 +58,8 @@ function fakeImap() {
         from: { address: 'alice@example.com', name: null },
       }))
     ),
+    existingUids: async (_m: string, uids: number[]) => uids,
+    uidsByMessageId: async () => new Map<string, number[]>(),
     moveMessages: vi.fn(async (uids: number[]) => ({
       uidMap: new Map(uids.map((u) => [u, u + 9000])),
     })),

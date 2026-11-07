@@ -78,7 +78,7 @@ describe('interrupted bulk hold', () => {
 
     expect(getUnconfirmedTargets(db, id)).toHaveLength(2);
 
-    updateIntentTargetDestinations(db, id, 'icloud', new Map([[101, 9001]]));
+    updateIntentTargetDestinations(db, id, 'icloud', new Map([[101, 9001]]), 'INBOX');
 
     // One confirmed, one still in flight when the process stopped.
     const unconfirmed = getUnconfirmedTargets(db, id);
@@ -96,7 +96,8 @@ describe('interrupted bulk hold', () => {
       new Map([
         [101, 9001],
         [102, 9002],
-      ])
+      ]),
+      'INBOX'
     );
 
     const rows = getIntentTargets(db, id);
@@ -116,7 +117,7 @@ describe('interrupted bulk hold', () => {
   it('does not lose a confirmed destination to a later re-insert', () => {
     const id = intentId();
     insertIntentTargets(db, id, targets);
-    updateIntentTargetDestinations(db, id, 'icloud', new Map([[101, 9001]]));
+    updateIntentTargetDestinations(db, id, 'icloud', new Map([[101, 9001]]), 'INBOX');
 
     // Re-inserting carries no destination_uid; it must not clobber the one we
     // already confirmed, or undo would move the wrong message back.
@@ -146,7 +147,7 @@ describe('interrupted bulk hold', () => {
 
     // UIDs are only unique per account; a cross-account update would corrupt
     // the other account's undo record.
-    updateIntentTargetDestinations(db, id, 'icloud', new Map([[101, 9001]]));
+    updateIntentTargetDestinations(db, id, 'icloud', new Map([[101, 9001]]), 'INBOX');
 
     const gmail = getIntentTargets(db, id).find((r) => r.account_id === 'gmail')!;
     expect(gmail.destination_uid).toBeNull();
