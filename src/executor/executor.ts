@@ -238,6 +238,7 @@ const PROGRESS_STALE_AFTER_MS = 10 * 60_000;
 /** The most of a message body `read_thread` hands to the agent. */
 const READ_THREAD_MAX_BODY_CHARS = 20_000;
 const LIST_SENDERS_DEFAULT_LIMIT = 200;
+const SKIPPED_REPLIED_MAX_TARGETS = 50;
 const GET_INTENT_DEFAULT_TARGETS = 50;
 
 /** How much of an account a capped scan actually reached. */
@@ -936,21 +937,45 @@ export class Executor {
     mailbox: string,
     uids: number[]
   ): Promise<boolean> {
+    return (await this.repliedUids(accountId, mailbox, uids)).size > 0;
+  }
+
+  /**
+   * Which of these messages belong to a conversation worth leaving alone: a
+   * thread someone replied to, or one the user wrote into. That covers more than
+   * messages with a direct reply. An answer to mail the user sent has no reply of
+   * its own, and it is the live end of the thread.
+   */
+  async repliedUids(
+    accountId: string,
+    mailbox: string,
+    uids: number[]
+  ): Promise<Set<number>> {
     return this.pool.withConnection(accountId, async (imap) => {
       // Envelopes rather than full messages: the gate needs only Message-Ids,
       // and a UID that has since gone simply isn't returned. It can't be moved
       // either, so it has no thread to protect and must not fail the rest.
       const selected = await imap.fetchEnvelopes(mailbox, uids);
       const selectedIds = selected.map((message) => message.messageId).filter(Boolean);
-      if (await imap.hasRepliesTo(mailbox, selectedIds, uids)) return true;
+      const thread = await imap.replyThreadIds(mailbox, selectedIds, uids);
 
-      // The user's own replies live in Sent, not beside the message they
-      // answer, and a thread they replied to is the one most worth protecting.
+      const ancestryOf = (message: (typeof selected)[number]) =>
+        [message.inReplyTo, ...message.references].filter((id): id is string => Boolean(id));
+      const ancestors = [...new Set(selected.flatMap(ancestryOf))];
+
+      // The user's own mail lives in Sent, not beside what it answers, and a
+      // thread they took part in is the one most worth protecting. That runs
+      // both ways: their reply to a selected message, and a selected message
+      // that answers something they sent.
       for (const sent of await imap.sentMailboxes()) {
         if (sent === mailbox) continue;
-        if (await imap.hasRepliesTo(sent, selectedIds, [])) return true;
+        for (const id of await imap.replyThreadIds(sent, selectedIds, [])) thread.add(id);
+        for (const id of await imap.messageIdsIn(sent, ancestors)) thread.add(id);
       }
-      return false;
+
+      const inThread = (message: (typeof selected)[number]) =>
+        [message.messageId, ...ancestryOf(message)].some((id) => thread.has(id));
+      return new Set(selected.filter(inThread).map((message) => message.uid));
     });
   }
 
@@ -1950,6 +1975,9 @@ export class Executor {
         targets,
         targets_total: allTargets.length,
       };
+      // A queued action's caller only ever polls here, so this is the one
+      // place it can learn why the action failed or was blocked.
+      if (row.error_detail) payload.error_detail = row.error_detail;
       if (links.reverses.length > 0) payload.reverses_intent_id = links.reverses;
       if (links.reversed_by) payload.reversed_by_intent_id = links.reversed_by;
 
@@ -2440,6 +2468,7 @@ export class Executor {
       per_account_errors?: Record<string, string>;
       warning?: string;
       cache_cross_check?: unknown;
+      skipped_replied?: number;
     }> = [];
 
     for (const [done, from] of senders.entries()) {
@@ -2455,6 +2484,7 @@ export class Executor {
           ...(result.per_account_errors ? { per_account_errors: result.per_account_errors } : {}),
           ...(result.warning ? { warning: result.warning } : {}),
           ...(result.cache_cross_check ? { cache_cross_check: result.cache_cross_check } : {}),
+          ...(result.skipped_replied ? { skipped_replied: result.skipped_replied.count } : {}),
         });
       } catch (error) {
         if (error instanceof HoldBySenderBlockedError) {
@@ -2613,17 +2643,18 @@ export class Executor {
     // Policy's `when_thread_has_replies: approval_required` override can't be
     // evaluated by the middleware for hold_by_sender because the UID list
     // hasn't been expanded yet. Enforce the gate here, after expansion,
-    // before any move. Fail-closed with a structured error so Claude Chat
-    // (or any caller) can relay a specific next-step hint. We also run this
-    // check on dry_run to surface the warning in previews.
+    // before any move. This tool cannot route a message to approval, so a
+    // replied thread stays where it is and the rest of the sweep goes ahead.
+    // It runs on dry_run too, so a preview shows the same split.
+    let skippedReplied: Target[] = [];
     if (expandedTargets.length > 0) {
       updateIntentProgress(this.db, intent.id, 'checking_replies', {
         matched: expandedTargets.length,
         ...(batch ? { batch } : {}),
       });
       // Group by (account_id, mailbox). hold_by_sender only searches a single
-      // mailbox per call today, but grouping matches threadHasReplies's
-      // expected per-mailbox shape and future-proofs multi-mailbox cases.
+      // mailbox per call today, but grouping matches repliedUids's expected
+      // per-mailbox shape and future-proofs multi-mailbox cases.
       const groups = new Map<string, { accountId: string; mailbox: string; uids: number[] }>();
       for (const t of expandedTargets) {
         const mbx = t.mailbox ?? 'INBOX';
@@ -2632,25 +2663,26 @@ export class Executor {
         g.uids.push(t.uid);
         groups.set(key, g);
       }
-      let repliedGroupCount = 0;
+      const replied = new Set<string>();
       for (const g of groups.values()) {
         // eslint-disable-next-line no-await-in-loop
-        const has = await this.threadHasReplies(g.accountId, g.mailbox, g.uids);
-        if (has) repliedGroupCount += 1;
+        for (const uid of await this.repliedUids(g.accountId, g.mailbox, g.uids)) {
+          replied.add(`${g.accountId}\u0000${g.mailbox}\u0000${uid}`);
+        }
       }
-      if (repliedGroupCount > 0) {
+      skippedReplied = expandedTargets.filter((t) =>
+        replied.has(`${t.account_id}\u0000${t.mailbox ?? 'INBOX'}\u0000${t.uid}`)
+      );
+      if (skippedReplied.length === expandedTargets.length) {
         const errorPayload = {
           error: true,
           code: 'replies_present',
           message:
-            `hold_by_sender matched ${expandedTargets.length} message(s) ` +
-            `in ${repliedGroupCount} replied thread group(s). Policy requires ` +
-            `approval for threads with replies, which this bulk tool cannot route. ` +
-            `Re-run with specific UIDs via hold_messages (which gates replied ` +
-            `threads through approval), or inspect the expanded UID list via ` +
-            `dry_run: true first.`,
+            `hold_by_sender matched ${expandedTargets.length} message(s), all in threads ` +
+            `with replies. Policy requires approval for those, which this bulk tool cannot ` +
+            `route, so nothing was held. Use hold_messages with specific UIDs, which gates ` +
+            `replied threads through approval.`,
           matched_count: expandedTargets.length,
-          replied_thread_count: repliedGroupCount,
           hint: 'Use dry_run: true to preview, then hand-select UIDs via hold_messages.',
         };
         // Throw a sentinel so `executeImmediate` marks the intent `failed` with
@@ -2659,8 +2691,8 @@ export class Executor {
         // the caller: `executeImmediate`'s catch swallows this error and
         // returns `payload` as the result text.
         const summary =
-          `Blocked: ${repliedGroupCount} matched thread group(s) have replies. ` +
-          `Re-run with specific UIDs via hold_messages, or preview with dry_run: true.`;
+          `Blocked: all ${expandedTargets.length} matched message(s) are in threads with replies. ` +
+          `Hold specific UIDs via hold_messages.`;
         throw new HoldBySenderBlockedError(errorPayload, summary);
       }
     }
@@ -2808,13 +2840,15 @@ export class Executor {
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
 
-    const result = await this.holdTargets(intent, expandedTargets, {
-      dryRun,
-      includeSummary,
-    });
+    const skipped = new Set(skippedReplied);
+    const result = await this.holdTargets(
+      intent,
+      expandedTargets.filter((t) => !skipped.has(t)),
+      { dryRun, includeSummary }
+    );
 
     const hasSearchErrors = Object.keys(searchResult.errors).length > 0;
-    if (!hasSearchErrors && !crossCheck) return result;
+    if (!hasSearchErrors && !crossCheck && skippedReplied.length === 0) return result;
     const searchName = from ? 'FROM search' : 'List-Id search';
 
     const parsed = JSON.parse(result[0].text);
@@ -2845,12 +2879,22 @@ export class Executor {
     if (cacheOnlyAccounts.length > 0) {
       parsed.warning = `${parsed.warning ?? ''}${cacheOnlyNote()}`.trim();
     }
+    if (skippedReplied.length > 0) {
+      parsed.skipped_replied = {
+        count: skippedReplied.length,
+        targets: skippedReplied.slice(0, SKIPPED_REPLIED_MAX_TARGETS),
+        note:
+          'These are in threads with replies, or threads you wrote into, so they were left ' +
+          'where they are. To hold one anyway, use hold_messages, which asks for approval.',
+      };
+    }
     updateIntentProgress(this.db, intent.id, dryRun ? 'previewed' : 'held', {
       total_messages: parsed.total_messages,
       ...(parsed.errors ? { errors: parsed.errors } : {}),
       ...(parsed.per_account_errors ? { per_account_errors: parsed.per_account_errors } : {}),
       ...(parsed.warning ? { warning: parsed.warning } : {}),
       ...(crossCheck ? { cache_cross_check: crossCheck } : {}),
+      ...(parsed.skipped_replied ? { skipped_replied: parsed.skipped_replied } : {}),
     });
     return [{ type: 'text', text: JSON.stringify(parsed, null, 2) }];
   }

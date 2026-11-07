@@ -17,7 +17,7 @@ const inputSchema = z.object({
     .optional()
     .describe(
       'Sender email address — prefer the complete address, or a prefix of it. Matching is performed by the IMAP server via SEARCH FROM, not locally, and servers disagree about what that means. Dovecot substring-matches the whole From header, so any fragment works. iCloud matches only within roughly the first 29 characters of the address, so a bare domain can return NOTHING on a sender whose local part is long while the full address returns everything: from="mattressfirm@email.mattressfirm.com" matched 23 messages, from="email.mattressfirm.com" matched 0, same sender and mailbox. A prefix of the address matches at any length. If a sweep returns no_match but you can see messages from the sender, retry with the FULL address — retrying with a shorter fragment, or with the domain alone, is the least likely thing to work.' +
-        ` Pass a list to sweep up to ${MAX_SENDERS} senders as one intent, which reports an outcome per sender and needs \`account_ids\`. A sender whose threads have replies is reported as blocked and does not stop the others.`
+        ` Pass a list to sweep up to ${MAX_SENDERS} senders as one intent, which reports an outcome per sender and needs \`account_ids\`. A message in a thread with replies, or in a thread you wrote into, is left where it is and listed under \`skipped_replied\` while the rest are held. A sender with nothing else to hold is reported as blocked and does not stop the others.`
     ),
   list_id: z
     .string()

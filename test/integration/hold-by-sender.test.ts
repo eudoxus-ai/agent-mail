@@ -137,7 +137,7 @@ describe('hold_by_sender integration', () => {
     });
     // Default: no replied threads so the executor-side replies gate lets
     // hold_by_sender proceed. Individual tests override as needed.
-    vi.spyOn(executor, 'threadHasReplies').mockResolvedValue(false);
+    vi.spyOn(executor, 'repliedUids').mockResolvedValue(new Set());
   });
 
   it('holds all 5 promoter messages, leaves friend untouched, records undo', async () => {

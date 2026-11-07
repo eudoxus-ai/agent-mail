@@ -32,6 +32,11 @@ function fakeImap(opts: {
   hasReplies?: (ids: string[]) => boolean;
   repliesIn?: (mailbox: string, ids: string[]) => boolean;
   sent?: string[];
+  /** Message-Ids of a replied thread, when only part of a sweep is in it. */
+  thread?: string[];
+  references?: Record<number, string[]>;
+  /** Message-Ids of mail the user sent. */
+  inSent?: string[];
 } = {}) {
   const missing = new Set(opts.missing ?? []);
   return {
@@ -54,14 +59,20 @@ function fakeImap(opts: {
           messageId: `<${uid}@x>`,
           subject: `Subject ${uid}`,
           from: { address: 'a@example.com', name: null },
+          references: opts.references?.[uid] ?? [],
         }))
     ),
     moveMessages: vi.fn(async (uids: number[]) => ({
       uidMap: new Map(uids.map((u) => [u, u + 9000])),
     })),
-    hasRepliesTo: vi.fn(
-      async (mailbox: string, ids: string[]) =>
-        opts.repliesIn?.(mailbox, ids) ?? opts.hasReplies?.(ids) ?? false
+    replyThreadIds: vi.fn(async (mailbox: string, ids: string[]) => {
+      if (opts.thread) return new Set(opts.thread);
+      const replied = opts.repliesIn?.(mailbox, ids) ?? opts.hasReplies?.(ids) ?? false;
+      return new Set(replied ? ids : []);
+    }),
+    messageIdsIn: vi.fn(
+      async (_m: string, ids: string[]) =>
+        new Set(ids.filter((id) => opts.inSent?.includes(id)))
     ),
     sentMailboxes: vi.fn(async () => opts.sent ?? ['Sent']),
   };
@@ -387,14 +398,14 @@ describe('replies gate and Sent', () => {
   it('does not search the sweep mailbox twice when sweeping Sent', async () => {
     const imap = fakeImap({ sent: ['Sent'] });
     await makeExecutor(imap).threadHasReplies('a', 'Sent', [1]);
-    expect(imap.hasRepliesTo).toHaveBeenCalledTimes(1);
+    expect(imap.replyThreadIds).toHaveBeenCalledTimes(1);
   });
 
   it('excludes the selected UIDs only in their own mailbox', async () => {
     const imap = fakeImap({});
     await makeExecutor(imap).threadHasReplies('a', 'INBOX', [1]);
-    expect(imap.hasRepliesTo).toHaveBeenCalledWith('INBOX', ['<1@x>'], [1]);
-    expect(imap.hasRepliesTo).toHaveBeenCalledWith('Sent', ['<1@x>'], []);
+    expect(imap.replyThreadIds).toHaveBeenCalledWith('INBOX', ['<1@x>'], [1]);
+    expect(imap.replyThreadIds).toHaveBeenCalledWith('Sent', ['<1@x>'], []);
   });
 
   it('fails closed when Sent cannot be searched', async () => {
@@ -568,5 +579,127 @@ describe('what a queued sweep leaves behind', () => {
       risk: 'none',
     });
     expect(JSON.parse(result[0].text).outcome.note).toContain('refused the List-Id search');
+  });
+});
+
+describe('a sweep where only some threads have replies', () => {
+  const moved = (imap: ReturnType<typeof fakeImap>) =>
+    imap.moveMessages.mock.calls.flatMap((c: any) => c[0]);
+  const sweep = { from: 'a@example.com', account_ids: ['one'] };
+
+  it('holds the rest and reports what it left', async () => {
+    const imap = fakeImap({ matches: () => [1, 2, 3], thread: ['<1@x>'] });
+    const { payload } = await run(imap, 'hold_by_sender', sweep);
+
+    expect(moved(imap)).toEqual([2, 3]);
+    expect(payload.total_messages).toBe(2);
+    expect(payload.skipped_replied.count).toBe(1);
+    expect(payload.skipped_replied.targets).toEqual([target(1)]);
+  });
+
+  it('leaves a later message in the same thread, which has no reply of its own', async () => {
+    const imap = fakeImap({
+      matches: () => [1, 2, 3],
+      thread: ['<1@x>', '<your-reply@x>'],
+      references: { 3: ['<1@x>', '<your-reply@x>'] },
+    });
+    const { payload } = await run(imap, 'hold_by_sender', sweep);
+
+    expect(moved(imap)).toEqual([2]);
+    expect(payload.skipped_replied.count).toBe(2);
+  });
+
+  it('leaves a reply to something you sent, even with no reply of its own', async () => {
+    const imap = fakeImap({
+      matches: () => [1, 2],
+      references: { 1: ['<yours@x>'] },
+      inSent: ['<yours@x>'],
+    });
+    const { payload } = await run(imap, 'hold_by_sender', sweep);
+
+    expect(moved(imap)).toEqual([2]);
+    expect(payload.skipped_replied.count).toBe(1);
+  });
+
+  it('holds a reply to a thread you were never in', async () => {
+    const imap = fakeImap({ matches: () => [1], references: { 1: ['<theirs@x>'] } });
+    await run(imap, 'hold_by_sender', sweep);
+    expect(moved(imap)).toEqual([1]);
+  });
+
+  it('looks up only ancestors, once each, and nothing for mail with none', async () => {
+    const imap = fakeImap({
+      matches: () => [1, 2, 3],
+      references: { 1: ['<a@x>', '<b@x>'], 2: ['<b@x>'] },
+    });
+    await run(imap, 'hold_by_sender', sweep);
+    expect(imap.messageIdsIn).toHaveBeenCalledWith('Sent', ['<a@x>', '<b@x>']);
+  });
+
+  it('holds nothing when Sent cannot be checked for ancestors', async () => {
+    const imap = fakeImap({ matches: () => [1, 2], references: { 1: ['<a@x>'] } });
+    imap.messageIdsIn.mockRejectedValue(new Error('Reply search failed in Sent'));
+    await expect(run(imap, 'hold_by_sender', sweep)).rejects.toThrow('Reply search failed in Sent');
+    expect(imap.moveMessages).not.toHaveBeenCalled();
+  });
+
+  it('counts the search for threads across every sent folder', async () => {
+    const imap = fakeImap({ matches: () => [1, 2], sent: ['Sent', 'Sent Messages'] });
+    imap.replyThreadIds.mockImplementation(async (mailbox: string) =>
+      new Set(mailbox === 'Sent Messages' ? ['<2@x>'] : [])
+    );
+    await run(imap, 'hold_by_sender', sweep);
+    expect(moved(imap)).toEqual([1]);
+  });
+
+  it('previews the same split on a dry run without moving anything', async () => {
+    const imap = fakeImap({ matches: () => [1, 2], thread: ['<1@x>'] });
+    const { payload } = await run(imap, 'hold_by_sender', { ...sweep, dry_run: true });
+
+    expect(imap.moveMessages).not.toHaveBeenCalled();
+    expect(payload.total_messages).toBe(1);
+    expect(payload.skipped_replied.count).toBe(1);
+  });
+
+  it('records what it left for a polling caller', async () => {
+    const imap = fakeImap({ matches: () => [1, 2], thread: ['<1@x>'] });
+    const { intent } = await run(imap, 'hold_by_sender', sweep);
+
+    const progress = getIntentProgress(db, intent.id);
+    expect(progress?.phase).toBe('held');
+    expect(progress?.detail?.skipped_replied).toMatchObject({ count: 1 });
+  });
+
+  it('is not recorded as a target, so undo cannot touch it', async () => {
+    const imap = fakeImap({ matches: () => [1, 2], thread: ['<1@x>'] });
+    const { intent } = await run(imap, 'hold_by_sender', sweep);
+    expect(getIntentTargets(db, intent.id).map((t) => t.uid)).toEqual([2]);
+  });
+
+  it('reports the count per sender in a batch', async () => {
+    const imap = fakeImap({ matches: () => [1, 2], thread: ['<1@x>'] });
+    const { payload } = await run(imap, 'hold_by_sender', {
+      from: ['a@x.com', 'b@x.com'],
+      account_ids: ['one'],
+    });
+    expect(payload.senders[0]).toMatchObject({ status: 'held', messages: 1, skipped_replied: 1 });
+  });
+
+  it('caps the list of targets but not the count', async () => {
+    const uids = Array.from({ length: 80 }, (_, i) => i + 1);
+    const imap = fakeImap({
+      matches: () => [...uids, 500],
+      thread: uids.map((uid) => `<${uid}@x>`),
+    });
+    const { payload } = await run(imap, 'hold_by_sender', sweep);
+    expect(payload.skipped_replied.count).toBe(80);
+    expect(payload.skipped_replied.targets).toHaveLength(50);
+  });
+
+  it('holds nothing when the reply search fails', async () => {
+    const imap = fakeImap({ matches: () => [1, 2] });
+    imap.replyThreadIds.mockRejectedValue(new Error('Reply search failed in Sent'));
+    await expect(run(imap, 'hold_by_sender', sweep)).rejects.toThrow('Reply search failed in Sent');
+    expect(imap.moveMessages).not.toHaveBeenCalled();
   });
 });

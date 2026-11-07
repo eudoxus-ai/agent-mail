@@ -110,12 +110,14 @@ function fakeImap(imapUids: number[], generation = GENERATION) {
         uid,
         subject: `Subject ${uid}`,
         from: { address: 'store@example.com', name: null },
+        references: [],
       }))
     ),
     moveMessages: vi.fn(async (uids: number[]) => ({
       uidMap: new Map(uids.map((u) => [u, u + 9000])),
     })),
-    hasRepliesTo: vi.fn(async () => false),
+    replyThreadIds: vi.fn(async () => new Set<string>()),
+    messageIdsIn: vi.fn(async () => new Set<string>()),
     sentMailboxes: vi.fn(async () => []),
   };
 }

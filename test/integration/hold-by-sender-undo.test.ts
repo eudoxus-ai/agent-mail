@@ -132,7 +132,7 @@ describe('hold_by_sender undo (regression)', () => {
       logger,
     });
     // No replied threads — let the hold proceed so we can test undo.
-    vi.spyOn(executor, 'threadHasReplies').mockResolvedValue(false);
+    vi.spyOn(executor, 'repliedUids').mockResolvedValue(new Set());
   });
 
   it('undo_intent reverses a hold_by_sender, moving all messages back to inbox', async () => {

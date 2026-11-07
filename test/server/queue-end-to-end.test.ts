@@ -67,6 +67,7 @@ function fakeImap(onMove?: () => void) {
         uid,
         subject: `Subject ${uid}`,
         from: { address: 'alice@example.com', name: null },
+        references: [],
       }))
     ),
     moveMessages: vi.fn(async (uids: number[]) => {
@@ -75,7 +76,8 @@ function fakeImap(onMove?: () => void) {
     }),
     // The middleware checks thread context before applying policy to a
     // hold_messages call, which happens before the queue is ever reached.
-    hasRepliesTo: vi.fn(async () => false),
+    replyThreadIds: vi.fn(async () => new Set<string>()),
+    messageIdsIn: vi.fn(async () => new Set<string>()),
     sentMailboxes: vi.fn(async () => []),
   };
 }
