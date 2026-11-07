@@ -57,15 +57,17 @@ describe('ImapProvider.listMessageUids', () => {
     expect(lock.release).toHaveBeenCalled();
   });
 
-  it('returns empty array when search returns false', async () => {
+  it('throws when the search fails, so a folder is never read as empty', async () => {
     const provider = makeProvider();
     const lock = { release: vi.fn() };
     (provider as any).client = {
       async getMailboxLock() { return lock; },
       async search() { return false; },
     };
-    const uids = await provider.listMessageUids('some-mailbox');
-    expect(uids).toEqual([]);
+    await expect(provider.listMessageUids('some-mailbox')).rejects.toThrow(
+      'Could not list messages in some-mailbox'
+    );
+    expect(lock.release).toHaveBeenCalled();
   });
 });
 
@@ -185,10 +187,27 @@ describe('ImapProvider.moveMessages', () => {
   function withMove(result: unknown) {
     const provider = makeProvider();
     (provider as any).client = {
+      capabilities: new Map([['MOVE', true]]),
       getMailboxLock: async () => ({ release: vi.fn() }),
       messageMove: async () => result,
     };
     return provider;
+  }
+
+  /** A server without MOVE, which is what iCloud reports. */
+  function withoutMove(copied: unknown, deleted: unknown = true) {
+    const provider = makeProvider();
+    const messageCopy = vi.fn(async () => copied);
+    const messageDelete = vi.fn(async () => deleted);
+    const messageMove = vi.fn();
+    (provider as any).client = {
+      capabilities: new Map(),
+      getMailboxLock: async () => ({ release: vi.fn() }),
+      messageCopy,
+      messageDelete,
+      messageMove,
+    };
+    return { provider, messageCopy, messageDelete, messageMove };
   }
 
   it('throws when the server refuses the move', async () => {
@@ -200,6 +219,53 @@ describe('ImapProvider.moveMessages', () => {
   it('returns the mapping the server gave', async () => {
     const uidMap = new Map([[1, 77]]);
     await expect(withMove({ uidMap }).moveMessages([1], 'INBOX', 'Held')).resolves.toEqual({ uidMap });
+  });
+
+  it('does not delete the source when a copy is refused', async () => {
+    const { provider, messageDelete } = withoutMove(false);
+    await expect(provider.moveMessages([1, 2], 'INBOX', 'Held')).rejects.toThrow(
+      'Could not move 2 message(s) from INBOX to Held'
+    );
+    expect(messageDelete).not.toHaveBeenCalled();
+  });
+
+  it('never uses the library move, whose fallback deletes regardless', async () => {
+    const { provider, messageMove } = withoutMove({ uidMap: new Map([[1, 77]]) });
+    await provider.moveMessages([1], 'INBOX', 'Held');
+    expect(messageMove).not.toHaveBeenCalled();
+  });
+
+  it('deletes after a good copy and returns the mapping', async () => {
+    const uidMap = new Map([[1, 77], [2, 78]]);
+    const { provider, messageDelete } = withoutMove({ uidMap });
+    await expect(provider.moveMessages([1, 2], 'INBOX', 'Held')).resolves.toEqual({ uidMap });
+    expect(messageDelete).toHaveBeenCalledWith('1,2', { uid: true });
+  });
+
+  it('deletes only what the server says it copied', async () => {
+    const { provider, messageDelete } = withoutMove({ uidMap: new Map([[2, 78]]) });
+    await provider.moveMessages([1, 2], 'INBOX', 'Held');
+    expect(messageDelete).toHaveBeenCalledWith('2', { uid: true });
+  });
+
+  it('deletes nothing when the server copied nothing', async () => {
+    const { provider, messageDelete } = withoutMove({ uidMap: new Map() });
+    await provider.moveMessages([1], 'INBOX', 'Held');
+    expect(messageDelete).not.toHaveBeenCalled();
+  });
+
+  it('copes with a server that gives no mapping for a good copy', async () => {
+    const { provider, messageDelete } = withoutMove({ path: 'INBOX' });
+    const { uidMap } = await provider.moveMessages([1, 2], 'INBOX', 'Held');
+    expect(uidMap.size).toBe(0);
+    expect(messageDelete).toHaveBeenCalledWith('1,2', { uid: true });
+  });
+
+  it('says so when the copy landed but the source could not be removed', async () => {
+    const { provider } = withoutMove({ uidMap: new Map([[1, 77]]) }, false);
+    await expect(provider.moveMessages([1], 'INBOX', 'Held')).rejects.toThrow(
+      'now in both INBOX and Held'
+    );
   });
 
   it('leaves the mapping empty when the server gave none', async () => {

@@ -651,7 +651,9 @@ export class ImapProvider {
   ): Promise<{ uidMap: Map<number, number> }> {
     const lock = await this.client.getMailboxLock(fromMailbox);
     try {
-      const result = await this.client.messageMove(uids.join(','), toMailbox, { uid: true });
+      const result = this.client.capabilities.has('MOVE')
+        ? await this.client.messageMove(uids.join(','), toMailbox, { uid: true })
+        : await this.copyThenDelete(uids, fromMailbox, toMailbox);
       // imapflow reports a failed move as `false`, not by throwing.
       if (!result) {
         throw new Error(`Could not move ${uids.length} message(s) from ${fromMailbox} to ${toMailbox}`);
@@ -662,6 +664,27 @@ export class ImapProvider {
     } finally {
       lock.release();
     }
+  }
+
+  /**
+   * MOVE for a server without it, which includes iCloud. imapflow has its own
+   * fallback, but that deletes the source without checking the copy worked,
+   * so one refused COPY would lose the mail. Call with the mailbox lock held.
+   */
+  private async copyThenDelete(uids: number[], fromMailbox: string, toMailbox: string) {
+    const copied = await this.client.messageCopy(uids.join(','), toMailbox, { uid: true });
+    if (!copied) return false;
+
+    const sources = copied.uidMap instanceof Map ? [...copied.uidMap.keys()] : uids;
+    if (sources.length === 0) return copied;
+
+    const deleted = await this.client.messageDelete(sources.join(','), { uid: true });
+    if (!deleted) {
+      throw new Error(
+        `Copied ${sources.length} message(s) but could not remove them, so they are now in both ${fromMailbox} and ${toMailbox}`
+      );
+    }
+    return copied;
   }
 
   async setFlags(
@@ -722,7 +745,12 @@ export class ImapProvider {
     const lock = await this.client.getMailboxLock(mailbox);
     try {
       const result = await this.client.search({ all: true }, { uid: true });
-      return Array.isArray(result) ? result : [];
+      // Callers act on the answer: folder migration deletes a folder it reads
+      // as empty, so a failed search must not look like one.
+      if (!Array.isArray(result)) {
+        throw new Error(`Could not list messages in ${mailbox}`);
+      }
+      return result;
     } finally {
       lock.release();
     }
