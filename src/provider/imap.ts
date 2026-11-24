@@ -58,6 +58,19 @@ function readPreview(msg: {
   return { headers: headerBytes.toString('utf-8'), snippet: extractSnippet(source) };
 }
 
+/** One message as `search` returns it. */
+export interface SearchHit {
+  uid: number;
+  envelope: { message_id: string; subject: string; from: Participant; date: string };
+  to: Participant[];
+  cc: Participant[];
+  in_reply_to: string | null;
+  snippet: string;
+  flags: string[];
+  list_id: string | null;
+  list_unsubscribe: string | null;
+}
+
 export interface ImapProviderOptions {
   /** Called when the connection dies asynchronously, outside any awaited call. */
   onError?: (error: Error) => void;
@@ -224,14 +237,7 @@ export class ImapProvider {
     mailbox: string,
     criteria: SearchCriteria,
     limit: number = 20
-  ): Promise<Array<{
-    uid: number;
-    envelope: { message_id: string; subject: string; from: Participant; date: string };
-    snippet: string;
-    flags: string[];
-    list_id: string | null;
-    list_unsubscribe: string | null;
-  }>> {
+  ): Promise<SearchHit[]> {
     const lock = await this.client.getMailboxLock(mailbox);
     try {
       const searchQuery: Record<string, unknown> = {};
@@ -267,14 +273,7 @@ export class ImapProvider {
       if (uidsToFetch.length === 0) return [];
 
       // Phase 2: hydrate envelopes + preview headers for the selected UIDs.
-      const results: Array<{
-        uid: number;
-        envelope: { message_id: string; subject: string; from: Participant; date: string };
-        snippet: string;
-        flags: string[];
-        list_id: string | null;
-        list_unsubscribe: string | null;
-      }> = [];
+      const results: SearchHit[] = [];
 
       for await (const msg of this.client.fetch(
         uidsToFetch.join(','),
@@ -296,6 +295,9 @@ export class ImapProvider {
             from: toParticipant(msg.envelope?.from?.[0]),
             date: msg.envelope?.date?.toISOString() ?? new Date().toISOString(),
           },
+          to: toParticipants(msg.envelope?.to),
+          cc: toParticipants(msg.envelope?.cc),
+          in_reply_to: parseMessageIds(extractHeader(headers, 'In-Reply-To'))[0] ?? null,
           snippet,
           flags: Array.from(msg.flags ?? []),
           list_id: listId,

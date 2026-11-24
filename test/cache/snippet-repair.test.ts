@@ -69,7 +69,7 @@ describe('snippet repair migration', () => {
   }
 
   function snippets(db: Database): Record<number, string> {
-    const rows = searchCache(db, { accountIds: ['work'], mailbox: 'INBOX', limit: 10 });
+    const rows = searchCache(db, { mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }], limit: 10 });
     return Object.fromEntries(rows.map((r) => [r.uid, r.snippet]));
   }
 

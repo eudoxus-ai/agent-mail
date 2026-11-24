@@ -16,3 +16,12 @@ export function isSentMailbox(mailbox: {
   const segments = mailbox.path.split(mailbox.delimiter ?? '/');
   return SENT_NAME.test(segments[segments.length - 1] ?? '');
 }
+
+/**
+ * The same test for a mailbox known only by name, as the cache knows them:
+ * it keeps no special-use flags and no delimiter, so both common delimiters
+ * are tried.
+ */
+export function isSentMailboxName(path: string): boolean {
+  return isSentMailbox({ path, delimiter: '/' }) || isSentMailbox({ path, delimiter: '.' });
+}

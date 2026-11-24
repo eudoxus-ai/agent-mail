@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isSentMailbox } from '../../src/lib/sent-mailboxes.js';
+import { isSentMailbox, isSentMailboxName } from '../../src/lib/sent-mailboxes.js';
 
 describe('isSentMailbox', () => {
   it.each([
@@ -19,5 +19,18 @@ describe('isSentMailbox', () => {
     ['INBOX.Sent.Old Receipts', null],
   ])('rejects %s', (path, specialUse) => {
     expect(isSentMailbox({ path, specialUse, delimiter: '.' })).toBe(false);
+  });
+});
+
+describe('isSentMailboxName', () => {
+  it.each(['[Gmail]/Sent Mail', 'Sent Messages', 'INBOX.Sent', 'INBOX.Sent Messages', 'Sent'])(
+    'accepts %s',
+    (path) => {
+      expect(isSentMailboxName(path)).toBe(true);
+    }
+  );
+
+  it.each(['INBOX', 'Archive', 'INBOX.Sent.Old Receipts', 'Sent to accountant'])('rejects %s', (path) => {
+    expect(isSentMailboxName(path)).toBe(false);
   });
 });

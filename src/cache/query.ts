@@ -2,19 +2,22 @@ import type { Database } from '../ledger/sqlite.js';
 import type { Participant } from '../types.js';
 import type { SearchCursor } from '../lib/search-cursor.js';
 import { toFtsMatchQuery } from './fts-query.js';
+import { inMailboxes, type MailboxRef } from './mailboxes.js';
 import { FTS_WEIGHTS } from './schema.js';
 
 /**
  * Cache-backed reads.
  *
- * Returns the exact shape searchThreadsMulti already produces, so the tool
- * contract is untouched and shadow mode can diff the two answers directly.
- * Knows nothing about IMAP.
+ * Returns the shape searchThreadsMulti produces, so shadow mode can diff the
+ * two answers directly, short of the fields that need the account
+ * configuration: from_me and replied_to_sender. Knows nothing about IMAP.
  */
 
 export interface CachedSearchParams {
-  accountIds: string[];
-  mailbox: string;
+  /** Every account's mailbox the search reads, as one date-ordered result. */
+  mailboxes: MailboxRef[];
+  /** Only messages in this conversation, by the cache's thread root. */
+  threadId?: string;
   query?: string;
   from?: string;
   listId?: string;
@@ -47,6 +50,10 @@ export interface CachedSearchRow {
   flags: string[];
   from_address: string;
   from_name: string | null;
+  to: Participant[];
+  cc: Participant[];
+  thread_id: string | null;
+  in_reply_to: string | null;
   list_id: string | null;
   list_unsubscribe: string | null;
   is_list_mail: boolean;
@@ -72,6 +79,10 @@ interface RawRow {
   date: number;
   from_address: string | null;
   from_name: string | null;
+  to_json: string;
+  cc_json: string;
+  thread_id: string | null;
+  in_reply_to: string | null;
   flags: string;
   list_id: string | null;
   list_unsub: string | null;
@@ -83,7 +94,7 @@ export function searchCache(
   db: Database,
   params: CachedSearchParams
 ): CachedSearchRow[] {
-  if (params.accountIds.length === 0) return [];
+  if (params.mailboxes.length === 0) return [];
 
   const where: string[] = [];
   const args: Array<string | number> = [];
@@ -101,11 +112,14 @@ export function searchCache(
 
   if (matchExpr) args.push(matchExpr);
 
-  where.push(`m.account_id IN (${params.accountIds.map(() => '?').join(', ')})`);
-  args.push(...params.accountIds);
+  const scope = inMailboxes('m', params.mailboxes);
+  where.push(scope.sql);
+  args.push(...scope.args);
 
-  where.push(`m.mailbox = ?`);
-  args.push(params.mailbox);
+  if (params.threadId) {
+    where.push(`m.thread_id = ?`);
+    args.push(params.threadId);
+  }
 
   if (params.since) {
     where.push(`m.date >= ?`);
@@ -178,6 +192,10 @@ function hydrate(db: Database, row: RawRow): CachedSearchRow {
     flags,
     from_address: row.from_address ?? '',
     from_name: row.from_name,
+    to: safeParse<Participant[]>(row.to_json, []),
+    cc: safeParse<Participant[]>(row.cc_json, []),
+    thread_id: row.thread_id,
+    in_reply_to: row.in_reply_to,
     list_id: row.list_id,
     list_unsubscribe: listUnsub?.raw ?? null,
     is_list_mail: row.is_list_mail === 1,
@@ -211,18 +229,49 @@ export function rankedSearch(
   params: CachedSearchParams
 ): CachedSearchRow[] {
   const matchExpr = toFtsMatchQuery(params.query);
-  if (!matchExpr || params.accountIds.length === 0) return [];
+  if (!matchExpr || params.mailboxes.length === 0) return [];
 
+  const scope = inMailboxes('m', params.mailboxes);
   const rows = db
     .prepare(
       `SELECT m.* FROM messages_fts
        JOIN messages m ON m.id = messages_fts.rowid
        WHERE messages_fts MATCH ?
-         AND m.account_id IN (${params.accountIds.map(() => '?').join(', ')})
+         AND ${scope.sql}
        ORDER BY bm25(messages_fts, ${FTS_WEIGHTS.subject}, ${FTS_WEIGHTS.body}, ${FTS_WEIGHTS.participants}, ${FTS_WEIGHTS.attachment_names})
        LIMIT ?`
     )
-    .all(matchExpr, ...params.accountIds, params.limit) as unknown as RawRow[];
+    .all(matchExpr, ...scope.args, params.limit) as unknown as RawRow[];
 
   return rows.map((row) => hydrate(db, row));
+}
+
+/**
+ * For each address, how many messages in the `sent` mailboxes have it in To
+ * or Cc. One statement for a whole page: sent mail is a small share of a
+ * cache, so reading its recipient lists with json_each is cheap.
+ */
+export function sentToCounts(
+  db: Database,
+  sent: MailboxRef[],
+  addresses: string[]
+): Map<string, number> {
+  const wanted = [...new Set(addresses.map((a) => a.toLowerCase()).filter(Boolean))];
+  if (sent.length === 0 || wanted.length === 0) return new Map();
+
+  const scope = inMailboxes('m', sent);
+  const rows = db
+    .prepare(
+      `SELECT address, COUNT(DISTINCT id) AS n FROM (
+         SELECT m.id, LOWER(json_extract(r.value, '$.address')) AS address
+         FROM messages m, json_each(m.to_json) r WHERE ${scope.sql}
+         UNION ALL
+         SELECT m.id, LOWER(json_extract(r.value, '$.address')) AS address
+         FROM messages m, json_each(m.cc_json) r WHERE ${scope.sql}
+       )
+       WHERE address IN (${wanted.map(() => '?').join(', ')})
+       GROUP BY address`
+    )
+    .all(...scope.args, ...scope.args, ...wanted) as Array<{ address: string; n: number }>;
+  return new Map(rows.map((r) => [r.address, r.n]));
 }

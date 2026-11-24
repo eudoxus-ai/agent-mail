@@ -22,7 +22,9 @@ const ACCOUNTS: AccountConfig[] = ['work', 'home'].map((id) => ({
 
 const SHARED = Date.UTC(2026, 5, 1, 12);
 
-function seed(cache: Database, accountId: string, uid: number, date: number) {
+const MAILBOXES: Record<string, string[]> = { work: ['INBOX', 'Sent'], home: ['INBOX', 'INBOX.Sent'] };
+
+function seed(cache: Database, accountId: string, uid: number, date: number, mailbox = 'INBOX') {
   upsertMessage(cache, {
     accountId,
     uidvalidity: 1,
@@ -37,14 +39,16 @@ function seed(cache: Database, accountId: string, uid: number, date: number) {
       bodyText: '',
       references: [],
       flags: [],
-      mailbox: 'INBOX',
+      mailbox,
     },
   });
 }
 
 function executorOver(cache: Database) {
-  for (const { id } of ACCOUNTS) {
-    upsertMailboxState(cache, id, 'INBOX', { backfill_complete: 1, last_delta_at: Date.now() });
+  for (const [id, mailboxes] of Object.entries(MAILBOXES)) {
+    for (const mailbox of mailboxes) {
+      upsertMailboxState(cache, id, mailbox, { backfill_complete: 1, last_delta_at: Date.now() });
+    }
   }
   return new Executor({
     db: openDatabase(':memory:'),
@@ -56,13 +60,13 @@ function executorOver(cache: Database) {
   });
 }
 
-async function pageToEnd(executor: Executor, limit: number) {
-  const pages: Array<Array<{ account_id: string; uid: number }>> = [];
+async function pageToEnd(executor: Executor, params: Record<string, unknown>) {
+  const pages: Array<Array<{ account_id: string; mailbox: string; uid: number }>> = [];
   let cursor: string | undefined;
   do {
     const { result } = await executor.executeImmediate({
       tool: 'search_threads',
-      toolParams: { limit, ...(cursor ? { cursor } : {}) },
+      toolParams: { ...params, ...(cursor ? { cursor } : {}) },
       accountId: 'work',
       agentId: 'test',
       risk: 'none',
@@ -75,41 +79,43 @@ async function pageToEnd(executor: Executor, limit: number) {
   return pages;
 }
 
-const key = (r: { account_id: string; uid: number }) => `${r.account_id}:${r.uid}`;
+const key = (r: { account_id: string; mailbox: string; uid: number }) =>
+  `${r.account_id}:${r.mailbox}:${r.uid}`;
 
 describe('search_threads cache cursor', () => {
   it('returns every row once across ties larger than a page, then stops', async () => {
     const cache = openCache(':memory:');
-    const expected: string[] = [];
-    // Seven rows per account at one instant, so the tie spans several pages
-    // and both accounts, and UIDs repeat across accounts.
-    for (const accountId of ['work', 'home']) {
-      for (let uid = 1; uid <= 7; uid += 1) {
-        seed(cache, accountId, uid, SHARED);
-        expected.push(`${accountId}:${uid}`);
-      }
+    // Fourteen rows at one instant, spread over both accounts and two
+    // mailboxes each, with UIDs that repeat across all four. The tie spans
+    // several pages.
+    for (const [accountId, [inbox, sent]] of Object.entries(MAILBOXES)) {
+      for (let uid = 1; uid <= 4; uid += 1) seed(cache, accountId, uid, SHARED, inbox);
+      for (let uid = 1; uid <= 3; uid += 1) seed(cache, accountId, uid, SHARED, sent);
     }
     // Two older rows make 16 in all, an exact multiple of the page size.
-    seed(cache, 'work', 8, SHARED - 1000);
-    seed(cache, 'home', 8, SHARED - 2000);
-    expected.push('work:8', 'home:8');
+    seed(cache, 'work', 5, SHARED - 1000);
+    seed(cache, 'home', 5, SHARED - 2000);
 
-    const pages = await pageToEnd(executorOver(cache), 4);
+    const pages = await pageToEnd(executorOver(cache), { limit: 4, include_sent: true });
 
     expect(pages.map((p) => p.length)).toEqual([4, 4, 4, 4]);
     const seen = pages.flat().map(key);
-    expect(new Set(seen).size).toBe(seen.length);
-    expect([...seen].sort()).toEqual([...expected].sort());
-    // Newest first, ties broken by account, then uid, descending.
-    expect(seen.slice(0, 8)).toEqual([7, 6, 5, 4, 3, 2, 1].map((u) => `work:${u}`).concat('home:7'));
-    expect(seen.slice(-2)).toEqual(['work:8', 'home:8']);
+    // Newest first, ties broken by account, mailbox, then uid, all descending.
+    expect(seen).toEqual([
+      'work:Sent:3', 'work:Sent:2', 'work:Sent:1',
+      'work:INBOX:4', 'work:INBOX:3', 'work:INBOX:2', 'work:INBOX:1',
+      'home:INBOX.Sent:3', 'home:INBOX.Sent:2', 'home:INBOX.Sent:1',
+      'home:INBOX:4', 'home:INBOX:3', 'home:INBOX:2', 'home:INBOX:1',
+      'work:INBOX:5', 'home:INBOX:5',
+    ]);
+    expect(new Set(seen).size).toBe(16);
   });
 
   it('ends without a cursor when the last page is short', async () => {
     const cache = openCache(':memory:');
     for (let uid = 1; uid <= 5; uid += 1) seed(cache, 'work', uid, SHARED - uid * 1000);
 
-    const pages = await pageToEnd(executorOver(cache), 2);
+    const pages = await pageToEnd(executorOver(cache), { limit: 2 });
 
     expect(pages.map((p) => p.map((r) => r.uid))).toEqual([[1, 2], [3, 4], [5]]);
   });

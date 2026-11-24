@@ -1,5 +1,5 @@
 import type { Database } from '../ledger/sqlite.js';
-import type { AccountConfig, Intent, RiskLevel } from '../types.js';
+import type { AccountConfig, Intent, Participant, RiskLevel } from '../types.js';
 import { isListMail } from '../attention/signals.js';
 import { classifyCategory, type Category } from '../attention/category.js';
 import type { Logger } from '../logger.js';
@@ -55,10 +55,22 @@ import {
   decodeCursor,
   encodeCursor,
   isAfterCursor,
-  type SearchCursor,
 } from '../lib/search-cursor.js';
 import { projectResult } from '../lib/envelope-projection.js';
-import { searchCache, countByAccount } from '../cache/query.js';
+import {
+  searchCache,
+  countByAccount,
+  sentToCounts,
+  type CachedSearchParams,
+  type CachedSearchRow,
+} from '../cache/query.js';
+import {
+  cachedMailboxes,
+  mailboxRole,
+  sentMailboxes,
+  type MailboxRef,
+} from '../cache/mailboxes.js';
+import { isSentMailboxName } from '../lib/sent-mailboxes.js';
 import { getCoverage, isServable } from '../cache/coverage.js';
 import { diffResults, logDivergence } from '../cache/shadow.js';
 import { invalidate } from '../cache/invalidate.js';
@@ -126,11 +138,46 @@ interface SearchThreadResult {
   };
   snippet: string;
   flags: string[];
+  to: Participant[];
+  cc: Participant[];
+  /** The cache's thread root. Null from the mail server, which has none. */
+  thread_id: string | null;
+  in_reply_to: string | null;
+  from_me: boolean;
+  /** Sent messages, across every account, addressed to this sender. Null from the mail server. */
+  replied_to_sender: number | null;
   list_id: string | null;
   list_unsubscribe: string | null;
   is_list_mail: boolean;
   category: Category;
   target: { account_id: string; uid: number; mailbox: string };
+}
+
+/**
+ * What a cache search reads: `mailbox` in every account, plus each account's
+ * sent mailboxes when asked. Without a mailbox it reads every cached mailbox,
+ * because a conversation spans Sent and archives as well as the inbox.
+ */
+interface CacheScope {
+  accountIds: string[];
+  mailbox?: string;
+  includeSent?: boolean;
+}
+
+function resolveScope(cache: Database, scope: CacheScope): MailboxRef[] {
+  const { mailbox } = scope;
+  if (mailbox === undefined) return cachedMailboxes(cache, scope.accountIds);
+  const named = scope.accountIds.map((account_id) => ({ account_id, mailbox }));
+  if (!scope.includeSent) return named;
+  return [...named, ...sentMailboxes(cache, scope.accountIds).filter((s) => s.mailbox !== mailbox)];
+}
+
+/** Why a read that only the cache can answer was refused. */
+function cacheOnlyRefusal(what: string, coverage: { state: string } | null): string {
+  const why = coverage
+    ? `the local cache is ${coverage.state}`
+    : 'no local cache could be read';
+  return `${what} is answered only from the local cache, and ${why}. ${INSTALL_HINT}`;
 }
 
 interface SearchThreadsMultiPayload {
@@ -544,14 +591,10 @@ export class Executor {
       return { uids: [], checked: false, reason: 'cache mode is off' };
     }
 
-    const attempt = this.readFromCache({
-      accountIds: [args.accountId],
-      mailbox: args.mailbox,
-      from: args.from,
-      listId: args.listId,
-      before: args.before,
-      limit: args.limit,
-    });
+    const attempt = this.readFromCache(
+      { accountIds: [args.accountId], mailbox: args.mailbox },
+      { from: args.from, listId: args.listId, before: args.before, limit: args.limit }
+    );
     if (!attempt) return { uids: [], checked: false, reason: 'cache read failed' };
     if (!attempt.servable) {
       return { uids: [], checked: false, reason: `cache ${attempt.coverage.state}` };
@@ -1085,6 +1128,8 @@ export class Executor {
     }
 
     const mailbox = (intent.params.mailbox as string) ?? 'INBOX';
+    const includeSent = intent.params.include_sent === true;
+    const threadId = intent.params.thread_id as string | undefined;
     const rawCursor = intent.params.cursor as string | undefined;
     const decodedCursor = rawCursor ? decodeCursor(rawCursor) : null;
     const baseCriteria = {
@@ -1108,20 +1153,32 @@ export class Executor {
     // divergence. Either way a cache failure falls through to IMAP.
     const cacheAttempt =
       this.cache && this.cacheConfig.mode !== 'off'
-        ? this.readFromCache({
-            accountIds: targetIds,
-            mailbox,
-            query,
-            from: baseCriteria.from,
-            to: baseCriteria.to,
-            subject: baseCriteria.subject,
-            since: baseCriteria.since,
-            before: baseCriteria.before,
-            cursor: decodedCursor ?? undefined,
-            // One past the page, to learn whether there is a next one.
-            limit: limit + 1,
-          })
+        ? this.readFromCache(
+            threadId ? { accountIds: targetIds } : { accountIds: targetIds, mailbox, includeSent },
+            {
+              threadId,
+              query,
+              from: baseCriteria.from,
+              to: baseCriteria.to,
+              subject: baseCriteria.subject,
+              since: baseCriteria.since,
+              before: baseCriteria.before,
+              cursor: decodedCursor ?? undefined,
+              // One past the page, to learn whether there is a next one.
+              limit: limit + 1,
+            }
+          )
         : null;
+
+    // Only the cache records which messages share a thread, so a thread
+    // search has nothing to fall back to. Searching INBOX instead would
+    // quietly answer a different question.
+    if (threadId) {
+      if (!cacheAttempt?.servable) {
+        throw new Error(cacheOnlyRefusal('A thread_id search', cacheAttempt?.coverage ?? null));
+      }
+      return this.buildCachePayload(cacheAttempt, allIds, limit, intent);
+    }
 
     if (cacheAttempt && this.cacheConfig.mode === 'on' && cacheAttempt.servable) {
       return this.buildCachePayload(cacheAttempt, allIds, limit, intent);
@@ -1144,52 +1201,72 @@ export class Executor {
       accountIds: targetIds,
       label: 'search_threads',
       fn: async (accountId, imap) => {
+        // Listing mailboxes costs a round trip, so it happens only when Sent
+        // is searched too. Otherwise a sent mailbox is known by name, as the
+        // cache knows it.
+        const sentPaths = includeSent ? await imap.sentMailboxes() : [];
+        const searched = [mailbox, ...sentPaths.filter((path) => path !== mailbox)];
         // Quotes mark a phrase for the cache; to a server they are literal text.
         const serverQuery = query?.replaceAll('"', '');
-        const resultSets = serverQuery
-          ? await Promise.all([
-              imap.search(mailbox, { ...imapCriteria, subject: serverQuery }, imapFetchLimit),
-              imap.search(mailbox, { ...imapCriteria, body: serverQuery }, imapFetchLimit),
-            ])
-          : [await imap.search(mailbox, imapCriteria, imapFetchLimit)];
 
-        const merged = new Map<number, Awaited<(typeof resultSets)[number][number]>>();
-        for (const set of resultSets) {
-          for (const result of set) {
-            merged.set(result.uid, result);
+        const results = [];
+        for (const box of searched) {
+          const resultSets = serverQuery
+            ? await Promise.all([
+                imap.search(box, { ...imapCriteria, subject: serverQuery }, imapFetchLimit),
+                imap.search(box, { ...imapCriteria, body: serverQuery }, imapFetchLimit),
+              ])
+            : [await imap.search(box, imapCriteria, imapFetchLimit)];
+
+          const merged = new Map<number, Awaited<(typeof resultSets)[number][number]>>();
+          for (const set of resultSets) {
+            for (const result of set) {
+              merged.set(result.uid, result);
+            }
           }
-        }
-        const baseResults = Array.from(merged.values()).map((r) => ({
-          account_id: accountId,
-          mailbox,
-          ...r,
-          from_address: r.envelope?.from?.address ?? '',
-          from_name: r.envelope?.from?.name ?? null,
-          list_id: r.list_id ?? null,
-          list_unsubscribe: r.list_unsubscribe ?? null,
-          is_list_mail: isListMail(r.list_unsubscribe, r.list_id),
-          category: classifyCategory({
-            list_id: r.list_id ?? null,
-            list_unsubscribe: r.list_unsubscribe ?? null,
-            subject: r.envelope?.subject ?? '',
-          }),
-          target: { account_id: accountId, uid: r.uid, mailbox },
-        }));
+          const inSent = sentPaths.includes(box) || isSentMailboxName(box);
+          const boxResults = Array.from(merged.values()).map((r) => {
+            const fromAddress = r.envelope?.from?.address ?? '';
+            return {
+              account_id: accountId,
+              mailbox: box,
+              ...r,
+              from_address: fromAddress,
+              from_name: r.envelope?.from?.name ?? null,
+              to: r.to ?? [],
+              cc: r.cc ?? [],
+              thread_id: null,
+              in_reply_to: r.in_reply_to ?? null,
+              from_me: this.isFromMe(inSent, fromAddress),
+              replied_to_sender: null,
+              list_id: r.list_id ?? null,
+              list_unsubscribe: r.list_unsubscribe ?? null,
+              is_list_mail: isListMail(r.list_unsubscribe, r.list_id),
+              category: classifyCategory({
+                list_id: r.list_id ?? null,
+                list_unsubscribe: r.list_unsubscribe ?? null,
+                subject: r.envelope?.subject ?? '',
+              }),
+              target: { account_id: accountId, uid: r.uid, mailbox: box },
+            };
+          });
 
-        // Populate snippet for threads that don't already have one.
-        // Only runs when include_snippets: true — each call adds one extra IMAP round-trip
-        // (N+1 calls per page). Default is off to keep searches fast.
-        if (intent.params.include_snippets === true) {
-          await Promise.all(
-            baseResults.map(async (r) => {
-              if (!r.snippet) {
-                r.snippet = await imap.fetchSnippet(mailbox, r.uid);
-              }
-            })
-          );
+          // Populate snippet for threads that don't already have one.
+          // Only runs when include_snippets: true — each call adds one extra IMAP round-trip
+          // (N+1 calls per page). Default is off to keep searches fast.
+          if (intent.params.include_snippets === true) {
+            await Promise.all(
+              boxResults.map(async (r) => {
+                if (!r.snippet) {
+                  r.snippet = await imap.fetchSnippet(box, r.uid);
+                }
+              })
+            );
+          }
+          results.push(...boxResults);
         }
 
-        return baseResults;
+        return results;
       },
     });
 
@@ -1233,31 +1310,36 @@ export class Executor {
   }
 
   /** Run the cache-side query, tolerating any failure by returning null. */
-  private readFromCache(params: {
-    accountIds: string[];
-    mailbox: string;
-    query?: string;
-    from?: string;
-    listId?: string;
-    to?: string;
-    subject?: string;
-    since?: Date;
-    before?: Date;
-    cursor?: SearchCursor;
-    limit: number;
-  }): {
-    rows: ReturnType<typeof searchCache>;
+  private readFromCache(
+    scope: CacheScope,
+    filters: Omit<CachedSearchParams, 'mailboxes'>
+  ): {
+    rows: Array<CachedSearchRow & { from_me: boolean; replied_to_sender: number }>;
     coverage: ReturnType<typeof getCoverage>;
     servable: boolean;
   } | null {
-    if (!this.cache) return null;
+    const cache = this.cache;
+    if (!cache) return null;
     try {
-      const coverage = getCoverage(this.cache, params.accountIds, {
+      const coverage = getCoverage(cache, scope.accountIds, {
         freshnessWindowSeconds: this.cacheConfig.freshnessWindowSeconds,
         // Coverage must be judged for the mailbox actually being searched.
-        mailbox: params.mailbox,
+        mailbox: scope.mailbox,
       });
-      const rows = searchCache(this.cache, params);
+      const found = searchCache(cache, { ...filters, mailboxes: resolveScope(cache, scope) });
+      // Replies count the operator's sent mail in every configured account,
+      // not only the ones searched: a sender answered from another account
+      // has still been answered.
+      const replies = sentToCounts(
+        cache,
+        sentMailboxes(cache, this.accounts.map((a) => a.id)),
+        found.map((r) => r.from_address)
+      );
+      const rows = found.map((r) => ({
+        ...r,
+        from_me: this.isFromMe(mailboxRole(r.mailbox) === 'sent', r.from_address),
+        replied_to_sender: replies.get(r.from_address.toLowerCase()) ?? 0,
+      }));
       return { rows, coverage, servable: isServable(coverage.state) };
     } catch (error) {
       this.logger.warn('cache: read failed, falling back to IMAP', {
@@ -1265,6 +1347,12 @@ export class Executor {
       });
       return null;
     }
+  }
+
+  /** Mail the operator wrote: anything in a sent mailbox, or sent from a configured address. */
+  private isFromMe(inSentMailbox: boolean, fromAddress: string): boolean {
+    const address = fromAddress.toLowerCase();
+    return inSentMailbox || this.accounts.some((a) => a.email.toLowerCase() === address);
   }
 
   private buildCachePayload(

@@ -1,7 +1,11 @@
 import { describe, it, expect, beforeEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { openCache, type Database } from '../../src/cache/db.js';
 import { upsertMessage, attachBody } from '../../src/cache/store.js';
-import { searchCache, countByAccount, rankedSearch } from '../../src/cache/query.js';
+import { searchCache, countByAccount, rankedSearch, sentToCounts } from '../../src/cache/query.js';
+import { sentMailboxes } from '../../src/cache/mailboxes.js';
 import { getCoverage, isServable } from '../../src/cache/coverage.js';
 import { upsertMailboxState } from '../../src/cache/state.js';
 import type { EmailMessage } from '../../src/types.js';
@@ -44,8 +48,7 @@ describe('searchCache', () => {
     add(2);
 
     const rows = searchCache(db, {
-      accountIds: ['work'],
-      mailbox: 'INBOX',
+      mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }],
       limit: 10,
     });
     expect(rows.map((r) => r.uid)).toEqual([3, 2, 1]);
@@ -53,7 +56,7 @@ describe('searchCache', () => {
 
   it('respects limit', () => {
     for (let uid = 1; uid <= 5; uid += 1) add(uid);
-    const rows = searchCache(db, { accountIds: ['work'], mailbox: 'INBOX', limit: 2 });
+    const rows = searchCache(db, { mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }], limit: 2 });
     expect(rows).toHaveLength(2);
   });
 
@@ -61,7 +64,7 @@ describe('searchCache', () => {
     add(1, {}, 'work');
     add(2, {}, 'personal');
 
-    const rows = searchCache(db, { accountIds: ['work'], mailbox: 'INBOX', limit: 10 });
+    const rows = searchCache(db, { mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }], limit: 10 });
     expect(rows.map((r) => r.account_id)).toEqual(['work']);
   });
 
@@ -69,7 +72,7 @@ describe('searchCache', () => {
     add(1, { mailbox: 'INBOX' });
     add(2, { mailbox: 'Sent' });
 
-    const rows = searchCache(db, { accountIds: ['work'], mailbox: 'Sent', limit: 10 });
+    const rows = searchCache(db, { mailboxes: [{ account_id: 'work', mailbox: 'Sent' }], limit: 10 });
     expect(rows.map((r) => r.uid)).toEqual([2]);
   });
 
@@ -79,8 +82,7 @@ describe('searchCache', () => {
     add(20);
 
     const rows = searchCache(db, {
-      accountIds: ['work'],
-      mailbox: 'INBOX',
+      mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }],
       since: new Date(Date.UTC(2026, 5, 5)),
       before: new Date(Date.UTC(2026, 5, 15)),
       limit: 10,
@@ -94,8 +96,7 @@ describe('searchCache', () => {
     add(3, { subject: 'Unrelated', bodyText: 'unrelated' });
 
     const rows = searchCache(db, {
-      accountIds: ['work'],
-      mailbox: 'INBOX',
+      mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }],
       query: 'pricing',
       limit: 10,
     });
@@ -106,8 +107,7 @@ describe('searchCache', () => {
     add(1, { subject: 'Q2-pricing' });
     expect(() =>
       searchCache(db, {
-        accountIds: ['work'],
-        mailbox: 'INBOX',
+        mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }],
         query: 'Q2-pricing',
         limit: 10,
       })
@@ -120,8 +120,7 @@ describe('searchCache', () => {
 
     expect(
       searchCache(db, {
-        accountIds: ['work'],
-        mailbox: 'INBOX',
+        mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }],
         from: 'bob@',
         limit: 10,
       }).map((r) => r.uid)
@@ -129,8 +128,7 @@ describe('searchCache', () => {
 
     expect(
       searchCache(db, {
-        accountIds: ['work'],
-        mailbox: 'INBOX',
+        mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }],
         from: 'Alice',
         limit: 10,
       }).map((r) => r.uid)
@@ -142,8 +140,7 @@ describe('searchCache', () => {
     add(2, { to: [{ address: 'you@example.com', name: null }] });
 
     const rows = searchCache(db, {
-      accountIds: ['work'],
-      mailbox: 'INBOX',
+      mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }],
       to: 'team@',
       limit: 10,
     });
@@ -152,7 +149,7 @@ describe('searchCache', () => {
 
   it('returns the shape search_threads already emits', () => {
     add(1, { subject: 'Hello' });
-    const [row] = searchCache(db, { accountIds: ['work'], mailbox: 'INBOX', limit: 1 });
+    const [row] = searchCache(db, { mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }], limit: 1 });
 
     expect(row).toMatchObject({
       account_id: 'work',
@@ -178,7 +175,7 @@ describe('searchCache', () => {
       ],
     });
 
-    const [row] = searchCache(db, { accountIds: ['work'], mailbox: 'INBOX', limit: 1 });
+    const [row] = searchCache(db, { mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }], limit: 1 });
     expect(row.attachments).toEqual([
       { part_id: '2', filename: 'deck.pdf', mime_type: 'application/pdf', size: 99 },
     ]);
@@ -186,7 +183,7 @@ describe('searchCache', () => {
 
   it('returns nothing for an empty account list', () => {
     add(1);
-    expect(searchCache(db, { accountIds: [], mailbox: 'INBOX', limit: 10 })).toEqual([]);
+    expect(searchCache(db, { mailboxes: [], limit: 10 })).toEqual([]);
   });
 
   it('finds text that only exists in a body fetched later', () => {
@@ -198,12 +195,46 @@ describe('searchCache', () => {
     attachBody(db, id, { text: 'the renewal date is in March' });
 
     const rows = searchCache(db, {
-      accountIds: ['work'],
-      mailbox: 'INBOX',
+      mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }],
       query: 'renewal',
       limit: 10,
     });
     expect(rows.map((r) => r.uid)).toEqual([1]);
+  });
+});
+
+describe('reading a cache the daemon wrote', () => {
+  it('works on a connection opened read-only, as the MCP server opens it', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agent-mail-ro-'));
+    try {
+      const path = join(dir, 'cache.db');
+      const writer = openCache(path);
+      upsertMessage(writer, { accountId: 'work', uidvalidity: 1, message: msg(1, { cc: [{ address: 'bob@example.com', name: null }] }) });
+      upsertMessage(writer, {
+        accountId: 'work',
+        uidvalidity: 1,
+        message: msg(2, {
+          mailbox: 'Sent Messages',
+          from: { address: 'you@example.com', name: null },
+          to: [{ address: 'alice@example.com', name: null }],
+        }),
+      });
+      upsertMailboxState(writer, 'work', 'INBOX', {});
+      upsertMailboxState(writer, 'work', 'Sent Messages', {});
+      writer.close();
+
+      const reader = openCache(path, { readOnly: true });
+      const [row] = searchCache(reader, { mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }], limit: 10 });
+      expect(row).toMatchObject({ uid: 1, cc: [{ address: 'bob@example.com', name: null }] });
+      const sent = sentMailboxes(reader, ['work']);
+      expect(sent).toEqual([{ account_id: 'work', mailbox: 'Sent Messages' }]);
+      expect(sentToCounts(reader, sent, ['Alice@example.com', 'bob@example.com'])).toEqual(
+        new Map([['alice@example.com', 1]])
+      );
+      reader.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -214,8 +245,7 @@ describe('countByAccount', () => {
     add(3, {}, 'personal');
 
     const rows = searchCache(db, {
-      accountIds: ['work', 'personal'],
-      mailbox: 'INBOX',
+      mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }, { account_id: 'personal', mailbox: 'INBOX' }],
       limit: 10,
     });
     expect(countByAccount(rows)).toEqual({ work: 2, personal: 1 });
@@ -228,8 +258,7 @@ describe('rankedSearch', () => {
     add(2, { subject: 'hello', bodyText: 'the budget is fine' });
 
     const rows = rankedSearch(db, {
-      accountIds: ['work'],
-      mailbox: 'INBOX',
+      mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }],
       query: 'budget',
       limit: 10,
     });
@@ -239,7 +268,7 @@ describe('rankedSearch', () => {
   it('returns nothing without a query', () => {
     add(1);
     expect(
-      rankedSearch(db, { accountIds: ['work'], mailbox: 'INBOX', limit: 10 })
+      rankedSearch(db, { mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }], limit: 10 })
     ).toEqual([]);
   });
 });

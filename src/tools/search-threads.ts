@@ -5,7 +5,7 @@ import { ALLOWED_FIELDS } from '../lib/envelope-projection.js';
 export const searchThreadsTool: ToolDefinition = {
   name: 'search_threads',
   description:
-    'Search email threads across all accounts (or a scoped subset). Returns snippets (account_id, uid, mailbox, from_address, from_name, envelope, snippet, flags, list_id, list_unsubscribe, is_list_mail, category, target) newest-first. Each result includes a `category` triage hint set to one of `newsletter`, `promotional`, `transactional`, `notification`, or `personal` — a fast heuristic classification so you do not need to reimplement one. The full-shape result includes flat top-level `from_address` and `from_name` for one-hop sender access, alongside the back-compat nested `envelope.from.{address,name}`. Envelope includes accounts_searched, accounts_available, per_account_errors, and `next_cursor` when more results are available. To paginate, pass `next_cursor` back verbatim as `cursor` on the next call (preferred). `before` (ISO8601, exclusive) is still supported for manual pagination. Each result carries a preassembled `target` object suitable for hold_messages. Set `include_snippets: true` to populate the `snippet` field (adds one IMAP fetch per result; off by default). Use `fields` to project only the keys you need per result (recommended for bulk triage to shrink payloads; `from_address` and `from_name` are available as flat projections). For full attention signals, use get_overview.',
+    'Search email threads across all accounts (or a scoped subset). Returns messages (account_id, uid, mailbox, from_address, from_name, to, cc, thread_id, in_reply_to, from_me, replied_to_sender, envelope, snippet, flags, list_id, list_unsubscribe, is_list_mail, category, target) newest-first. `to` and `cc` are arrays of `{address, name}`. `thread_id` names the conversation in the local cache; pass it back as `thread_id` to read the whole conversation. `from_me` is true for mail in a sent mailbox or from a configured account address. `replied_to_sender` is how many messages in your sent mailboxes, across all accounts, have this sender in To or Cc, so 0 means you have never written to them. When the mail server answers instead of the cache, `thread_id` and `replied_to_sender` are null. Set `include_sent: true` to merge each account\'s sent mailboxes into the same date-ordered results. Each result includes a `category` triage hint set to one of `newsletter`, `promotional`, `transactional`, `notification`, or `personal` — a fast heuristic classification so you do not need to reimplement one. The full-shape result includes flat top-level `from_address` and `from_name` for one-hop sender access, alongside the back-compat nested `envelope.from.{address,name}`. Envelope includes accounts_searched, accounts_available, per_account_errors, and `next_cursor` when more results are available. To paginate, pass `next_cursor` back verbatim as `cursor` on the next call (preferred). `before` (ISO8601, exclusive) is still supported for manual pagination. Each result carries a preassembled `target` object suitable for hold_messages. Set `include_snippets: true` to populate the `snippet` field (adds one IMAP fetch per result; off by default). Use `fields` to project only the keys you need per result (recommended for bulk triage to shrink payloads; `from_address` and `from_name` are available as flat projections). For full attention signals, use get_overview.',
   inputSchema: z.object({
     query: z
       .string()
@@ -35,6 +35,15 @@ export const searchThreadsTool: ToolDefinition = {
       .optional()
       .describe('Accounts to search. Omit for all configured accounts.'),
     mailbox: z.string().min(1).optional().describe('Mailbox to search (default: INBOX)'),
+    include_sent: z
+      .boolean()
+      .optional()
+      .describe('Also search each account\'s sent mailboxes, merged into one newest-first result with `mailbox`. Default false.'),
+    thread_id: z
+      .string()
+      .min(1)
+      .optional()
+      .describe('Return only messages in this conversation, a `thread_id` from an earlier result. Searches every cached mailbox of the requested accounts, ignoring `mailbox`, so replies in Sent and archived messages are included. Answered only from the local cache: an error says so when the cache cannot answer.'),
     limit: z
       .number()
       .int()

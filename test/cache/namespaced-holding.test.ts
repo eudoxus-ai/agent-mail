@@ -116,8 +116,7 @@ describe('syncing a namespaced holding folder', () => {
 
     // The rows answer to the name every tool asks by...
     const rows = searchCache(db, {
-      accountIds: ['work'],
-      mailbox: HOLDING_MAILBOX,
+      mailboxes: [{ account_id: 'work', mailbox: HOLDING_MAILBOX }],
       limit: 10,
     });
     expect(rows).toHaveLength(2);

@@ -80,8 +80,7 @@ describe('sync to search', () => {
     await sync(provider());
 
     const rows = searchCache(db, {
-      accountIds: ['work'],
-      mailbox: 'INBOX',
+      mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }],
       query: 'indemnity',
       limit: 10,
     });
@@ -96,8 +95,7 @@ describe('sync to search', () => {
 
     expect(
       searchCache(db, {
-        accountIds: ['work'],
-        mailbox: 'INBOX',
+        mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }],
         from: 'bob@',
         limit: 10,
       })
@@ -105,8 +103,7 @@ describe('sync to search', () => {
 
     expect(
       searchCache(db, {
-        accountIds: ['work'],
-        mailbox: 'Sent',
+        mailboxes: [{ account_id: 'work', mailbox: 'Sent' }],
         limit: 10,
       })
     ).toHaveLength(1);
@@ -143,7 +140,7 @@ describe('mutation echo through the query path', () => {
   it('hides a held message from its source mailbox before the next sync', async () => {
     const p = provider();
     await sync(p);
-    expect(searchCache(db, { accountIds: ['work'], mailbox: 'INBOX', limit: 10 })).toHaveLength(2);
+    expect(searchCache(db, { mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }], limit: 10 })).toHaveLength(2);
 
     // What the executor does after a successful IMAP move.
     invalidate(db, {
@@ -154,7 +151,7 @@ describe('mutation echo through the query path', () => {
       detail: { toMailbox: 'agent-mail-holding' },
     });
 
-    const rows = searchCache(db, { accountIds: ['work'], mailbox: 'INBOX', limit: 10 });
+    const rows = searchCache(db, { mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }], limit: 10 });
     expect(rows.map((r) => r.uid)).toEqual([1]);
   });
 
@@ -192,8 +189,7 @@ describe('shadow mode', () => {
     await sync(p);
 
     const cacheRows = searchCache(db, {
-      accountIds: ['work'],
-      mailbox: 'INBOX',
+      mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }],
       limit: 10,
     });
     // What IMAP would have returned for the same query, newest-first.
@@ -214,8 +210,7 @@ describe('shadow mode', () => {
     await sync(p);
 
     const cacheRows = searchCache(db, {
-      accountIds: ['work'],
-      mailbox: 'INBOX',
+      mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }],
       limit: 10,
     });
     const imapRows = [
