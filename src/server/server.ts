@@ -28,6 +28,8 @@ import { undoIntentTool } from '../tools/undo-intent.js';
 import { getOverviewTool, runGetOverview } from '../tools/get-overview.js';
 import { listSendersTool } from '../tools/list-senders.js';
 import { listMailboxesTool } from '../tools/list-mailboxes.js';
+import { listAccountsTool } from '../tools/list-accounts.js';
+import { listCorrespondentsTool } from '../tools/list-correspondents.js';
 import { getIntentTool } from '../tools/get-intent.js';
 import { cancelIntentTool } from '../tools/cancel-intent.js';
 import { getScanResultTool } from '../tools/get-scan-result.js';
@@ -71,6 +73,8 @@ const ALL_TOOLS: ToolDefinition[] = [
   getOverviewTool,
   listSendersTool,
   listMailboxesTool,
+  listAccountsTool,
+  listCorrespondentsTool,
   getIntentTool,
   cancelIntentTool,
   getScanResultTool,

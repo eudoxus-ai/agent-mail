@@ -3,6 +3,8 @@ import { searchThreadsTool } from '../../src/tools/search-threads.js';
 import { readThreadTool } from '../../src/tools/read-thread.js';
 import { listSendersTool } from '../../src/tools/list-senders.js';
 import { listMailboxesTool } from '../../src/tools/list-mailboxes.js';
+import { listAccountsTool } from '../../src/tools/list-accounts.js';
+import { listCorrespondentsTool } from '../../src/tools/list-correspondents.js';
 import { getAuditLogTool } from '../../src/tools/get-audit-log.js';
 import { getOverviewTool } from '../../src/tools/get-overview.js';
 import { getPendingActionsTool } from '../../src/tools/get-pending-actions.js';
@@ -23,6 +25,8 @@ const cases: Array<
   ['read_thread', readThreadTool, { readOnlyHint: true, destructiveHint: false, idempotentHint: true }],
   ['list_senders', listSendersTool, { readOnlyHint: true, destructiveHint: false, idempotentHint: true }],
   ['list_mailboxes', listMailboxesTool, { readOnlyHint: true, destructiveHint: false, idempotentHint: true }],
+  ['list_accounts', listAccountsTool, { readOnlyHint: true, destructiveHint: false, idempotentHint: true }],
+  ['list_correspondents', listCorrespondentsTool, { readOnlyHint: true, destructiveHint: false, idempotentHint: true }],
   ['get_audit_log', getAuditLogTool, { readOnlyHint: true, destructiveHint: false, idempotentHint: true }],
   ['get_overview', getOverviewTool, { readOnlyHint: true, destructiveHint: false, idempotentHint: true }],
   ['get_pending_actions', getPendingActionsTool, { readOnlyHint: true, destructiveHint: false, idempotentHint: true }],

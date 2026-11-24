@@ -67,9 +67,12 @@ import {
 import {
   cachedMailboxes,
   mailboxRole,
+  sentFromAddresses,
   sentMailboxes,
+  summarizeMailboxes,
   type MailboxRef,
 } from '../cache/mailboxes.js';
+import { listCorrespondents } from '../cache/correspondents.js';
 import { isSentMailboxName } from '../lib/sent-mailboxes.js';
 import { getCoverage, isServable } from '../cache/coverage.js';
 import { diffResults, logDivergence } from '../cache/shadow.js';
@@ -172,12 +175,16 @@ function resolveScope(cache: Database, scope: CacheScope): MailboxRef[] {
   return [...named, ...sentMailboxes(cache, scope.accountIds).filter((s) => s.mailbox !== mailbox)];
 }
 
+const CACHE_HINT =
+  'The agent-mail daemon fills the cache while cache.mode is shadow or on ' +
+  `(see 'agent-mail cache'). ${INSTALL_HINT}`;
+
 /** Why a read that only the cache can answer was refused. */
 function cacheOnlyRefusal(what: string, coverage: { state: string } | null): string {
   const why = coverage
     ? `the local cache is ${coverage.state}`
     : 'no local cache could be read';
-  return `${what} is answered only from the local cache, and ${why}. ${INSTALL_HINT}`;
+  return `${what} is answered only from the local cache, and ${why}. ${CACHE_HINT}`;
 }
 
 interface SearchThreadsMultiPayload {
@@ -1705,6 +1712,100 @@ export class Executor {
     return payload;
   }
 
+  /**
+   * The configured accounts, and what the cache knows about each: the
+   * addresses its sent mail went out from, and its cached mailboxes. Never
+   * contacts a server, so it answers even when one is down.
+   */
+  private listAccounts() {
+    const configured = this.accounts.map(({ id, email }) => ({ id, email }));
+    const cache = this.cacheConfig.mode === 'off' ? undefined : this.cache;
+    const note =
+      'The local cache is not available, so only the configured accounts are listed. ' +
+      `Sending addresses and mailboxes come from the cache. ${CACHE_HINT}`;
+    if (!cache) return { accounts: configured, note };
+
+    try {
+      const ids = configured.map((a) => a.id);
+      const senders = sentFromAddresses(cache, sentMailboxes(cache, ids));
+      const mailboxes = summarizeMailboxes(cache, ids);
+      return {
+        accounts: configured.map((account) => {
+          const addresses = senders
+            .filter((s) => s.account_id === account.id)
+            .map(({ address, sent }) => ({ address, sent }));
+          const email = account.email.toLowerCase();
+          if (!addresses.some((a) => a.address === email)) addresses.push({ address: email, sent: 0 });
+          return {
+            ...account,
+            addresses,
+            mailboxes: mailboxes
+              .filter((m) => m.account_id === account.id)
+              .map(({ account_id: _, ...mailbox }) => mailbox),
+          };
+        }),
+      };
+    } catch (error) {
+      this.logger.warn('cache: read failed for list_accounts', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { accounts: configured, note };
+    }
+  }
+
+  private listCorrespondentsMulti(intent: Intent) {
+    const requested = (intent.params.account_ids as string[] | undefined) ?? null;
+    const allIds = this.accounts.map((a) => a.id);
+    const targetIds = requested ?? allIds;
+    const unknown = targetIds.filter((id) => !allIds.includes(id));
+    if (unknown.length > 0) throw new Error(`Unknown account_ids: ${unknown.join(', ')}`);
+
+    const { cache, coverage } = this.servingCache('list_correspondents', targetIds);
+    // An alias is the operator's whichever account it was used from.
+    const own = [
+      ...this.accounts.map((a) => a.email),
+      ...sentFromAddresses(cache, sentMailboxes(cache, allIds)).map((s) => s.address),
+    ];
+    const { total, correspondents } = listCorrespondents(cache, {
+      accountIds: targetIds,
+      sent: sentMailboxes(cache, targetIds),
+      exclude: own,
+      since: intent.params.since ? new Date(intent.params.since as string) : undefined,
+      before: intent.params.before ? new Date(intent.params.before as string) : undefined,
+      minSent: (intent.params.min_sent as number | undefined) ?? 0,
+      limit: (intent.params.limit as number | undefined) ?? 100,
+    });
+
+    return {
+      accounts_searched: targetIds,
+      accounts_available: allIds,
+      cache: { state: coverage.state, last_synced_at: coverage.last_synced_at },
+      correspondents_total: total,
+      correspondents,
+    };
+  }
+
+  /** The cache, for a read nothing else can answer. Throws when it cannot serve these accounts. */
+  private servingCache(what: string, accountIds: string[]) {
+    const cache = this.cacheConfig.mode === 'off' ? undefined : this.cache;
+    let coverage: ReturnType<typeof getCoverage> | null = null;
+    if (cache) {
+      try {
+        coverage = getCoverage(cache, accountIds, {
+          freshnessWindowSeconds: this.cacheConfig.freshnessWindowSeconds,
+        });
+      } catch (error) {
+        this.logger.warn(`cache: read failed for ${what}`, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    if (!cache || !coverage || !isServable(coverage.state)) {
+      throw new Error(cacheOnlyRefusal(what, coverage));
+    }
+    return { cache, coverage };
+  }
+
   private async performAction(
     intent: Intent
   ): Promise<Array<{ type: 'text'; text: string }>> {
@@ -1737,6 +1838,15 @@ export class Executor {
 
     if (intent.tool === 'list_mailboxes') {
       const payload = await this.listMailboxesMulti(intent);
+      return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
+    }
+
+    if (intent.tool === 'list_accounts') {
+      return [{ type: 'text', text: JSON.stringify(this.listAccounts(), null, 2) }];
+    }
+
+    if (intent.tool === 'list_correspondents') {
+      const payload = this.listCorrespondentsMulti(intent);
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
 

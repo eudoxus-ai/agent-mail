@@ -38,7 +38,7 @@ export const searchThreadsTool: ToolDefinition = {
     include_sent: z
       .boolean()
       .optional()
-      .describe('Also search each account\'s sent mailboxes, merged into one newest-first result with `mailbox`. Default false.'),
+      .describe('Also search each account\'s sent mailboxes, merged into one newest-first result with `mailbox`. Default false. list_accounts shows each account\'s mailbox names and roles.'),
     thread_id: z
       .string()
       .min(1)

@@ -20,6 +20,8 @@ describe('evaluatePolicy', () => {
       'get_audit_log',
       'undo_intent',
       'unsubscribe_sender',
+      'list_accounts',
+      'list_correspondents',
     ]) {
       const result = evaluatePolicy(policy, tool);
       expect(result.decision).toBe('execute');
