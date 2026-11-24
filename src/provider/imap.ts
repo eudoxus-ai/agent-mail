@@ -3,7 +3,6 @@ import type { ResolvedAccount, EmailMessage, SearchCriteria, Participant } from 
 import { parseListUnsubscribe } from '../lib/list-unsubscribe.js';
 import { isSentMailbox } from '../lib/sent-mailboxes.js';
 import { parseMessageIds } from '../lib/message-ids.js';
-import { pickNewestUids } from './search-ordering.js';
 import { extractSnippet, extractSnippetFromPart, getHeader, htmlToText, splitHeadersBody } from './mime.js';
 import type { SnippetSource } from './mime.js';
 
@@ -269,49 +268,49 @@ export class ImapProvider {
       const allUids: number[] = searchResult;
       if (allUids.length === 0) return [];
 
-      const uidsToFetch = pickNewestUids(allUids, limit);
-      if (uidsToFetch.length === 0) return [];
-
-      // Phase 2: hydrate envelopes + preview headers for the selected UIDs.
-      const results: SearchHit[] = [];
-
-      for await (const msg of this.client.fetch(
-        uidsToFetch.join(','),
-        {
-          uid: true,
-          envelope: true,
-          flags: true,
-          ...PREVIEW_QUERY,
-        },
-        { uid: true }
-      )) {
-        const { headers, snippet } = readPreview(msg);
-        const { listId, listUnsubscribe } = extractListHeadersFromSource(headers);
-        results.push({
-          uid: msg.uid,
-          envelope: {
-            message_id: msg.envelope?.messageId ?? `${msg.uid}@unknown`,
-            subject: msg.envelope?.subject ?? '(no subject)',
-            from: toParticipant(msg.envelope?.from?.[0]),
-            date: msg.envelope?.date?.toISOString() ?? new Date().toISOString(),
-          },
-          to: toParticipants(msg.envelope?.to),
-          cc: toParticipants(msg.envelope?.cc),
-          in_reply_to: parseMessageIds(extractHeader(headers, 'In-Reply-To'))[0] ?? null,
-          snippet,
-          flags: Array.from(msg.flags ?? []),
-          list_id: listId,
-          list_unsubscribe: listUnsubscribe,
-        });
-      }
-
-      // Post-filter by exact `before` timestamp. IMAP BEFORE operates at
-      // day granularity so we widened the query by one day above; trim
-      // same-day results here to honor the advertised exclusive cursor.
+      // Newest UIDs first, a page at a time, until `limit` messages qualify
+      // or the mailbox runs out. IMAP BEFORE works at day granularity, so the
+      // query above was widened by a day and the newest UIDs it matched can
+      // all fall after the exact `before`. Stopping at one page of them would
+      // return a short page with older mail still unread.
       const beforeMs = criteria.before?.getTime();
-      const filtered = beforeMs !== undefined
-        ? results.filter((r) => new Date(r.envelope.date).getTime() < beforeMs)
-        : results;
+      const hits = new Map<number, SearchHit>();
+
+      for (let end = allUids.length; end > 0 && hits.size < limit; end -= limit) {
+        const uidsToFetch = allUids.slice(Math.max(0, end - limit), end);
+        for await (const msg of this.client.fetch(
+          uidsToFetch.join(','),
+          {
+            uid: true,
+            envelope: true,
+            flags: true,
+            ...PREVIEW_QUERY,
+          },
+          { uid: true }
+        )) {
+          const date = msg.envelope?.date ?? new Date();
+          if (beforeMs !== undefined && date.getTime() >= beforeMs) continue;
+          const { headers, snippet } = readPreview(msg);
+          const { listId, listUnsubscribe } = extractListHeadersFromSource(headers);
+          hits.set(msg.uid, {
+            uid: msg.uid,
+            envelope: {
+              message_id: msg.envelope?.messageId ?? `${msg.uid}@unknown`,
+              subject: msg.envelope?.subject ?? '(no subject)',
+              from: toParticipant(msg.envelope?.from?.[0]),
+              date: date.toISOString(),
+            },
+            to: toParticipants(msg.envelope?.to),
+            cc: toParticipants(msg.envelope?.cc),
+            in_reply_to: parseMessageIds(extractHeader(headers, 'In-Reply-To'))[0] ?? null,
+            snippet,
+            flags: Array.from(msg.flags ?? []),
+            list_id: listId,
+            list_unsubscribe: listUnsubscribe,
+          });
+        }
+      }
+      const filtered = [...hits.values()];
 
       // Sort descending by date (newest first). IMAP UIDs are usually chronological
       // but not guaranteed, so sort on the envelope date we already have.
@@ -319,7 +318,7 @@ export class ImapProvider {
         (a, b) => new Date(b.envelope.date).getTime() - new Date(a.envelope.date).getTime()
       );
 
-      return filtered;
+      return filtered.slice(0, limit);
     } finally {
       lock.release();
     }

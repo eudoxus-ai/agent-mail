@@ -80,4 +80,46 @@ describe('ImapProvider search `before` semantics', () => {
     expect(calls.searchQuery.before).toBeUndefined();
     expect(results).toHaveLength(2);
   });
+
+  it('reads past a busy day to fill the page', async () => {
+    // 25 messages later on the cursor's day than the cursor, then 5 older.
+    const cursor = new Date('2026-04-15T01:00:00Z');
+    const older = [1, 2, 3, 4, 5].map((uid) => ({ uid, date: `2026-04-1${uid}T00:00:00Z` }));
+    const sameDay = Array.from({ length: 25 }, (_, i) => ({
+      uid: 100 + i,
+      date: new Date(Date.UTC(2026, 3, 15, 2, i)).toISOString(),
+    }));
+    const all = [...older, ...sameDay];
+    const client = {
+      async getMailboxLock() {
+        return { release() {} };
+      },
+      async search() {
+        return all.map((m) => m.uid);
+      },
+      async *fetch(range: string) {
+        const wanted = new Set(range.split(',').map(Number));
+        for (const m of all.filter((x) => wanted.has(x.uid))) {
+          yield {
+            uid: m.uid,
+            envelope: { messageId: `m${m.uid}`, subject: 's', from: [], date: new Date(m.date) },
+            headers: Buffer.alloc(0),
+            flags: new Set<string>(),
+          };
+        }
+      },
+    };
+    const provider = new ImapProvider({
+      id: 'a@x.com',
+      email: 'a@x.com',
+      imap: { host: 'h', port: 993, tls: true },
+      smtp: { host: 'h', port: 465, tls: true },
+      auth: { user: 'u', pass: 'p' },
+    });
+    (provider as any).client = client;
+
+    const results = await provider.search('INBOX', { before: cursor }, 3);
+
+    expect(results.map((r) => r.uid)).toEqual([5, 4, 3]);
+  });
 });
