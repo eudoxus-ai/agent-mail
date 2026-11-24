@@ -1,5 +1,6 @@
 import type { Database } from '../ledger/sqlite.js';
 import type { Participant } from '../types.js';
+import type { SearchCursor } from '../lib/search-cursor.js';
 import { toFtsMatchQuery } from './fts-query.js';
 import { FTS_WEIGHTS } from './schema.js';
 
@@ -21,6 +22,8 @@ export interface CachedSearchParams {
   subject?: string;
   since?: Date;
   before?: Date;
+  /** Return only rows after this one in search order. */
+  cursor?: SearchCursor;
   limit: number;
 }
 
@@ -112,6 +115,11 @@ export function searchCache(
     where.push(`m.date < ?`);
     args.push(params.before.getTime());
   }
+  if (params.cursor) {
+    const { before, account_id, mailbox, uid } = params.cursor;
+    where.push(`(m.date, m.account_id, m.mailbox, m.uid) < (?, ?, ?, ?)`);
+    args.push(Date.parse(before), account_id, mailbox, uid);
+  }
 
   // Structured filters are substring matches on the stored values, matching
   // IMAP SEARCH FROM/TO/SUBJECT semantics rather than FTS tokenization.
@@ -133,10 +141,12 @@ export function searchCache(
     args.push(`%${params.subject.toLowerCase()}%`);
   }
 
-  // Ordering is date DESC in both shapes. Relevance ranking is deliberately
+  // Both shapes use the order defined in lib/search-cursor.ts, and the cursor
+  // predicate above is its keyset. Relevance ranking is deliberately
   // NOT used for ordering: search_threads is documented to return newest-first,
   // and shadow mode can only diff the two paths if ordering matches.
-  const sql = `${base} AND ${where.join(' AND ')} ORDER BY m.date DESC, m.uid DESC LIMIT ?`;
+  const sql = `${base} AND ${where.join(' AND ')}
+    ORDER BY m.date DESC, m.account_id DESC, m.mailbox DESC, m.uid DESC LIMIT ?`;
   args.push(params.limit);
 
   const rows = db.prepare(sql).all(...args) as unknown as RawRow[];
@@ -186,8 +196,8 @@ function safeParse<T>(raw: string | null, fallback: T): T {
   }
 }
 
-/** Per-account result counts, matching the IMAP path's envelope. */
-export function countByAccount(rows: CachedSearchRow[]): Record<string, number> {
+/** Per-account result counts for the search_threads envelope. */
+export function countByAccount(rows: Array<{ account_id: string }>): Record<string, number> {
   const counts: Record<string, number> = {};
   for (const row of rows) {
     counts[row.account_id] = (counts[row.account_id] ?? 0) + 1;

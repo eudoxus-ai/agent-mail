@@ -1,104 +1,116 @@
-import { describe, it, expect } from 'vitest';
-import { applyCursorBoundary } from '../../src/executor/executor.js';
-import { encodeCursor, decodeCursor } from '../../src/lib/search-cursor.js';
+import { describe, it, expect, vi } from 'vitest';
+import { Executor } from '../../src/executor/executor.js';
+import { openDatabase } from '../../src/ledger/db.js';
+import { openCache, type Database } from '../../src/cache/db.js';
+import { upsertMessage } from '../../src/cache/store.js';
+import { upsertMailboxState } from '../../src/cache/state.js';
+import { createLogger } from '../../src/logger.js';
+import type { AccountConfig } from '../../src/types.js';
 
 /**
- * The cache path must apply the same cursor boundary filter as IMAP.
- *
- * `before` is padded by 1 ms so rows sharing the previous page's boundary
- * timestamp come back rather than being skipped. Returning them unfiltered
- * makes page two repeat page one, and when enough messages share a timestamp
- * the cursor stops advancing entirely.
+ * Paging search_threads from the cache must reach the end, returning every
+ * row exactly once. The old cursor stopped at page two whenever it had to
+ * drop rows it had already returned.
  */
 
-const BOUNDARY = '2026-06-01T12:00:00.000Z';
+const ACCOUNTS: AccountConfig[] = ['work', 'home'].map((id) => ({
+  id,
+  email: `${id}@example.com`,
+  imap: { host: 'h', port: 993, tls: true },
+  smtp: { host: 'h', port: 465, tls: true },
+}));
 
-function row(uid: number, date = BOUNDARY, account_id = 'work', mailbox = 'INBOX') {
-  return { account_id, mailbox, uid, envelope: { date } };
+const SHARED = Date.UTC(2026, 5, 1, 12);
+
+function seed(cache: Database, accountId: string, uid: number, date: number) {
+  upsertMessage(cache, {
+    accountId,
+    uidvalidity: 1,
+    message: {
+      uid,
+      messageId: `<${accountId}-${uid}@x>`,
+      from: { address: 'alice@example.com', name: null },
+      to: [],
+      cc: [],
+      date: new Date(date).toISOString(),
+      subject: `s${uid}`,
+      bodyText: '',
+      references: [],
+      flags: [],
+      mailbox: 'INBOX',
+    },
+  });
 }
 
-describe('applyCursorBoundary', () => {
-  it('drops rows already emitted at the boundary timestamp', () => {
-    const cursor = decodeCursor(
-      encodeCursor({
-        before: BOUNDARY,
-        boundary_seen: [{ account_id: 'work', mailbox: 'INBOX', uid: 10 }],
-      })
-    )!;
+function executorOver(cache: Database) {
+  for (const { id } of ACCOUNTS) {
+    upsertMailboxState(cache, id, 'INBOX', { backfill_complete: 1, last_delta_at: Date.now() });
+  }
+  return new Executor({
+    db: openDatabase(':memory:'),
+    accounts: ACCOUNTS,
+    pool: { withConnection: vi.fn(async () => { throw new Error('IMAP must not be used'); }) } as never,
+    logger: createLogger('cli', { minLevel: 'error' }),
+    cache,
+    cacheConfig: { mode: 'on', freshnessWindowSeconds: 3600 } as never,
+  });
+}
 
-    const filtered = applyCursorBoundary([row(10), row(11)], cursor);
-    expect(filtered.map((r) => r.uid)).toEqual([11]);
+async function pageToEnd(executor: Executor, limit: number) {
+  const pages: Array<Array<{ account_id: string; uid: number }>> = [];
+  let cursor: string | undefined;
+  do {
+    const { result } = await executor.executeImmediate({
+      tool: 'search_threads',
+      toolParams: { limit, ...(cursor ? { cursor } : {}) },
+      accountId: 'work',
+      agentId: 'test',
+      risk: 'none',
+    });
+    const payload = JSON.parse(result[0].text);
+    pages.push(payload.results);
+    cursor = payload.next_cursor;
+    if (pages.length > 50) throw new Error('cursor never ended');
+  } while (cursor);
+  return pages;
+}
+
+const key = (r: { account_id: string; uid: number }) => `${r.account_id}:${r.uid}`;
+
+describe('search_threads cache cursor', () => {
+  it('returns every row once across ties larger than a page, then stops', async () => {
+    const cache = openCache(':memory:');
+    const expected: string[] = [];
+    // Seven rows per account at one instant, so the tie spans several pages
+    // and both accounts, and UIDs repeat across accounts.
+    for (const accountId of ['work', 'home']) {
+      for (let uid = 1; uid <= 7; uid += 1) {
+        seed(cache, accountId, uid, SHARED);
+        expected.push(`${accountId}:${uid}`);
+      }
+    }
+    // Two older rows make 16 in all, an exact multiple of the page size.
+    seed(cache, 'work', 8, SHARED - 1000);
+    seed(cache, 'home', 8, SHARED - 2000);
+    expected.push('work:8', 'home:8');
+
+    const pages = await pageToEnd(executorOver(cache), 4);
+
+    expect(pages.map((p) => p.length)).toEqual([4, 4, 4, 4]);
+    const seen = pages.flat().map(key);
+    expect(new Set(seen).size).toBe(seen.length);
+    expect([...seen].sort()).toEqual([...expected].sort());
+    // Newest first, ties broken by account, then uid, descending.
+    expect(seen.slice(0, 8)).toEqual([7, 6, 5, 4, 3, 2, 1].map((u) => `work:${u}`).concat('home:7'));
+    expect(seen.slice(-2)).toEqual(['work:8', 'home:8']);
   });
 
-  it('keeps rows strictly older than the boundary', () => {
-    const cursor = decodeCursor(
-      encodeCursor({ before: BOUNDARY, boundary_seen: [] })
-    )!;
+  it('ends without a cursor when the last page is short', async () => {
+    const cache = openCache(':memory:');
+    for (let uid = 1; uid <= 5; uid += 1) seed(cache, 'work', uid, SHARED - uid * 1000);
 
-    const older = row(5, '2026-05-31T00:00:00.000Z');
-    expect(applyCursorBoundary([older], cursor).map((r) => r.uid)).toEqual([5]);
-  });
+    const pages = await pageToEnd(executorOver(cache), 2);
 
-  it('drops rows newer than the boundary', () => {
-    const cursor = decodeCursor(
-      encodeCursor({ before: BOUNDARY, boundary_seen: [] })
-    )!;
-
-    const newer = row(99, '2026-06-02T00:00:00.000Z');
-    expect(applyCursorBoundary([newer], cursor)).toEqual([]);
-  });
-
-  it('does not confuse identical UIDs across accounts', () => {
-    const cursor = decodeCursor(
-      encodeCursor({
-        before: BOUNDARY,
-        boundary_seen: [{ account_id: 'work', mailbox: 'INBOX', uid: 10 }],
-      })
-    )!;
-
-    // UIDs are unique only per account/mailbox; a scalar comparison would
-    // wrongly drop the personal account's row.
-    const filtered = applyCursorBoundary(
-      [row(10, BOUNDARY, 'work'), row(10, BOUNDARY, 'personal')],
-      cursor
-    );
-    expect(filtered.map((r) => r.account_id)).toEqual(['personal']);
-  });
-
-  it('does not confuse identical UIDs across mailboxes', () => {
-    const cursor = decodeCursor(
-      encodeCursor({
-        before: BOUNDARY,
-        boundary_seen: [{ account_id: 'work', mailbox: 'INBOX', uid: 10 }],
-      })
-    )!;
-
-    const filtered = applyCursorBoundary(
-      [row(10, BOUNDARY, 'work', 'INBOX'), row(10, BOUNDARY, 'work', 'Archive')],
-      cursor
-    );
-    expect(filtered.map((r) => r.mailbox)).toEqual(['Archive']);
-  });
-
-  it('makes a second page disjoint from the first', () => {
-    const page1 = [row(12), row(11), row(10)];
-    const cursor = decodeCursor(
-      encodeCursor({
-        before: BOUNDARY,
-        boundary_seen: page1.map((r) => ({
-          account_id: r.account_id,
-          mailbox: r.mailbox,
-          uid: r.uid,
-        })),
-      })
-    )!;
-
-    // What the padded `before` would fetch again for page two.
-    const refetched = [...page1, row(9), row(8)];
-    const page2 = applyCursorBoundary(refetched, cursor);
-
-    expect(page2.map((r) => r.uid)).toEqual([9, 8]);
-    const overlap = page2.filter((r) => page1.some((p) => p.uid === r.uid));
-    expect(overlap).toEqual([]);
+    expect(pages.map((p) => p.map((r) => r.uid))).toEqual([[1, 2], [3, 4], [5]]);
   });
 });

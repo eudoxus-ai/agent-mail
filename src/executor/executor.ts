@@ -49,7 +49,14 @@ import {
   INSTALL_HINT,
   type WorkerState,
 } from '../ledger/worker-heartbeat.js';
-import { decodeCursor, encodeCursor, type SearchCursor } from '../lib/search-cursor.js';
+import {
+  compareSearchOrder,
+  cursorAt,
+  decodeCursor,
+  encodeCursor,
+  isAfterCursor,
+  type SearchCursor,
+} from '../lib/search-cursor.js';
 import { projectResult } from '../lib/envelope-projection.js';
 import { searchCache, countByAccount } from '../cache/query.js';
 import { getCoverage, isServable } from '../cache/coverage.js';
@@ -1080,16 +1087,6 @@ export class Executor {
     const mailbox = (intent.params.mailbox as string) ?? 'INBOX';
     const rawCursor = intent.params.cursor as string | undefined;
     const decodedCursor = rawCursor ? decodeCursor(rawCursor) : null;
-    // When a cursor is present, we need BOTH `before` and `lastUid` to move
-    // forward correctly across boundary-timestamp groups. Passing
-    // `cursor.before` to IMAP as strictly-less-than would drop every message
-    // that shares the cursor boundary timestamp but has uid > lastUid — they
-    // would become unreachable. Instead pad the IMAP `before` by 1 ms so
-    // boundary-timestamp rows come through, then post-filter below using a
-    // `(date, uid)` tuple comparison against the cursor.
-    const effectiveBefore = decodedCursor
-      ? new Date(new Date(decodedCursor.before).getTime() + 1).toISOString()
-      : (intent.params.before as string | undefined);
     const baseCriteria = {
       from: intent.params.from as string | undefined,
       to: intent.params.to as string | undefined,
@@ -1097,17 +1094,14 @@ export class Executor {
       since: intent.params.since
         ? new Date(intent.params.since as string)
         : undefined,
-      before: effectiveBefore ? new Date(effectiveBefore) : undefined,
+      // A cursor replaces `before`.
+      before:
+        !decodedCursor && intent.params.before
+          ? new Date(intent.params.before as string)
+          : undefined,
     };
     const limit = (intent.params.limit as number) ?? 20;
     const query = intent.params.query as string | undefined;
-    // When paging with a cursor we may need to fetch more than `limit` from
-    // IMAP: boundary-timestamp rows that tie with the cursor (`date ==
-    // cursor.before`) can be mixed with already-seen rows. The tuple filter
-    // drops the seen ones, so to guarantee we can still fill `limit` we over-
-    // fetch up to the group size. `limit * 2` is a safe upper bound because
-    // at most `limit` rows at the boundary were already returned on page 1.
-    const imapFetchLimit = decodedCursor ? limit * 2 : limit;
 
     // Cache read path. `on` serves from the cache when coverage allows;
     // `shadow` computes the cache answer but still returns IMAP's, logging any
@@ -1123,13 +1117,27 @@ export class Executor {
             subject: baseCriteria.subject,
             since: baseCriteria.since,
             before: baseCriteria.before,
-            limit,
+            cursor: decodedCursor ?? undefined,
+            // One past the page, to learn whether there is a next one.
+            limit: limit + 1,
           })
         : null;
 
     if (cacheAttempt && this.cacheConfig.mode === 'on' && cacheAttempt.servable) {
-      return this.buildCachePayload(cacheAttempt, allIds, limit, intent, decodedCursor);
+      return this.buildCachePayload(cacheAttempt, allIds, limit, intent);
     }
+
+    // The server cannot apply the cursor. It filters by calendar day and the
+    // provider trims to an exclusive `before`, so ask for everything up to and
+    // including the cursor's instant and apply the cursor here. That window
+    // also holds mail from later on the cursor's day, already returned, which
+    // the cursor filter drops. Fetching twice the page keeps the page full
+    // unless one day holds more than a page of it. The one extra row says
+    // whether a next page exists.
+    const imapCriteria = decodedCursor
+      ? { ...baseCriteria, before: new Date(Date.parse(decodedCursor.before) + 1) }
+      : baseCriteria;
+    const imapFetchLimit = (decodedCursor ? limit * 2 : limit) + 1;
 
     const fanResult = await fanOut({
       pool: this.pool,
@@ -1140,10 +1148,10 @@ export class Executor {
         const serverQuery = query?.replaceAll('"', '');
         const resultSets = serverQuery
           ? await Promise.all([
-              imap.search(mailbox, { ...baseCriteria, subject: serverQuery }, imapFetchLimit),
-              imap.search(mailbox, { ...baseCriteria, body: serverQuery }, imapFetchLimit),
+              imap.search(mailbox, { ...imapCriteria, subject: serverQuery }, imapFetchLimit),
+              imap.search(mailbox, { ...imapCriteria, body: serverQuery }, imapFetchLimit),
             ])
-          : [await imap.search(mailbox, baseCriteria, imapFetchLimit)];
+          : [await imap.search(mailbox, imapCriteria, imapFetchLimit)];
 
         const merged = new Map<number, Awaited<(typeof resultSets)[number][number]>>();
         for (const set of resultSets) {
@@ -1185,45 +1193,13 @@ export class Executor {
       },
     });
 
-    // Apply cursor filter: keep rows strictly older than `cursor.before`, and
-    // rows at the boundary date only if their `{account_id, mailbox, uid}`
-    // tuple was NOT already emitted on the previous page. UIDs are only
-    // unique per account/mailbox, so a scalar UID comparison would drop
-    // cross-account boundary rows (e.g. account B's uid=5 at the same
-    // timestamp as account A's uid=100).
-    const cursorBoundaryMs = decodedCursor
-      ? new Date(decodedCursor.before).getTime()
-      : null;
-    const boundarySeenKeys = decodedCursor
-      ? new Set(
-          decodedCursor.boundary_seen.map(
-            (r) => `${r.account_id}\x00${r.mailbox}\x00${r.uid}`
-          )
-        )
-      : null;
-    const allResults = Object.values(fanResult.per_account)
+    const ordered = Object.values(fanResult.per_account)
       .flat()
-      .filter((r) => {
-        if (cursorBoundaryMs === null || boundarySeenKeys === null) return true;
-        const rowMs = new Date(r.envelope.date).getTime();
-        if (rowMs < cursorBoundaryMs) return true;
-        if (rowMs === cursorBoundaryMs) {
-          return !boundarySeenKeys.has(
-            `${r.account_id}\x00${r.mailbox}\x00${r.uid}`
-          );
-        }
-        return false;
-      })
-      .sort(
-        (a, b) =>
-          new Date(b.envelope.date).getTime() - new Date(a.envelope.date).getTime()
-      )
-      .slice(0, limit);
+      .filter((r) => !decodedCursor || isAfterCursor(r, decodedCursor))
+      .sort(compareSearchOrder);
+    const allResults = ordered.slice(0, limit);
 
-    const per_account_counts: Record<string, number> = {};
-    for (const [accountId, rows] of Object.entries(fanResult.per_account)) {
-      per_account_counts[accountId] = (rows as any[]).length;
-    }
+    const per_account_counts = countByAccount(allResults);
 
     const fields = intent.params.fields as string[] | undefined;
     const projected = allResults.map((r) => projectResult(r, fields));
@@ -1237,31 +1213,15 @@ export class Executor {
     if (Object.keys(fanResult.errors).length > 0) {
       payload.per_account_errors = fanResult.errors;
     }
-    if (allResults.length >= limit && allResults.length > 0) {
-      const oldest = allResults[allResults.length - 1];
-      const boundaryDate = oldest.envelope.date;
-      const boundaryMs = new Date(boundaryDate).getTime();
-      // Every row on this page sharing the oldest date must be recorded, not
-      // just the last one — otherwise page 2 would re-emit the boundary rows
-      // we already returned. Capped at `limit` entries.
-      const boundary_seen = allResults
-        .filter((r) => new Date(r.envelope.date).getTime() === boundaryMs)
-        .map((r) => ({
-          account_id: r.account_id,
-          mailbox: r.mailbox,
-          uid: r.uid,
-        }));
-      payload.next_cursor = encodeCursor({
-        before: boundaryDate,
-        boundary_seen,
-      });
+    if (ordered.length > limit) {
+      payload.next_cursor = encodeCursor(cursorAt(allResults[allResults.length - 1]));
     }
 
     // Shadow mode: IMAP's answer is what ships; the cache answer is only
     // compared against it. This is the gate that has to pass before anyone
     // flips mode to `on`.
     if (cacheAttempt && this.cacheConfig.mode === 'shadow') {
-      const diff = diffResults(allResults, cacheAttempt.rows);
+      const diff = diffResults(allResults, cacheAttempt.rows.slice(0, limit));
       logDivergence(
         this.logger,
         { mailbox, query, account_ids: targetIds, limit, cache_state: cacheAttempt.coverage.state },
@@ -1283,6 +1243,7 @@ export class Executor {
     subject?: string;
     since?: Date;
     before?: Date;
+    cursor?: SearchCursor;
     limit: number;
   }): {
     rows: ReturnType<typeof searchCache>;
@@ -1310,17 +1271,10 @@ export class Executor {
     attempt: NonNullable<ReturnType<Executor['readFromCache']>>,
     allIds: string[],
     limit: number,
-    intent: Intent,
-    cursor: SearchCursor | null
+    intent: Intent
   ): SearchThreadsMultiPayload {
     const fields = intent.params.fields as string[] | undefined;
-
-    // `before` was padded by 1 ms so rows sharing the previous page's boundary
-    // timestamp come back rather than being skipped. They must then be
-    // filtered by the tuple already emitted, exactly as the IMAP path does —
-    // otherwise page two repeats page one and, when enough messages share a
-    // timestamp, the cursor stops advancing.
-    const rows = cursor ? applyCursorBoundary(attempt.rows, cursor) : attempt.rows;
+    const rows = attempt.rows.slice(0, limit);
 
     const payload: SearchThreadsMultiPayload = {
       accounts_searched: Object.keys(countByAccount(rows)),
@@ -1337,19 +1291,8 @@ export class Executor {
       coverage: attempt.coverage.coverage,
     };
 
-    if (rows.length >= limit && rows.length > 0) {
-      const oldest = rows[rows.length - 1];
-      const boundaryMs = new Date(oldest.envelope.date).getTime();
-      payload.next_cursor = encodeCursor({
-        before: oldest.envelope.date,
-        boundary_seen: rows
-          .filter((r) => new Date(r.envelope.date).getTime() === boundaryMs)
-          .map((r) => ({
-            account_id: r.account_id,
-            mailbox: r.mailbox,
-            uid: r.uid,
-          })),
-      });
+    if (attempt.rows.length > limit) {
+      payload.next_cursor = encodeCursor(cursorAt(rows[rows.length - 1]));
     }
 
     return payload;
@@ -3301,31 +3244,4 @@ function buildInterpretation(input: {
     'Borrows are serialized per account, so anything queued behind a slow operation ' +
     'waits for it — a small job sitting at "executing" is usually queued, not stuck.'
   );
-}
-
-
-/**
- * Drop rows already emitted at the previous page's boundary timestamp.
- *
- * Mirrors the IMAP path: keep anything strictly older than the boundary, plus
- * boundary-timestamp rows whose (account_id, mailbox, uid) triple was not
- * already returned. UIDs are unique only per account/mailbox, so a scalar
- * comparison would drop cross-account rows that merely share a UID.
- */
-export function applyCursorBoundary<
-  T extends { account_id: string; mailbox: string; uid: number; envelope: { date: string } },
->(rows: T[], cursor: SearchCursor): T[] {
-  const boundaryMs = new Date(cursor.before).getTime();
-  const seen = new Set(
-    cursor.boundary_seen.map((r) => `${r.account_id}\u0000${r.mailbox}\u0000${r.uid}`)
-  );
-
-  return rows.filter((row) => {
-    const rowMs = new Date(row.envelope.date).getTime();
-    if (rowMs < boundaryMs) return true;
-    if (rowMs === boundaryMs) {
-      return !seen.has(`${row.account_id}\u0000${row.mailbox}\u0000${row.uid}`);
-    }
-    return false;
-  });
 }

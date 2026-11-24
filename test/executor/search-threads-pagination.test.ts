@@ -109,12 +109,13 @@ describe('search_threads opaque cursor pagination', () => {
     expect(payload.next_cursor).toBeTruthy();
     const decoded = decodeCursor(payload.next_cursor);
     expect(decoded).not.toBeNull();
-    // oldest of first page is the 10th newest = index 9 in corpus
-    expect(decoded!.before).toBe(corpus[9].envelope.date);
-    // boundary_seen should contain the single row at the boundary date.
-    expect(decoded!.boundary_seen).toEqual([
-      { account_id: 'a@x.com', mailbox: 'INBOX', uid: corpus[9].uid },
-    ]);
+    // The cursor is the last row of the page: the 10th newest, index 9.
+    expect(decoded).toEqual({
+      before: corpus[9].envelope.date,
+      account_id: 'a@x.com',
+      mailbox: 'INBOX',
+      uid: corpus[9].uid,
+    });
   });
 
   it('advances past the first page when cursor is passed back', async () => {
@@ -177,7 +178,7 @@ describe('search_threads opaque cursor pagination', () => {
     // Valid base64url + JSON, but `before` is not a date. decodeCursor must
     // return null so the search falls back to no-cursor semantics.
     const cursor = Buffer.from(
-      JSON.stringify({ before: 'not-a-date', boundary_seen: [] })
+      JSON.stringify({ before: 'not-a-date', account_id: 'a@x.com', mailbox: 'INBOX', uid: 1 })
     ).toString('base64url');
 
     const { result } = await executor.executeImmediate({
@@ -229,15 +230,15 @@ describe('search_threads opaque cursor pagination', () => {
       list_id: null,
       list_unsubscribe: null,
     }));
-    // Search spy: filter by before (strict <) if provided, else return all.
-    // This mirrors real IMAP SEARCH BEFORE semantics (date-exclusive).
+    // Search spy: filter by before (strict <) if provided, else return all,
+    // then keep the highest UIDs the way ImapProvider.search does.
     const searchSpy = vi.fn(async (_mailbox: string, criteria: any, limit: number) => {
       let rows = corpus;
       if (criteria.before instanceof Date) {
         const beforeMs = criteria.before.getTime();
         rows = rows.filter((r) => new Date(r.envelope.date).getTime() < beforeMs);
       }
-      return rows.slice(0, limit);
+      return rows.slice(-limit);
     });
     const pool = {
       withConnection: vi.fn(async (_id: string, fn: any) =>
@@ -372,7 +373,9 @@ describe('search_threads opaque cursor pagination', () => {
 
     const cursor = encodeCursor({
       before: '2026-04-20T00:00:00.000Z',
-      boundary_seen: [],
+      account_id: 'a@x.com',
+      mailbox: 'INBOX',
+      uid: 1,
     });
 
     await executor.executeImmediate({
@@ -388,9 +391,9 @@ describe('search_threads opaque cursor pagination', () => {
     });
 
     const [, criteria] = searchSpy.mock.calls[0];
-    // Cursor `before` is padded by 1ms so IMAP's strict less-than still
-    // surfaces boundary-timestamp rows; tuple filter in JS enforces
-    // the true `(date, uid) < (cursor.before, cursor.lastUid)` ordering.
+    // The provider's `before` is exclusive, and rows at the cursor's own
+    // instant may still be due, so the server is asked for everything up to
+    // and including it. The cursor itself is applied after.
     expect((criteria.before as Date).toISOString()).toBe('2026-04-20T00:00:00.001Z');
   });
 });
