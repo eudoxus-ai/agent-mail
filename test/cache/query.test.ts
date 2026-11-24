@@ -347,10 +347,10 @@ describe('getCoverage', () => {
 
 describe('coverage must match the scope actually being searched', () => {
   const NOW = Date.UTC(2026, 6, 31, 12, 0, 0);
-  const opts = (mailbox?: string) => ({
+  const opts = (mailbox: string, accountIds = ['work']) => ({
     freshnessWindowSeconds: 300,
     now: NOW,
-    mailbox,
+    mailboxes: accountIds.map((account_id) => ({ account_id, mailbox })),
   });
 
   function synced(accountId: string, mailbox: string) {
@@ -370,11 +370,21 @@ describe('coverage must match the scope actually being searched', () => {
     expect(getCoverage(db, ['work'], opts('INBOX')).state).toBe('fresh');
   });
 
+  it('is unavailable when one of several mailboxes has never been synced', () => {
+    synced('work', 'INBOX');
+    const mailboxes = ['INBOX', 'Sent'].map((mailbox) => ({ account_id: 'work', mailbox }));
+
+    // A synced INBOX does not vouch for the Sent mailbox read alongside it.
+    expect(
+      getCoverage(db, ['work'], { freshnessWindowSeconds: 300, now: NOW, mailboxes }).state
+    ).toBe('unavailable');
+  });
+
   it('is unavailable when only some requested accounts have synced', () => {
     synced('work', 'INBOX');
 
     // A two-account search must not quietly return one account's results.
-    expect(getCoverage(db, ['work', 'personal'], opts('INBOX')).state).toBe('unavailable');
+    expect(getCoverage(db, ['work', 'personal'], opts('INBOX', ['work', 'personal'])).state).toBe('unavailable');
     expect(getCoverage(db, ['work'], opts('INBOX')).state).toBe('fresh');
   });
 
@@ -382,7 +392,7 @@ describe('coverage must match the scope actually being searched', () => {
     synced('work', 'INBOX');
     synced('personal', 'INBOX');
 
-    expect(getCoverage(db, ['work', 'personal'], opts('INBOX')).state).toBe('fresh');
+    expect(getCoverage(db, ['work', 'personal'], opts('INBOX', ['work', 'personal'])).state).toBe('fresh');
   });
 
   it('is unavailable when a mailbox is known but has never completed a sync', () => {

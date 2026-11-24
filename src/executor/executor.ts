@@ -1195,9 +1195,9 @@ export class Executor {
     // provider trims to an exclusive `before`, so ask for everything up to and
     // including the cursor's instant and apply the cursor here. That window
     // also holds mail from later on the cursor's day, already returned, which
-    // the cursor filter drops. Fetching twice the page keeps the page full
-    // unless one day holds more than a page of it. The one extra row says
-    // whether a next page exists.
+    // the provider skips past. What is left to drop here is mail at the
+    // cursor's own instant that sorts before it, and fetching twice the page
+    // leaves room for that. The one extra row says whether a next page exists.
     const imapCriteria = decodedCursor
       ? { ...baseCriteria, before: new Date(Date.parse(decodedCursor.before) + 1) }
       : baseCriteria;
@@ -1322,31 +1322,40 @@ export class Executor {
     scope: CacheScope,
     filters: Omit<CachedSearchParams, 'mailboxes'>
   ): {
-    rows: Array<CachedSearchRow & { from_me: boolean; replied_to_sender: number }>;
+    rows: Array<CachedSearchRow & { from_me: boolean; replied_to_sender: number | null }>;
     coverage: ReturnType<typeof getCoverage>;
     servable: boolean;
   } | null {
     const cache = this.cache;
     if (!cache) return null;
     try {
-      const coverage = getCoverage(cache, scope.accountIds, {
-        freshnessWindowSeconds: this.cacheConfig.freshnessWindowSeconds,
-        // Coverage must be judged for the mailbox actually being searched.
-        mailbox: scope.mailbox,
-      });
-      const found = searchCache(cache, { ...filters, mailboxes: resolveScope(cache, scope) });
+      const freshness = { freshnessWindowSeconds: this.cacheConfig.freshnessWindowSeconds };
+      const mailboxes = resolveScope(cache, scope);
+      // Coverage must be judged for every mailbox actually read. With
+      // include_sent that is Sent too: a healthy INBOX says nothing about it.
+      const coverage = getCoverage(cache, scope.accountIds, { ...freshness, mailboxes });
+      const found = searchCache(cache, { ...filters, mailboxes });
       // Replies count the operator's sent mail in every configured account,
       // not only the ones searched: a sender answered from another account
-      // has still been answered.
-      const replies = sentToCounts(
-        cache,
-        sentMailboxes(cache, this.accounts.map((a) => a.id)),
-        found.map((r) => r.from_address)
-      );
+      // has still been answered. A count is only as good as the Sent mail
+      // behind it, so when that is missing, unsynced or stale the answer is
+      // null, not a 0 that would read as "never written to".
+      const sent = sentMailboxes(cache, this.accounts.map((a) => a.id));
+      const sentUsable =
+        sent.length > 0 &&
+        isServable(
+          getCoverage(cache, [...new Set(sent.map((s) => s.account_id))], {
+            ...freshness,
+            mailboxes: sent,
+          }).state
+        );
+      const replies = sentUsable
+        ? sentToCounts(cache, sent, found.map((r) => r.from_address))
+        : null;
       const rows = found.map((r) => ({
         ...r,
         from_me: this.isFromMe(mailboxRole(r.mailbox) === 'sent', r.from_address),
-        replied_to_sender: replies.get(r.from_address.toLowerCase()) ?? 0,
+        replied_to_sender: replies ? (replies.get(r.from_address.toLowerCase()) ?? 0) : null,
       }));
       return { rows, coverage, servable: isServable(coverage.state) };
     } catch (error) {

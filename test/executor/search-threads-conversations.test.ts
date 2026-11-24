@@ -131,6 +131,35 @@ const where = (r: { account_id: string; mailbox: string; uid: number }) =>
   `${r.account_id} ${r.mailbox} ${r.uid}`;
 
 describe('search_threads conversation fields from the cache', () => {
+  const STALE = Date.now() - 2 * 3600 * 1000;
+
+  it('does not answer include_sent from the cache when a sent mailbox is stale', async () => {
+    synced('work', '[Gmail]/Sent Mail', STALE);
+    const search_ = vi.fn(async () => []);
+    const imap = { search: search_, sentMailboxes: vi.fn(async () => ['[Gmail]/Sent Mail']) };
+    const ex = executor({
+      pool: { withConnection: vi.fn(async (_id: string, fn: (i: unknown) => unknown) => fn(imap)) },
+    });
+
+    const payload = await search(ex, { account_ids: ['work'], include_sent: true });
+
+    expect(payload.cache).toBeUndefined();
+    expect(search_.mock.calls.map((c) => c[0])).toEqual(['INBOX', '[Gmail]/Sent Mail']);
+  });
+
+  it('reports replies as unknown, not zero, when sent mail is stale', async () => {
+    synced('home', 'INBOX.Sent Messages', STALE);
+
+    const payload = await search(executor(), { account_ids: ['work'] });
+
+    expect(payload.cache.state).toBe('fresh');
+    expect(payload.results.map((r: { replied_to_sender: unknown }) => r.replied_to_sender)).toEqual([
+      null,
+      null,
+      null,
+    ]);
+  });
+
   it('reports recipients, thread, authorship and replies per message', async () => {
     const payload = await search(executor(), { account_ids: ['work'] });
 
