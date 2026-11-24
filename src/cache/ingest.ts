@@ -206,6 +206,7 @@ export function toMessageRow(input: IngestInput): MessageRow {
       list_id: listId,
       list_unsubscribe: listUnsub?.raw ?? null,
       subject: m.subject ?? '',
+      from_address: m.from?.address ?? null,
     }),
     size: input.size ?? null,
     has_attach: attachments.length > 0 ? 1 : 0,

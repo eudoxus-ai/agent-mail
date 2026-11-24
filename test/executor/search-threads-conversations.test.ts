@@ -253,4 +253,15 @@ describe('search_threads conversation fields from the mail server', () => {
       replied_to_sender: null,
     });
   });
+
+  it('classifies an automated sender as a notification', async () => {
+    const imap = { search: vi.fn(async () => [hit(1, 'no-reply@service.example', day(1))]) };
+    const ex = executor({
+      cache: undefined,
+      pool: { withConnection: vi.fn(async (_id: string, fn: (i: unknown) => unknown) => fn(imap)) },
+    });
+
+    const payload = await search(ex, { account_ids: ['work'] });
+    expect(payload.results[0].category).toBe('notification');
+  });
 });

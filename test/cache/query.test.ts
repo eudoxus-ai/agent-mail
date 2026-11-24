@@ -165,6 +165,15 @@ describe('searchCache', () => {
     expect(Array.isArray(row.flags)).toBe(true);
   });
 
+  it('classifies each row as it is read, not by the category stored at ingest', () => {
+    const { id } = add(1, { from: { address: 'noreply@service.example', name: null }, subject: 'Hello' });
+    // What a row ingested under an older classifier still holds.
+    db.prepare(`UPDATE messages SET category = 'personal' WHERE id = ?`).run(id);
+
+    const [row] = searchCache(db, { mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }], limit: 1 });
+    expect(row.category).toBe('notification');
+  });
+
   it('includes attachment metadata', () => {
     upsertMessage(db, {
       accountId: 'work',

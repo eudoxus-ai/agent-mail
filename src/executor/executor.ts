@@ -1246,6 +1246,7 @@ export class Executor {
                 list_id: r.list_id ?? null,
                 list_unsubscribe: r.list_unsubscribe ?? null,
                 subject: r.envelope?.subject ?? '',
+                from_address: fromAddress,
               }),
               target: { account_id: accountId, uid: r.uid, mailbox: box },
             };

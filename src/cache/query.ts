@@ -1,6 +1,7 @@
 import type { Database } from '../ledger/sqlite.js';
 import type { Participant } from '../types.js';
 import type { SearchCursor } from '../lib/search-cursor.js';
+import { classifyCategory, type Category } from '../attention/category.js';
 import { toFtsMatchQuery } from './fts-query.js';
 import { inMailboxes, type MailboxRef } from './mailboxes.js';
 import { FTS_WEIGHTS } from './schema.js';
@@ -57,7 +58,7 @@ export interface CachedSearchRow {
   list_id: string | null;
   list_unsubscribe: string | null;
   is_list_mail: boolean;
-  category: string;
+  category: Category;
   target: { account_id: string; uid: number; mailbox: string };
   attachments: Array<{
     part_id: string;
@@ -87,7 +88,6 @@ interface RawRow {
   list_id: string | null;
   list_unsub: string | null;
   is_list_mail: number;
-  category: string | null;
 }
 
 export function searchCache(
@@ -199,7 +199,14 @@ function hydrate(db: Database, row: RawRow): CachedSearchRow {
     list_id: row.list_id,
     list_unsubscribe: listUnsub?.raw ?? null,
     is_list_mail: row.is_list_mail === 1,
-    category: row.category ?? 'personal',
+    // Classified here rather than read from messages.category, which holds
+    // whatever the classifier said when the row was ingested.
+    category: classifyCategory({
+      list_id: row.list_id,
+      list_unsubscribe: listUnsub?.raw ?? null,
+      subject: row.subject,
+      from_address: row.from_address,
+    }),
     target: { account_id: row.account_id, uid: row.uid, mailbox: row.mailbox },
     attachments,
   };
