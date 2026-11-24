@@ -10,6 +10,8 @@ tools:
   search_threads:      { risk: none, gate: ungated, reversible: false }
   list_senders:        { risk: none, gate: ungated, reversible: false }
   list_mailboxes:      { risk: none, gate: ungated, reversible: false }
+  list_accounts:       { risk: none, gate: ungated, reversible: false }
+  list_correspondents: { risk: none, gate: ungated, reversible: false }
   read_thread:         { risk: none, gate: ungated, reversible: false }
   # Reading is risk: none elsewhere, but this one writes a file to disk.
   # Set gate: configurable if you want approval before attachments are saved.

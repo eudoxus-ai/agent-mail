@@ -150,8 +150,8 @@ export function htmlToText(html: string): string {
     .replace(/&gt;/gi, '>')
     .replace(/&quot;/gi, '"')
     .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&#(\d+);/g, (_m, code) => {
-      const n = Number(code);
+    .replace(/&#(x[0-9a-f]+|\d+);/gi, (_m, code: string) => {
+      const n = code[0].toLowerCase() === 'x' ? parseInt(code.slice(1), 16) : Number(code);
       return Number.isFinite(n) && n > 0 && n < 0x110000
         ? String.fromCodePoint(n)
         : ' ';
@@ -206,6 +206,7 @@ export function toMessageRow(input: IngestInput): MessageRow {
       list_id: listId,
       list_unsubscribe: listUnsub?.raw ?? null,
       subject: m.subject ?? '',
+      from_address: m.from?.address ?? null,
     }),
     size: input.size ?? null,
     has_attach: attachments.length > 0 ? 1 : 0,

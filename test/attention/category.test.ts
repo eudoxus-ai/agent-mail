@@ -57,4 +57,47 @@ describe('classifyCategory', () => {
       subject: '70% off shoes — limited time',
     })).toBe('promotional');
   });
+
+  it('promotional on Black Friday and Cyber Monday subjects', () => {
+    for (const subject of ['Black Friday starts now', 'CYBER MONDAY: last chance', 'Up to 40%off everything']) {
+      expect(classifyCategory({ list_id: null, list_unsubscribe: null, subject })).toBe('promotional');
+    }
+  });
+
+  it.each([
+    'noreply@service.example',
+    'no-reply@service.example',
+    'no_reply@service.example',
+    'donotreply@service.example',
+    'do-not-reply@service.example',
+    'notifications@github.example',
+    'notification@service.example',
+    'MAILER-DAEMON@mx.example',
+    'postmaster@mx.example',
+    'bounce@mail.example',
+    'bounces+12345@mail.example',
+    'alerts@bank.example',
+  ])('notification for an automated sender that would otherwise look personal: %s', (from_address) => {
+    expect(
+      classifyCategory({ list_id: null, list_unsubscribe: null, subject: 'Hello there', from_address })
+    ).toBe('notification');
+  });
+
+  it('personal for people whose names merely resemble those words', () => {
+    for (const from_address of ['bouncer@club.example', 'norah@example.com', 'alice@notifications.example']) {
+      expect(
+        classifyCategory({ list_id: null, list_unsubscribe: null, subject: 'Hello there', from_address })
+      ).toBe('personal');
+    }
+  });
+
+  it('keeps the stronger signals ahead of the sender', () => {
+    const from_address = 'noreply@shop.example';
+    expect(
+      classifyCategory({ list_id: null, list_unsubscribe: null, subject: 'Your receipt', from_address })
+    ).toBe('transactional');
+    expect(
+      classifyCategory({ list_id: '<news.shop.example>', list_unsubscribe: null, subject: 'Weekly', from_address })
+    ).toBe('newsletter');
+  });
 });

@@ -40,7 +40,7 @@ function add(uid: number, overrides: Partial<EmailMessage> = {}) {
 }
 
 function inboxUids(): number[] {
-  return searchCache(db, { accountIds: ['work'], mailbox: 'INBOX', limit: 100 }).map(
+  return searchCache(db, { mailboxes: [{ account_id: 'work', mailbox: 'INBOX' }], limit: 100 }).map(
     (r) => r.uid
   );
 }

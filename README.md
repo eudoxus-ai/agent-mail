@@ -235,7 +235,9 @@ Notifications are posted with `osascript` instead of `node-notifier`/`terminal-n
 
 | Tool | What it does | Risk | Gate |
 |------|-------------|------|------|
-| `search_threads` | Search emails across all accounts (or scoped via `account_ids`) | None | Immediate |
+| `search_threads` | Search emails across all accounts (or scoped via `account_ids`). Each result has its recipients, thread, and whether you wrote it or have written to its sender. `include_sent: true` merges sent mail into the same results; `thread_id` returns one whole conversation | None | Immediate |
+| `list_accounts` | Your accounts, the addresses you send from, and each cached mailbox with its role (inbox, sent, other) | None | Immediate |
+| `list_correspondents` | The people you exchange mail with: messages each way, last contact, and shared threads. Reads only the local cache | None | Immediate |
 | `read_thread` | Read a single message identified by `target: {account_id, uid}` | None | Immediate |
 | `get_attachment` | Download one attachment to a private staging directory and return its path | Low | Immediate |
 | `get_overview` | Cross-account summary of recent mail that needs attention | None | Immediate |
@@ -265,6 +267,12 @@ Read tools (`search_threads`, `get_overview`, `get_audit_log`, `get_pending_acti
 ```
 
 `per_account_errors` is only present when at least one account failed — the rest of the call still succeeds with partial results.
+
+### Conversations
+
+Every `search_threads` result carries `to`, `cc`, `thread_id`, `in_reply_to`, `from_me` and `replied_to_sender`. `from_me` is true for mail in a sent mailbox or from one of your configured addresses. `replied_to_sender` counts the messages in your sent mailboxes, across all accounts, that have the sender in To or Cc, so `0` means you have never written to them. Pass a result's `thread_id` back to get the whole conversation, including your replies in Sent and anything archived.
+
+`thread_id`, `replied_to_sender`, `list_correspondents` and the mailbox details in `list_accounts` come from the [local cache](#local-cache). When the mail server answers a search instead, `thread_id` and `replied_to_sender` are `null`. A `thread_id` search or `list_correspondents` call that the cache cannot answer returns an error rather than a different answer.
 
 ### Account-qualified targets
 

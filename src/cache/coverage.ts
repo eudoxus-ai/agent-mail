@@ -1,4 +1,5 @@
 import type { Database } from '../ledger/sqlite.js';
+import { inMailboxes, type MailboxRef } from './mailboxes.js';
 
 /**
  * What the cache actually has, so responses can say so.
@@ -35,7 +36,7 @@ interface CoverageRow {
 export function getCoverage(
   db: Database,
   accountIds: string[],
-  options: { freshnessWindowSeconds: number; now?: number; mailbox?: string }
+  options: { freshnessWindowSeconds: number; now?: number; mailboxes?: MailboxRef[] }
 ): CacheCoverage {
   const now = options.now ?? Date.now();
 
@@ -44,13 +45,18 @@ export function getCoverage(
   }
 
   const placeholders = accountIds.map(() => '?').join(', ');
-  // Scoped to the mailbox actually being searched. Without this, state for any
+  // Scoped to the mailboxes actually being read. Without this, state for any
   // synced mailbox made an unsynced one (Drafts, say) look servable, and the
   // cache would answer with an empty result while suppressing the IMAP
   // fallback — silently missing mail, which is the failure this whole design
   // exists to avoid.
-  const mailboxClause = options.mailbox ? ' AND s.mailbox = ?' : '';
-  const args = options.mailbox ? [...accountIds, options.mailbox] : accountIds;
+  const { mailboxes } = options;
+  if (mailboxes && mailboxes.length === 0) {
+    return { state: 'unavailable', last_synced_at: null, coverage: {} };
+  }
+  const scope = mailboxes ? inMailboxes('s', mailboxes) : null;
+  const mailboxClause = scope ? ` AND ${scope.sql}` : '';
+  const args = scope ? [...accountIds, ...scope.args] : accountIds;
 
   const rows = db
     .prepare(
@@ -71,6 +77,10 @@ export function getCoverage(
   // and quietly return that account's results alone.
   const covered = new Set(rows.map((r) => r.account_id));
   if (accountIds.some((id) => !covered.has(id))) {
+    return { state: 'unavailable', last_synced_at: null, coverage: {} };
+  }
+  // Likewise every mailbox asked about: one with no state has never been read.
+  if (mailboxes && rows.length < new Set(mailboxes.map((m) => `${m.account_id}\u0000${m.mailbox}`)).size) {
     return { state: 'unavailable', last_synced_at: null, coverage: {} };
   }
 

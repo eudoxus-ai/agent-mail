@@ -1,5 +1,5 @@
 import type { Database } from '../ledger/sqlite.js';
-import type { AccountConfig, Intent, RiskLevel } from '../types.js';
+import type { AccountConfig, Intent, Participant, RiskLevel } from '../types.js';
 import { isListMail } from '../attention/signals.js';
 import { classifyCategory, type Category } from '../attention/category.js';
 import type { Logger } from '../logger.js';
@@ -49,9 +49,31 @@ import {
   INSTALL_HINT,
   type WorkerState,
 } from '../ledger/worker-heartbeat.js';
-import { decodeCursor, encodeCursor, type SearchCursor } from '../lib/search-cursor.js';
+import {
+  compareSearchOrder,
+  cursorAt,
+  decodeCursor,
+  encodeCursor,
+  isAfterCursor,
+} from '../lib/search-cursor.js';
 import { projectResult } from '../lib/envelope-projection.js';
-import { searchCache, countByAccount } from '../cache/query.js';
+import {
+  searchCache,
+  countByAccount,
+  sentToCounts,
+  type CachedSearchParams,
+  type CachedSearchRow,
+} from '../cache/query.js';
+import {
+  cachedMailboxes,
+  mailboxRole,
+  sentFromAddresses,
+  sentMailboxes,
+  summarizeMailboxes,
+  type MailboxRef,
+} from '../cache/mailboxes.js';
+import { listCorrespondents } from '../cache/correspondents.js';
+import { isSentMailboxName } from '../lib/sent-mailboxes.js';
 import { getCoverage, isServable } from '../cache/coverage.js';
 import { diffResults, logDivergence } from '../cache/shadow.js';
 import { invalidate } from '../cache/invalidate.js';
@@ -119,11 +141,50 @@ interface SearchThreadResult {
   };
   snippet: string;
   flags: string[];
+  to: Participant[];
+  cc: Participant[];
+  /** The cache's thread root. Null from the mail server, which has none. */
+  thread_id: string | null;
+  in_reply_to: string | null;
+  from_me: boolean;
+  /** Sent messages, across every account, addressed to this sender. Null from the mail server. */
+  replied_to_sender: number | null;
   list_id: string | null;
   list_unsubscribe: string | null;
   is_list_mail: boolean;
   category: Category;
   target: { account_id: string; uid: number; mailbox: string };
+}
+
+/**
+ * What a cache search reads: `mailbox` in every account, plus each account's
+ * sent mailboxes when asked. Without a mailbox it reads every cached mailbox,
+ * because a conversation spans Sent and archives as well as the inbox.
+ */
+interface CacheScope {
+  accountIds: string[];
+  mailbox?: string;
+  includeSent?: boolean;
+}
+
+function resolveScope(cache: Database, scope: CacheScope): MailboxRef[] {
+  const { mailbox } = scope;
+  if (mailbox === undefined) return cachedMailboxes(cache, scope.accountIds);
+  const named = scope.accountIds.map((account_id) => ({ account_id, mailbox }));
+  if (!scope.includeSent) return named;
+  return [...named, ...sentMailboxes(cache, scope.accountIds).filter((s) => s.mailbox !== mailbox)];
+}
+
+const CACHE_HINT =
+  'The agent-mail daemon fills the cache while cache.mode is shadow or on ' +
+  `(see 'agent-mail cache'). ${INSTALL_HINT}`;
+
+/** Why a read that only the cache can answer was refused. */
+function cacheOnlyRefusal(what: string, coverage: { state: string } | null): string {
+  const why = coverage
+    ? `the local cache is ${coverage.state}`
+    : 'no local cache could be read';
+  return `${what} is answered only from the local cache, and ${why}. ${CACHE_HINT}`;
 }
 
 interface SearchThreadsMultiPayload {
@@ -537,14 +598,10 @@ export class Executor {
       return { uids: [], checked: false, reason: 'cache mode is off' };
     }
 
-    const attempt = this.readFromCache({
-      accountIds: [args.accountId],
-      mailbox: args.mailbox,
-      from: args.from,
-      listId: args.listId,
-      before: args.before,
-      limit: args.limit,
-    });
+    const attempt = this.readFromCache(
+      { accountIds: [args.accountId], mailbox: args.mailbox },
+      { from: args.from, listId: args.listId, before: args.before, limit: args.limit }
+    );
     if (!attempt) return { uids: [], checked: false, reason: 'cache read failed' };
     if (!attempt.servable) {
       return { uids: [], checked: false, reason: `cache ${attempt.coverage.state}` };
@@ -1078,18 +1135,10 @@ export class Executor {
     }
 
     const mailbox = (intent.params.mailbox as string) ?? 'INBOX';
+    const includeSent = intent.params.include_sent === true;
+    const threadId = intent.params.thread_id as string | undefined;
     const rawCursor = intent.params.cursor as string | undefined;
     const decodedCursor = rawCursor ? decodeCursor(rawCursor) : null;
-    // When a cursor is present, we need BOTH `before` and `lastUid` to move
-    // forward correctly across boundary-timestamp groups. Passing
-    // `cursor.before` to IMAP as strictly-less-than would drop every message
-    // that shares the cursor boundary timestamp but has uid > lastUid — they
-    // would become unreachable. Instead pad the IMAP `before` by 1 ms so
-    // boundary-timestamp rows come through, then post-filter below using a
-    // `(date, uid)` tuple comparison against the cursor.
-    const effectiveBefore = decodedCursor
-      ? new Date(new Date(decodedCursor.before).getTime() + 1).toISOString()
-      : (intent.params.before as string | undefined);
     const baseCriteria = {
       from: intent.params.from as string | undefined,
       to: intent.params.to as string | undefined,
@@ -1097,133 +1146,145 @@ export class Executor {
       since: intent.params.since
         ? new Date(intent.params.since as string)
         : undefined,
-      before: effectiveBefore ? new Date(effectiveBefore) : undefined,
+      // A cursor replaces `before`.
+      before:
+        !decodedCursor && intent.params.before
+          ? new Date(intent.params.before as string)
+          : undefined,
     };
     const limit = (intent.params.limit as number) ?? 20;
     const query = intent.params.query as string | undefined;
-    // When paging with a cursor we may need to fetch more than `limit` from
-    // IMAP: boundary-timestamp rows that tie with the cursor (`date ==
-    // cursor.before`) can be mixed with already-seen rows. The tuple filter
-    // drops the seen ones, so to guarantee we can still fill `limit` we over-
-    // fetch up to the group size. `limit * 2` is a safe upper bound because
-    // at most `limit` rows at the boundary were already returned on page 1.
-    const imapFetchLimit = decodedCursor ? limit * 2 : limit;
 
     // Cache read path. `on` serves from the cache when coverage allows;
     // `shadow` computes the cache answer but still returns IMAP's, logging any
     // divergence. Either way a cache failure falls through to IMAP.
     const cacheAttempt =
       this.cache && this.cacheConfig.mode !== 'off'
-        ? this.readFromCache({
-            accountIds: targetIds,
-            mailbox,
-            query,
-            from: baseCriteria.from,
-            to: baseCriteria.to,
-            subject: baseCriteria.subject,
-            since: baseCriteria.since,
-            before: baseCriteria.before,
-            limit,
-          })
+        ? this.readFromCache(
+            threadId ? { accountIds: targetIds } : { accountIds: targetIds, mailbox, includeSent },
+            {
+              threadId,
+              query,
+              from: baseCriteria.from,
+              to: baseCriteria.to,
+              subject: baseCriteria.subject,
+              since: baseCriteria.since,
+              before: baseCriteria.before,
+              cursor: decodedCursor ?? undefined,
+              // One past the page, to learn whether there is a next one.
+              limit: limit + 1,
+            }
+          )
         : null;
 
-    if (cacheAttempt && this.cacheConfig.mode === 'on' && cacheAttempt.servable) {
-      return this.buildCachePayload(cacheAttempt, allIds, limit, intent, decodedCursor);
+    // Only the cache records which messages share a thread, so a thread
+    // search has nothing to fall back to. Searching INBOX instead would
+    // quietly answer a different question.
+    if (threadId) {
+      if (!cacheAttempt?.servable) {
+        throw new Error(cacheOnlyRefusal('A thread_id search', cacheAttempt?.coverage ?? null));
+      }
+      return this.buildCachePayload(cacheAttempt, allIds, limit, intent);
     }
+
+    if (cacheAttempt && this.cacheConfig.mode === 'on' && cacheAttempt.servable) {
+      return this.buildCachePayload(cacheAttempt, allIds, limit, intent);
+    }
+
+    // The server cannot apply the cursor. It filters by calendar day and the
+    // provider trims to an exclusive `before`, so ask for everything up to and
+    // including the cursor's instant and apply the cursor here. That window
+    // also holds mail from later on the cursor's day, already returned, which
+    // the provider skips past. What is left to drop here is mail at the
+    // cursor's own instant that sorts before it, and fetching twice the page
+    // leaves room for that. The one extra row says whether a next page exists.
+    const imapCriteria = decodedCursor
+      ? { ...baseCriteria, before: new Date(Date.parse(decodedCursor.before) + 1) }
+      : baseCriteria;
+    const imapFetchLimit = (decodedCursor ? limit * 2 : limit) + 1;
 
     const fanResult = await fanOut({
       pool: this.pool,
       accountIds: targetIds,
       label: 'search_threads',
       fn: async (accountId, imap) => {
+        // Listing mailboxes costs a round trip, so it happens only when Sent
+        // is searched too. Otherwise a sent mailbox is known by name, as the
+        // cache knows it.
+        const sentPaths = includeSent ? await imap.sentMailboxes() : [];
+        const searched = [mailbox, ...sentPaths.filter((path) => path !== mailbox)];
         // Quotes mark a phrase for the cache; to a server they are literal text.
         const serverQuery = query?.replaceAll('"', '');
-        const resultSets = serverQuery
-          ? await Promise.all([
-              imap.search(mailbox, { ...baseCriteria, subject: serverQuery }, imapFetchLimit),
-              imap.search(mailbox, { ...baseCriteria, body: serverQuery }, imapFetchLimit),
-            ])
-          : [await imap.search(mailbox, baseCriteria, imapFetchLimit)];
 
-        const merged = new Map<number, Awaited<(typeof resultSets)[number][number]>>();
-        for (const set of resultSets) {
-          for (const result of set) {
-            merged.set(result.uid, result);
+        const results = [];
+        for (const box of searched) {
+          const resultSets = serverQuery
+            ? await Promise.all([
+                imap.search(box, { ...imapCriteria, subject: serverQuery }, imapFetchLimit),
+                imap.search(box, { ...imapCriteria, body: serverQuery }, imapFetchLimit),
+              ])
+            : [await imap.search(box, imapCriteria, imapFetchLimit)];
+
+          const merged = new Map<number, Awaited<(typeof resultSets)[number][number]>>();
+          for (const set of resultSets) {
+            for (const result of set) {
+              merged.set(result.uid, result);
+            }
           }
-        }
-        const baseResults = Array.from(merged.values()).map((r) => ({
-          account_id: accountId,
-          mailbox,
-          ...r,
-          from_address: r.envelope?.from?.address ?? '',
-          from_name: r.envelope?.from?.name ?? null,
-          list_id: r.list_id ?? null,
-          list_unsubscribe: r.list_unsubscribe ?? null,
-          is_list_mail: isListMail(r.list_unsubscribe, r.list_id),
-          category: classifyCategory({
-            list_id: r.list_id ?? null,
-            list_unsubscribe: r.list_unsubscribe ?? null,
-            subject: r.envelope?.subject ?? '',
-          }),
-          target: { account_id: accountId, uid: r.uid, mailbox },
-        }));
+          const inSent = sentPaths.includes(box) || isSentMailboxName(box);
+          const boxResults = Array.from(merged.values()).map((r) => {
+            const fromAddress = r.envelope?.from?.address ?? '';
+            return {
+              account_id: accountId,
+              mailbox: box,
+              ...r,
+              from_address: fromAddress,
+              from_name: r.envelope?.from?.name ?? null,
+              to: r.to ?? [],
+              cc: r.cc ?? [],
+              thread_id: null,
+              in_reply_to: r.in_reply_to ?? null,
+              from_me: this.isFromMe(inSent, fromAddress),
+              replied_to_sender: null,
+              list_id: r.list_id ?? null,
+              list_unsubscribe: r.list_unsubscribe ?? null,
+              is_list_mail: isListMail(r.list_unsubscribe, r.list_id),
+              category: classifyCategory({
+                list_id: r.list_id ?? null,
+                list_unsubscribe: r.list_unsubscribe ?? null,
+                subject: r.envelope?.subject ?? '',
+                from_address: fromAddress,
+              }),
+              target: { account_id: accountId, uid: r.uid, mailbox: box },
+            };
+          });
 
-        // Populate snippet for threads that don't already have one.
-        // Only runs when include_snippets: true — each call adds one extra IMAP round-trip
-        // (N+1 calls per page). Default is off to keep searches fast.
-        if (intent.params.include_snippets === true) {
-          await Promise.all(
-            baseResults.map(async (r) => {
-              if (!r.snippet) {
-                r.snippet = await imap.fetchSnippet(mailbox, r.uid);
-              }
-            })
-          );
+          // Populate snippet for threads that don't already have one.
+          // Only runs when include_snippets: true — each call adds one extra IMAP round-trip
+          // (N+1 calls per page). Default is off to keep searches fast.
+          if (intent.params.include_snippets === true) {
+            await Promise.all(
+              boxResults.map(async (r) => {
+                if (!r.snippet) {
+                  r.snippet = await imap.fetchSnippet(box, r.uid);
+                }
+              })
+            );
+          }
+          results.push(...boxResults);
         }
 
-        return baseResults;
+        return results;
       },
     });
 
-    // Apply cursor filter: keep rows strictly older than `cursor.before`, and
-    // rows at the boundary date only if their `{account_id, mailbox, uid}`
-    // tuple was NOT already emitted on the previous page. UIDs are only
-    // unique per account/mailbox, so a scalar UID comparison would drop
-    // cross-account boundary rows (e.g. account B's uid=5 at the same
-    // timestamp as account A's uid=100).
-    const cursorBoundaryMs = decodedCursor
-      ? new Date(decodedCursor.before).getTime()
-      : null;
-    const boundarySeenKeys = decodedCursor
-      ? new Set(
-          decodedCursor.boundary_seen.map(
-            (r) => `${r.account_id}\x00${r.mailbox}\x00${r.uid}`
-          )
-        )
-      : null;
-    const allResults = Object.values(fanResult.per_account)
+    const ordered = Object.values(fanResult.per_account)
       .flat()
-      .filter((r) => {
-        if (cursorBoundaryMs === null || boundarySeenKeys === null) return true;
-        const rowMs = new Date(r.envelope.date).getTime();
-        if (rowMs < cursorBoundaryMs) return true;
-        if (rowMs === cursorBoundaryMs) {
-          return !boundarySeenKeys.has(
-            `${r.account_id}\x00${r.mailbox}\x00${r.uid}`
-          );
-        }
-        return false;
-      })
-      .sort(
-        (a, b) =>
-          new Date(b.envelope.date).getTime() - new Date(a.envelope.date).getTime()
-      )
-      .slice(0, limit);
+      .filter((r) => !decodedCursor || isAfterCursor(r, decodedCursor))
+      .sort(compareSearchOrder);
+    const allResults = ordered.slice(0, limit);
 
-    const per_account_counts: Record<string, number> = {};
-    for (const [accountId, rows] of Object.entries(fanResult.per_account)) {
-      per_account_counts[accountId] = (rows as any[]).length;
-    }
+    const per_account_counts = countByAccount(allResults);
 
     const fields = intent.params.fields as string[] | undefined;
     const projected = allResults.map((r) => projectResult(r, fields));
@@ -1237,31 +1298,15 @@ export class Executor {
     if (Object.keys(fanResult.errors).length > 0) {
       payload.per_account_errors = fanResult.errors;
     }
-    if (allResults.length >= limit && allResults.length > 0) {
-      const oldest = allResults[allResults.length - 1];
-      const boundaryDate = oldest.envelope.date;
-      const boundaryMs = new Date(boundaryDate).getTime();
-      // Every row on this page sharing the oldest date must be recorded, not
-      // just the last one — otherwise page 2 would re-emit the boundary rows
-      // we already returned. Capped at `limit` entries.
-      const boundary_seen = allResults
-        .filter((r) => new Date(r.envelope.date).getTime() === boundaryMs)
-        .map((r) => ({
-          account_id: r.account_id,
-          mailbox: r.mailbox,
-          uid: r.uid,
-        }));
-      payload.next_cursor = encodeCursor({
-        before: boundaryDate,
-        boundary_seen,
-      });
+    if (ordered.length > limit) {
+      payload.next_cursor = encodeCursor(cursorAt(allResults[allResults.length - 1]));
     }
 
     // Shadow mode: IMAP's answer is what ships; the cache answer is only
     // compared against it. This is the gate that has to pass before anyone
     // flips mode to `on`.
     if (cacheAttempt && this.cacheConfig.mode === 'shadow') {
-      const diff = diffResults(allResults, cacheAttempt.rows);
+      const diff = diffResults(allResults, cacheAttempt.rows.slice(0, limit));
       logDivergence(
         this.logger,
         { mailbox, query, account_ids: targetIds, limit, cache_state: cacheAttempt.coverage.state },
@@ -1273,30 +1318,45 @@ export class Executor {
   }
 
   /** Run the cache-side query, tolerating any failure by returning null. */
-  private readFromCache(params: {
-    accountIds: string[];
-    mailbox: string;
-    query?: string;
-    from?: string;
-    listId?: string;
-    to?: string;
-    subject?: string;
-    since?: Date;
-    before?: Date;
-    limit: number;
-  }): {
-    rows: ReturnType<typeof searchCache>;
+  private readFromCache(
+    scope: CacheScope,
+    filters: Omit<CachedSearchParams, 'mailboxes'>
+  ): {
+    rows: Array<CachedSearchRow & { from_me: boolean; replied_to_sender: number | null }>;
     coverage: ReturnType<typeof getCoverage>;
     servable: boolean;
   } | null {
-    if (!this.cache) return null;
+    const cache = this.cache;
+    if (!cache) return null;
     try {
-      const coverage = getCoverage(this.cache, params.accountIds, {
-        freshnessWindowSeconds: this.cacheConfig.freshnessWindowSeconds,
-        // Coverage must be judged for the mailbox actually being searched.
-        mailbox: params.mailbox,
-      });
-      const rows = searchCache(this.cache, params);
+      const freshness = { freshnessWindowSeconds: this.cacheConfig.freshnessWindowSeconds };
+      const mailboxes = resolveScope(cache, scope);
+      // Coverage must be judged for every mailbox actually read. With
+      // include_sent that is Sent too: a healthy INBOX says nothing about it.
+      const coverage = getCoverage(cache, scope.accountIds, { ...freshness, mailboxes });
+      const found = searchCache(cache, { ...filters, mailboxes });
+      // Replies count the operator's sent mail in every configured account,
+      // not only the ones searched: a sender answered from another account
+      // has still been answered. A count is only as good as the Sent mail
+      // behind it, so when that is missing, unsynced or stale the answer is
+      // null, not a 0 that would read as "never written to".
+      const sent = sentMailboxes(cache, this.accounts.map((a) => a.id));
+      const sentUsable =
+        sent.length > 0 &&
+        isServable(
+          getCoverage(cache, [...new Set(sent.map((s) => s.account_id))], {
+            ...freshness,
+            mailboxes: sent,
+          }).state
+        );
+      const replies = sentUsable
+        ? sentToCounts(cache, sent, found.map((r) => r.from_address))
+        : null;
+      const rows = found.map((r) => ({
+        ...r,
+        from_me: this.isFromMe(mailboxRole(r.mailbox) === 'sent', r.from_address),
+        replied_to_sender: replies ? (replies.get(r.from_address.toLowerCase()) ?? 0) : null,
+      }));
       return { rows, coverage, servable: isServable(coverage.state) };
     } catch (error) {
       this.logger.warn('cache: read failed, falling back to IMAP', {
@@ -1306,21 +1366,20 @@ export class Executor {
     }
   }
 
+  /** Mail the operator wrote: anything in a sent mailbox, or sent from a configured address. */
+  private isFromMe(inSentMailbox: boolean, fromAddress: string): boolean {
+    const address = fromAddress.toLowerCase();
+    return inSentMailbox || this.accounts.some((a) => a.email.toLowerCase() === address);
+  }
+
   private buildCachePayload(
     attempt: NonNullable<ReturnType<Executor['readFromCache']>>,
     allIds: string[],
     limit: number,
-    intent: Intent,
-    cursor: SearchCursor | null
+    intent: Intent
   ): SearchThreadsMultiPayload {
     const fields = intent.params.fields as string[] | undefined;
-
-    // `before` was padded by 1 ms so rows sharing the previous page's boundary
-    // timestamp come back rather than being skipped. They must then be
-    // filtered by the tuple already emitted, exactly as the IMAP path does —
-    // otherwise page two repeats page one and, when enough messages share a
-    // timestamp, the cursor stops advancing.
-    const rows = cursor ? applyCursorBoundary(attempt.rows, cursor) : attempt.rows;
+    const rows = attempt.rows.slice(0, limit);
 
     const payload: SearchThreadsMultiPayload = {
       accounts_searched: Object.keys(countByAccount(rows)),
@@ -1337,19 +1396,8 @@ export class Executor {
       coverage: attempt.coverage.coverage,
     };
 
-    if (rows.length >= limit && rows.length > 0) {
-      const oldest = rows[rows.length - 1];
-      const boundaryMs = new Date(oldest.envelope.date).getTime();
-      payload.next_cursor = encodeCursor({
-        before: oldest.envelope.date,
-        boundary_seen: rows
-          .filter((r) => new Date(r.envelope.date).getTime() === boundaryMs)
-          .map((r) => ({
-            account_id: r.account_id,
-            mailbox: r.mailbox,
-            uid: r.uid,
-          })),
-      });
+    if (attempt.rows.length > limit) {
+      payload.next_cursor = encodeCursor(cursorAt(rows[rows.length - 1]));
     }
 
     return payload;
@@ -1673,6 +1721,100 @@ export class Executor {
     return payload;
   }
 
+  /**
+   * The configured accounts, and what the cache knows about each: the
+   * addresses its sent mail went out from, and its cached mailboxes. Never
+   * contacts a server, so it answers even when one is down.
+   */
+  private listAccounts() {
+    const configured = this.accounts.map(({ id, email }) => ({ id, email }));
+    const cache = this.cacheConfig.mode === 'off' ? undefined : this.cache;
+    const note =
+      'The local cache is not available, so only the configured accounts are listed. ' +
+      `Sending addresses and mailboxes come from the cache. ${CACHE_HINT}`;
+    if (!cache) return { accounts: configured, note };
+
+    try {
+      const ids = configured.map((a) => a.id);
+      const senders = sentFromAddresses(cache, sentMailboxes(cache, ids));
+      const mailboxes = summarizeMailboxes(cache, ids);
+      return {
+        accounts: configured.map((account) => {
+          const addresses = senders
+            .filter((s) => s.account_id === account.id)
+            .map(({ address, sent }) => ({ address, sent }));
+          const email = account.email.toLowerCase();
+          if (!addresses.some((a) => a.address === email)) addresses.push({ address: email, sent: 0 });
+          return {
+            ...account,
+            addresses,
+            mailboxes: mailboxes
+              .filter((m) => m.account_id === account.id)
+              .map(({ account_id: _, ...mailbox }) => mailbox),
+          };
+        }),
+      };
+    } catch (error) {
+      this.logger.warn('cache: read failed for list_accounts', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { accounts: configured, note };
+    }
+  }
+
+  private listCorrespondentsMulti(intent: Intent) {
+    const requested = (intent.params.account_ids as string[] | undefined) ?? null;
+    const allIds = this.accounts.map((a) => a.id);
+    const targetIds = requested ?? allIds;
+    const unknown = targetIds.filter((id) => !allIds.includes(id));
+    if (unknown.length > 0) throw new Error(`Unknown account_ids: ${unknown.join(', ')}`);
+
+    const { cache, coverage } = this.servingCache('list_correspondents', targetIds);
+    // An alias is the operator's whichever account it was used from.
+    const own = [
+      ...this.accounts.map((a) => a.email),
+      ...sentFromAddresses(cache, sentMailboxes(cache, allIds)).map((s) => s.address),
+    ];
+    const { total, correspondents } = listCorrespondents(cache, {
+      accountIds: targetIds,
+      sent: sentMailboxes(cache, targetIds),
+      exclude: own,
+      since: intent.params.since ? new Date(intent.params.since as string) : undefined,
+      before: intent.params.before ? new Date(intent.params.before as string) : undefined,
+      minSent: (intent.params.min_sent as number | undefined) ?? 0,
+      limit: (intent.params.limit as number | undefined) ?? 100,
+    });
+
+    return {
+      accounts_searched: targetIds,
+      accounts_available: allIds,
+      cache: { state: coverage.state, last_synced_at: coverage.last_synced_at },
+      correspondents_total: total,
+      correspondents,
+    };
+  }
+
+  /** The cache, for a read nothing else can answer. Throws when it cannot serve these accounts. */
+  private servingCache(what: string, accountIds: string[]) {
+    const cache = this.cacheConfig.mode === 'off' ? undefined : this.cache;
+    let coverage: ReturnType<typeof getCoverage> | null = null;
+    if (cache) {
+      try {
+        coverage = getCoverage(cache, accountIds, {
+          freshnessWindowSeconds: this.cacheConfig.freshnessWindowSeconds,
+        });
+      } catch (error) {
+        this.logger.warn(`cache: read failed for ${what}`, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    if (!cache || !coverage || !isServable(coverage.state)) {
+      throw new Error(cacheOnlyRefusal(what, coverage));
+    }
+    return { cache, coverage };
+  }
+
   private async performAction(
     intent: Intent
   ): Promise<Array<{ type: 'text'; text: string }>> {
@@ -1705,6 +1847,15 @@ export class Executor {
 
     if (intent.tool === 'list_mailboxes') {
       const payload = await this.listMailboxesMulti(intent);
+      return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
+    }
+
+    if (intent.tool === 'list_accounts') {
+      return [{ type: 'text', text: JSON.stringify(this.listAccounts(), null, 2) }];
+    }
+
+    if (intent.tool === 'list_correspondents') {
+      const payload = this.listCorrespondentsMulti(intent);
       return [{ type: 'text', text: JSON.stringify(payload, null, 2) }];
     }
 
@@ -3301,31 +3452,4 @@ function buildInterpretation(input: {
     'Borrows are serialized per account, so anything queued behind a slow operation ' +
     'waits for it — a small job sitting at "executing" is usually queued, not stuck.'
   );
-}
-
-
-/**
- * Drop rows already emitted at the previous page's boundary timestamp.
- *
- * Mirrors the IMAP path: keep anything strictly older than the boundary, plus
- * boundary-timestamp rows whose (account_id, mailbox, uid) triple was not
- * already returned. UIDs are unique only per account/mailbox, so a scalar
- * comparison would drop cross-account rows that merely share a UID.
- */
-export function applyCursorBoundary<
-  T extends { account_id: string; mailbox: string; uid: number; envelope: { date: string } },
->(rows: T[], cursor: SearchCursor): T[] {
-  const boundaryMs = new Date(cursor.before).getTime();
-  const seen = new Set(
-    cursor.boundary_seen.map((r) => `${r.account_id}\u0000${r.mailbox}\u0000${r.uid}`)
-  );
-
-  return rows.filter((row) => {
-    const rowMs = new Date(row.envelope.date).getTime();
-    if (rowMs < boundaryMs) return true;
-    if (rowMs === boundaryMs) {
-      return !seen.has(`${row.account_id}\u0000${row.mailbox}\u0000${row.uid}`);
-    }
-    return false;
-  });
 }
