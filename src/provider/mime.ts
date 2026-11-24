@@ -2,48 +2,33 @@
  * Extract a short, readable snippet from a (possibly partial) message source.
  *
  * Handles text/plain root, multipart with text/plain first part, quoted-printable,
- * and strips quoted-reply tails and signatures. Falls back to text/html parts
- * when no text/plain alternative is available. Returns empty string on any failure.
+ * base64, and the part's declared charset, and strips quoted-reply tails and
+ * signatures. Falls back to text/html parts when no text/plain alternative is
+ * available. Returns empty string on any failure.
+ *
+ * A string source is taken to be text and encoded as UTF-8 first; a Buffer is
+ * the message as the server sent it.
  *
  * Never throws.
  */
 export function extractSnippet(source: Buffer | string, maxLength = 200): string {
   try {
-    const text = typeof source === 'string' ? source : source.toString('utf-8');
+    const bytes = typeof source === 'string' ? Buffer.from(source, 'utf-8') : source;
+    // One latin1 character per byte. Headers are ASCII, and the body has to
+    // stay undecoded until the chosen part's charset is known: decoding it as
+    // UTF-8 here turns a windows-1252 body into replacement characters, and
+    // decoding quoted-printable escapes as characters splits every multibyte
+    // UTF-8 sequence into Latin-1 garbage.
+    const entity = splitHeadersBody(bytes.toString('latin1'));
+    if (!entity.body) return '';
 
-    const { headers, body } = splitHeadersBody(text);
-    if (!body) return '';
+    const part = chooseTextPart(entity);
+    if (!part) return '';
 
-    const contentType = getHeader(headers, 'content-type') ?? 'text/plain';
+    let text = decodePart(part);
+    if (part.html) text = htmlToText(text);
 
-    let rawBody: string;
-    let isHtml = false;
-    if (/^multipart\//i.test(contentType)) {
-      const boundary = extractBoundary(contentType);
-      if (!boundary) return '';
-      const plain = findTextPart(body, boundary, /^text\/plain/i);
-      if (plain) {
-        rawBody = plain;
-      } else {
-        const html = findTextPart(body, boundary, /^text\/html/i);
-        if (!html) return '';
-        rawBody = html;
-        isHtml = true;
-      }
-    } else if (/^text\/plain/i.test(contentType)) {
-      const encoding = getHeader(headers, 'content-transfer-encoding') ?? '7bit';
-      rawBody = decodeEncoding(body, encoding);
-    } else if (/^text\/html/i.test(contentType)) {
-      const encoding = getHeader(headers, 'content-transfer-encoding') ?? '7bit';
-      rawBody = decodeEncoding(body, encoding);
-      isHtml = true;
-    } else {
-      return '';
-    }
-
-    if (isHtml) rawBody = htmlToText(rawBody);
-
-    const cleaned = stripQuotedReply(stripSignature(rawBody)).trim();
+    const cleaned = stripQuotedReply(stripSignature(text)).trim();
     if (!cleaned) return '';
     return cleaned.length > maxLength ? cleaned.slice(0, maxLength) : cleaned;
   } catch {
@@ -79,41 +64,70 @@ function extractBoundary(contentType: string): string | null {
   return match ? match[1] : null;
 }
 
-/** Given a multipart body, its boundary, and a content-type regex, return the decoded text of the first matching part. */
-function findTextPart(body: string, boundary: string, ctRegex: RegExp): string | null {
-  const delimiter = `--${boundary}`;
-  const parts = body.split(delimiter).slice(1); // drop preamble
-  for (const part of parts) {
-    if (part.trim() === '--' || part.trim() === '') continue;
-    const trimmed = part.replace(/^\r?\n/, '');
-    const { headers, body: partBody } = splitHeadersBody(trimmed);
-    const partCt = getHeader(headers, 'content-type') ?? '';
-    if (ctRegex.test(partCt)) {
-      const enc = getHeader(headers, 'content-transfer-encoding') ?? '7bit';
-      return decodeEncoding(partBody, enc);
-    }
-  }
-  return null;
+interface Entity {
+  headers: string;
+  body: string;
 }
 
-function decodeEncoding(body: string, encoding: string): string {
-  const enc = encoding.trim().toLowerCase();
-  if (enc === 'quoted-printable') {
-    return body
-      .replace(/=\r?\n/g, '')
-      .replace(/=([0-9A-Fa-f]{2})/g, (_, hex) =>
-        String.fromCharCode(parseInt(hex, 16))
+/** The part a snippet is read from: the first text/plain, else the first text/html. */
+function chooseTextPart(entity: Entity): (Entity & { html: boolean }) | null {
+  const contentType = getHeader(entity.headers, 'content-type') ?? 'text/plain';
+  if (/^text\/plain/i.test(contentType)) return { ...entity, html: false };
+  if (/^text\/html/i.test(contentType)) return { ...entity, html: true };
+  if (!/^multipart\//i.test(contentType)) return null;
+
+  const boundary = extractBoundary(contentType);
+  if (!boundary) return null;
+  const parts = entity.body
+    .split(`--${boundary}`)
+    .slice(1) // drop preamble
+    .filter((part) => part.trim() !== '--' && part.trim() !== '')
+    .map((part) => splitHeadersBody(part.replace(/^\r?\n/, '')));
+  const typed = (pattern: RegExp) =>
+    parts.find((part) => pattern.test(getHeader(part.headers, 'content-type') ?? ''));
+
+  const plain = typed(/^text\/plain/i);
+  if (plain) return { ...plain, html: false };
+  const html = typed(/^text\/html/i);
+  return html ? { ...html, html: true } : null;
+}
+
+/** Undo the transfer encoding, then read the bytes in the part's own charset. */
+function decodePart(part: Entity): string {
+  const encoding = getHeader(part.headers, 'content-transfer-encoding') ?? '7bit';
+  const charset = getHeader(part.headers, 'content-type')?.match(/charset="?([^";\s]+)"?/i)?.[1];
+  // The preview is cut at a byte count, so its last character can be
+  // incomplete. That shows up as trailing replacement characters.
+  return decodeCharset(transferDecode(part.body, encoding), charset).replace(/\uFFFD+$/, '');
+}
+
+/** `body` holds one latin1 character per byte, so latin1 turns it back into those bytes. */
+function transferDecode(body: string, encoding: string): Buffer {
+  switch (encoding.trim().toLowerCase()) {
+    case 'quoted-printable':
+      return Buffer.from(
+        body
+          .replace(/=\r?\n/g, '')
+          // An escape cut short by the preview limit.
+          .replace(/=[0-9A-Fa-f]?$/, '')
+          .replace(/=([0-9A-Fa-f]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+        'latin1'
       );
+    case 'base64':
+      return Buffer.from(body.replace(/\s+/g, ''), 'base64');
+    default:
+      // 7bit / 8bit / binary / unknown
+      return Buffer.from(body, 'latin1');
   }
-  if (enc === 'base64') {
-    try {
-      return Buffer.from(body.replace(/\s+/g, ''), 'base64').toString('utf-8');
-    } catch {
-      return '';
-    }
+}
+
+function decodeCharset(bytes: Buffer, charset: string | undefined): string {
+  try {
+    return new TextDecoder(charset ?? 'utf-8').decode(bytes);
+  } catch {
+    // An unknown label gets the same reading as a part that names none.
+    return new TextDecoder('utf-8').decode(bytes);
   }
-  // 7bit / 8bit / binary / unknown → pass through
-  return body;
 }
 
 function stripQuotedReply(text: string): string {
@@ -178,7 +192,10 @@ export function htmlToText(html: string): string {
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
-    .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(parseInt(d, 10)))
+    .replace(/&#(x[0-9a-f]+|\d+);/gi, (entity, code: string) => {
+      const point = code[0].toLowerCase() === 'x' ? parseInt(code.slice(1), 16) : parseInt(code, 10);
+      return point > 0 && point < 0x110000 ? String.fromCodePoint(point) : entity;
+    })
     .replace(/[ \t]+/g, ' ')
     .replace(/\n{3,}/g, '\n\n');
 }

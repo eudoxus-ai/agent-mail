@@ -47,9 +47,15 @@ function readPreview(msg: {
   headers?: Buffer;
   bodyParts?: Map<string, Buffer>;
 }): { headers: string; snippet: string } {
-  const headers = msg.headers?.toString('utf-8') ?? '';
-  const body = msg.bodyParts?.get('text')?.toString('utf-8') ?? '';
-  return { headers, snippet: extractSnippet(`${headers.trimEnd()}\r\n\r\n${body}`) };
+  const headerBytes = msg.headers ?? Buffer.alloc(0);
+  const body = msg.bodyParts?.get('text') ?? Buffer.alloc(0);
+  // Bytes, not text: only the body part's own charset says how to read it.
+  const source = Buffer.concat([
+    Buffer.from(headerBytes.toString('latin1').replace(/[\r\n]+$/, ''), 'latin1'),
+    Buffer.from('\r\n\r\n'),
+    body,
+  ]);
+  return { headers: headerBytes.toString('utf-8'), snippet: extractSnippet(source) };
 }
 
 export interface ImapProviderOptions {

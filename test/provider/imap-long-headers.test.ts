@@ -177,3 +177,33 @@ describe('folded headers', () => {
     expect(snippet).toBe('Hello there.');
   });
 });
+
+describe('preview bytes', () => {
+  it('search reads a non-UTF-8 body in its declared charset', async () => {
+    const account: ResolvedAccount = {
+      id: 'a',
+      email: 'me@example.com',
+      imap: { host: 'h', port: 993, tls: true },
+      smtp: { host: 'h', port: 587, tls: true },
+      auth: { user: 'u', pass: 'p' },
+    };
+    const imap = new ImapProvider(account);
+    (imap as any).client = {
+      getMailboxLock: async () => ({ release: vi.fn() }),
+      search: async () => [7],
+      async *fetch() {
+        yield {
+          uid: 7,
+          envelope: { messageId: '<m@x>', subject: 'Hi', from: [], to: [], cc: [], date: new Date(0) },
+          flags: new Set<string>(),
+          headers: Buffer.from('Content-Type: text/plain; charset=iso-8859-1\r\n\r\n'),
+          // "Déjà vu" in ISO-8859-1. Decoding it as UTF-8 yields replacement characters.
+          bodyParts: new Map([['text', Buffer.from([0x44, 0xe9, 0x6a, 0xe0, 0x20, 0x76, 0x75])]]),
+        };
+      },
+    };
+
+    const [r] = await imap.search('INBOX', {}, 10);
+    expect(r.snippet).toBe('Déjà vu');
+  });
+});

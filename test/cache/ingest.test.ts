@@ -96,6 +96,10 @@ describe('htmlToText', () => {
     expect(htmlToText('caf&#233;')).toBe('café');
   });
 
+  it('handles hex numeric entities', () => {
+    expect(htmlToText('I&#x2019;m &#X1F389;')).toBe('I’m 🎉');
+  });
+
   it('returns empty string for empty input', () => {
     expect(htmlToText('')).toBe('');
   });
